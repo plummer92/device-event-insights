@@ -6,16 +6,29 @@ import datetime as dt
 from io import BytesIO
 
 # ====== Settings ======
-APP_VER = "v4.1 — Delivery Analytics + Weekly Summary + Drilldown"
+APP_VER = "v4.1 — Delivery Analytics + Weekly Summary + Drilldown (with header de-dupe)"
 USE_SHEETS = True          # set False if you don’t want Google Sheets history
 DEFAULT_IDLE_MIN = 15      # minutes of no activity to split delivery runs
 DEFAULT_DRILL_MARGIN = 10  # minutes of context on each side when showing source events
 
 st.set_page_config(page_title=f"Device Event Insights — {APP_VER}", layout="wide")
 st.title(f"📊 All Device Event Insights — {APP_VER}")
-st.caption("Delivery cycle times, walking gaps, device/med trends, and a drilldown inspector to view raw source events for any anomaly.")
+st.caption("Delivery cycle times, walking gaps, device/med trends, and a drilldown inspector. Includes header de-duplication + debug expander.")
 
 # ------------------ Helpers ------------------
+def _dedupe_columns(cols):
+    """Make duplicate column headers unique: 'User', 'User' -> 'User', 'User_1'."""
+    seen = {}
+    new = []
+    for c in [str(x).strip() for x in cols]:
+        if c in seen:
+            seen[c] += 1
+            new.append(f"{c}_{seen[c]}")
+        else:
+            seen[c] = 0
+            new.append(c)
+    return new
+
 def detect_cols(df):
     """
     Heuristics to find key columns in the daily export.
@@ -54,7 +67,10 @@ def detect_cols(df):
 @st.cache_data(show_spinner=False)
 def load_events(xlsx_file):
     df = pd.read_excel(xlsx_file, sheet_name=0, dtype=str)
-    df.columns = [str(c).strip() for c in df.columns]
+
+    # 🔧 make headers unique to avoid "label is not unique" errors
+    df.columns = _dedupe_columns(df.columns)
+
     colmap = detect_cols(df)
     # coerce time and add helpers
     df[colmap["datetime"]] = pd.to_datetime(df[colmap["datetime"]], errors="coerce")
@@ -168,6 +184,11 @@ if not events_file:
     st.stop()
 
 events_df, colmap = load_events(events_file)
+
+# 🔍 Debug visibility (so you can confirm detected columns & headers)
+with st.expander("Show detected columns (debug)"):
+    st.write("Detected colmap:", colmap)
+    st.write("All headers:", list(events_df.columns))
 
 # ------------------ Sidebar Filters ------------------
 with st.sidebar:
@@ -356,7 +377,7 @@ with tab4:
     st.markdown("### Transaction Type Split per Device")
     # pivot: device × type counts
     pivot = ev.pivot_table(index=colmap["device"], columns=colmap["type"], values=colmap["datetime"], aggfunc="count", fill_value=0)
-    st.dataframe(pivot.sort_values(pivot.columns.tolist()[0] if len(pivot.columns)>0 else None, ascending=False).head(100), use_container_width=True)
+    st.dataframe(pivot.sort_index(ascending=True).head(200), use_container_width=True)
 
     if len(pivot.columns) > 0:
         stacked = pivot.reset_index().melt(id_vars=colmap["device"], var_name="transaction_type", value_name="count")
