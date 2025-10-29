@@ -6,21 +6,21 @@ import datetime as dt
 from io import BytesIO
 
 # ====== Settings ======
-APP_VER = "v4.0 — Delivery Analytics + Weekly Summary"
-USE_SHEETS = True  # set False if you don’t want Google Sheets history
-DEFAULT_IDLE_MIN = 15  # minutes of no activity to split delivery runs
+APP_VER = "v4.1 — Delivery Analytics + Weekly Summary + Drilldown"
+USE_SHEETS = True          # set False if you don’t want Google Sheets history
+DEFAULT_IDLE_MIN = 15      # minutes of no activity to split delivery runs
+DEFAULT_DRILL_MARGIN = 10  # minutes of context on each side when showing source events
 
 st.set_page_config(page_title=f"Device Event Insights — {APP_VER}", layout="wide")
 st.title(f"📊 All Device Event Insights — {APP_VER}")
-st.caption("Upload your daily All-Device Events (XLSX). Get delivery cycle times, tech walking gaps, and machine rankings. Persist daily metrics and auto-build a weekly summary.")
+st.caption("Delivery cycle times, walking gaps, device/med trends, and a drilldown inspector to view raw source events for any anomaly.")
 
 # ------------------ Helpers ------------------
 def detect_cols(df):
     """
-    Heuristics to find timestamp / device / type / user columns in your report.
-    We keep this permissive so it works across slight format changes.
+    Heuristics to find key columns in the daily export.
     """
-    colmap = {"datetime": None, "device": None, "type": None, "element": None, "user": None}
+    colmap = {"datetime": None, "device": None, "type": None, "element": None, "user": None, "desc": None}
     for c in df.columns:
         lc = str(c).lower()
         if colmap["datetime"] is None and any(k in lc for k in ["date", "time", "timestamp"]):
@@ -29,8 +29,10 @@ def detect_cols(df):
             colmap["device"] = c
         if colmap["type"] is None and any(k in lc for k in ["transactiontype","trans type","type","event"]):
             colmap["type"] = c
-        if colmap["element"] is None and any(k in lc for k in ["element","med","item","ndc","drug"]):
+        if colmap["element"] is None and any(k in lc for k in ["element","med","item","ndc","drug","code"]):
             colmap["element"] = c
+        if colmap["desc"] is None and any(k in lc for k in ["desc","name","title","drug","med"]):
+            colmap["desc"] = c
         if colmap["user"] is None and any(k in lc for k in ["user","operator","tech","technician","employee"]):
             colmap["user"] = c
 
@@ -63,25 +65,27 @@ def load_events(xlsx_file):
     return df, colmap
 
 def _seconds_to_hhmmss(s):
-    s = int(s)
+    if pd.isna(s): return ""
+    s = int(max(0, s))
     h = s // 3600
     m = (s % 3600) // 60
     sec = s % 60
-    if h > 0:
-        return f"{h:d}:{m:02d}:{sec:02d}"
-    return f"{m:d}:{sec:02d}"
+    return f"{h:d}:{m:02d}:{sec:02d}" if h > 0 else f"{m:d}:{sec:02d}"
 
 def build_delivery_analytics(ev, colmap, idle_min=DEFAULT_IDLE_MIN):
     """
     Core engine:
       - Per tech: sort by time; compute per-row delta to next row for same tech
       - Dwell at device = time until next event (same tech) IF next device is different
-      - Walk time (between devices) = same as above (gap after leaving device before arriving at next)
+      - Walk time (between devices) = same as dwell estimate (gap after device A before device B)
       - Delivery runs: split by idle gaps >= idle_min
     """
     ts = colmap["datetime"]; dev = colmap["device"]; user = colmap["user"]
 
-    data = ev[[ts, dev, user, colmap["type"]]].sort_values([user, ts]).copy()
+    needed = [ts, dev, user, colmap["type"]]
+    if colmap.get("desc"): needed.append(colmap["desc"])
+    data = ev[needed].sort_values([user, ts]).copy()
+
     # next-event per tech
     data["__next_ts"]  = data.groupby(user)[ts].shift(-1)
     data["__next_dev"] = data.groupby(user)[dev].shift(-1)
@@ -97,9 +101,11 @@ def build_delivery_analytics(ev, colmap, idle_min=DEFAULT_IDLE_MIN):
         np.nan
     )
 
-    # walking time = same as dwell estimate (time between finishing device A and first event at device B)
-    # We label it as walk_sec; in reality it's walk + hallway constraints + “next-start” delay.
-    data["walk_sec"] = data["dwell_sec"]
+    # use the same as “walk” (between-device delay); store timestamps/hours for drilldown
+    data["walk_sec"]   = data["dwell_sec"]
+    data["start_time"] = data[ts]
+    data["end_time"]   = data["__next_ts"]
+    data["hour"]       = data["start_time"].dt.hour
 
     # delivery runs: new run when idle gap >= idle_min (per tech)
     cutoff = idle_min * 60
@@ -114,9 +120,9 @@ def build_delivery_analytics(ev, colmap, idle_min=DEFAULT_IDLE_MIN):
         p75_dwell_sec=("dwell_sec", lambda x: np.nanpercentile(x.dropna(), 75) if x.notna().any() else np.nan),
         p90_dwell_sec=("dwell_sec", lambda x: np.nanpercentile(x.dropna(), 90) if x.notna().any() else np.nan),
     ).reset_index()
-    device_stats["avg_dwell_hhmmss"] = device_stats["avg_dwell_sec"].apply(lambda x: _seconds_to_hhmmss(x) if pd.notna(x) else "")
-    device_stats["p75_hhmmss"] = device_stats["p75_dwell_sec"].apply(lambda x: _seconds_to_hhmmss(x) if pd.notna(x) else "")
-    device_stats["p90_hhmmss"] = device_stats["p90_dwell_sec"].apply(lambda x: _seconds_to_hhmmss(x) if pd.notna(x) else "")
+    device_stats["avg_dwell_hhmmss"] = device_stats["avg_dwell_sec"].apply(_seconds_to_hhmmss)
+    device_stats["p75_hhmmss"] = device_stats["p75_dwell_sec"].apply(_seconds_to_hhmmss)
+    device_stats["p90_hhmmss"] = device_stats["p90_dwell_sec"].apply(_seconds_to_hhmmss)
     device_stats = device_stats.sort_values(["avg_dwell_sec","events"], ascending=[False, False])
 
     # 2) Tech-level: walking time and dwell
@@ -126,14 +132,14 @@ def build_delivery_analytics(ev, colmap, idle_min=DEFAULT_IDLE_MIN):
         total_walk_min=("walk_sec", lambda x: np.nansum(x)/60.0),
         avg_dwell_sec=("dwell_sec","mean"),
     ).reset_index()
-    tech_stats["avg_walk_hhmmss"] = tech_stats["avg_walk_sec"].apply(lambda x: _seconds_to_hhmmss(x) if pd.notna(x) else "")
-    tech_stats["avg_dwell_hhmmss"] = tech_stats["avg_dwell_sec"].apply(lambda x: _seconds_to_hhmmss(x) if pd.notna(x) else "")
+    tech_stats["avg_walk_hhmmss"] = tech_stats["avg_walk_sec"].apply(_seconds_to_hhmmss)
+    tech_stats["avg_dwell_hhmmss"] = tech_stats["avg_dwell_sec"].apply(_seconds_to_hhmmss)
     tech_stats = tech_stats.sort_values("total_walk_min", ascending=False)
 
     # 3) Delivery runs per tech
     run_stats = data.groupby([user,"run_id"]).agg(
-        start=(ts, "min"),
-        end=(ts, "max"),
+        start=("start_time", "min"),
+        end=("start_time", "max"),
         devices_visited=(dev, lambda x: x.nunique()),
         events=("gap_sec","count")
     ).reset_index()
@@ -144,6 +150,16 @@ def build_delivery_analytics(ev, colmap, idle_min=DEFAULT_IDLE_MIN):
     hourly.columns = ["hour","events"]
 
     return data, device_stats, tech_stats, run_stats, hourly
+
+def get_source_slice(ev, colmap, tech, start_ts, end_ts, margin_min=DEFAULT_DRILL_MARGIN):
+    """Return raw source rows around a walk gap for the chosen tech with time margins."""
+    ts = colmap["datetime"]; user = colmap["user"]
+    if pd.isna(start_ts) or pd.isna(end_ts):
+        return pd.DataFrame()
+    left  = pd.to_datetime(start_ts) - pd.Timedelta(minutes=margin_min)
+    right = pd.to_datetime(end_ts)   + pd.Timedelta(minutes=margin_min)
+    sl = ev[(ev[user]==tech) & (ev[ts] >= left) & (ev[ts] <= right)].copy()
+    return sl.sort_values(ts)
 
 # ------------------ Upload Events ------------------
 events_file = st.file_uploader("Upload daily **Events** Excel (.xlsx)", type=["xlsx"], key="events")
@@ -213,6 +229,7 @@ data, device_stats, tech_stats, run_stats, hourly = build_delivery_analytics(ev,
 with tab2:
     st.subheader("Delivery Analytics (per tech sequence)")
 
+    # WALKING HISTOGRAM + TABLE (with timestamps & hour)
     cA, cB = st.columns(2)
     with cA:
         st.markdown("**Walking gaps (approx.)** — time between finishing one device and starting the next device for the same tech.")
@@ -220,17 +237,19 @@ with tab2:
         if not walk.empty:
             walk["walk_min"] = walk["walk_sec"]/60.0
             st.plotly_chart(
-                px.histogram(walk, x="walk_min", nbins=40, color=colmap["user"], barmode="overlay",
-                             title="Histogram: Walking + between-device delay (minutes)"),
+                px.histogram(walk, x="walk_sec", nbins=50, color=colmap["user"], barmode="overlay",
+                             title="Histogram: Walking + between-device delay (seconds)"),
                 use_container_width=True
             )
-        st.dataframe(
-            walk[[colmap["user"], colmap["device"], "__next_dev", "walk_sec"]]
-            .assign(walk_hhmmss=lambda d: d["walk_sec"].apply(lambda x: _seconds_to_hhmmss(x)))
-            .rename(columns={colmap["user"]:"tech", colmap["device"]:"device", "__next_dev":"next_device"}),
-            use_container_width=True
+        walk_table = (
+            walk[[colmap["user"], colmap["device"], "__next_dev", "start_time", "end_time", "hour", "walk_sec"]]
+            .assign(walk_hhmmss=lambda d: d["walk_sec"].apply(_seconds_to_hhmmss))
+            .rename(columns={colmap["user"]:"tech", colmap["device"]:"device", "__next_dev":"next_device"})
+            .reset_index(drop=True)
         )
+        st.dataframe(walk_table, use_container_width=True)
 
+    # DELIVERY RUNS
     with cB:
         st.markdown("**Delivery runs** — split when idle gap ≥ selected threshold.")
         if not run_stats.empty:
@@ -240,6 +259,59 @@ with tab2:
                 use_container_width=True
             )
         st.dataframe(run_stats.sort_values(["start"]).rename(columns={colmap["user"]:"tech"}), use_container_width=True)
+
+    st.divider()
+    st.markdown("### 🔎 Drilldown Inspector (click-like filtering)")
+    st.caption("Pick a tech + gap threshold and optionally specific devices/hours. We’ll show matching long gaps and the raw source rows around any selected gap.")
+    cc1, cc2, cc3, cc4 = st.columns(4)
+    with cc1:
+        drill_tech = st.selectbox("Technician", sorted(ev[colmap["user"]].unique()), index=0 if ev[colmap["user"]].nunique()>0 else None)
+    with cc2:
+        min_gap = st.number_input("Min gap (seconds)", min_value=0, max_value=3600, value=200, step=10)
+    with cc3:
+        dev_filter = st.selectbox("Device (optional)", ["(any)"] + sorted(ev[colmap["device"]].unique()))
+    with cc4:
+        hour_filter = st.selectbox("Hour (optional)", ["(any)"] + list(range(24)))
+
+    # filter walk_table to candidates
+    filt = (walk_table["tech"]==drill_tech) & (walk_table["walk_sec"]>=min_gap)
+    if dev_filter != "(any)":
+        filt &= (walk_table["device"]==dev_filter)
+    if hour_filter != "(any)":
+        filt &= (walk_table["hour"]==hour_filter)
+
+    drill_candidates = walk_table[filt].copy()
+    drill_candidates["label"] = drill_candidates.apply(
+        lambda r: f"{r['tech']} | {r['device']} ➜ {r['next_device']} | {r['start_time']:%H:%M:%S} → {r['end_time']:%H:%M:%S} | {int(r['walk_sec'])}s",
+        axis=1
+    )
+
+    st.write(f"Matches: **{len(drill_candidates)}**")
+    st.dataframe(drill_candidates, use_container_width=True)
+
+    chosen = None
+    if not drill_candidates.empty:
+        chosen_label = st.selectbox("Choose a gap to inspect", drill_candidates["label"].tolist())
+        chosen = drill_candidates.loc[drill_candidates["label"]==chosen_label].iloc[0]
+
+    if chosen is not None:
+        st.markdown("#### Source rows around this gap")
+        src = get_source_slice(
+            ev, colmap,
+            tech=chosen["tech"],
+            start_ts=chosen["start_time"],
+            end_ts=chosen["end_time"],
+            margin_min=DEFAULT_DRILL_MARGIN
+        )
+        if src.empty:
+            st.info("No source rows found in the window.")
+        else:
+            # show compact, ordered columns first
+            preferred = [colmap["datetime"], colmap["user"], colmap["device"], colmap["type"]]
+            if colmap.get("desc"): preferred.append(colmap["desc"])
+            rest = [c for c in src.columns if c not in preferred]
+            ordered = src[preferred + rest].sort_values(colmap["datetime"]).reset_index(drop=True)
+            st.dataframe(ordered, use_container_width=True)
 
 with tab3:
     st.subheader("Technician Comparison")
@@ -257,7 +329,7 @@ with tab3:
         )
 
 with tab4:
-    st.subheader("Device Rankings — Where time goes")
+    st.subheader("Device Rankings — Volume & Time")
     if not device_stats.empty:
         st.dataframe(
             device_stats[[colmap["device"], "events", "avg_dwell_hhmmss", "p75_hhmmss", "p90_hhmmss"]]
@@ -280,6 +352,36 @@ with tab4:
                 use_container_width=True
             )
 
+    st.divider()
+    st.markdown("### Transaction Type Split per Device")
+    # pivot: device × type counts
+    pivot = ev.pivot_table(index=colmap["device"], columns=colmap["type"], values=colmap["datetime"], aggfunc="count", fill_value=0)
+    st.dataframe(pivot.sort_values(pivot.columns.tolist()[0] if len(pivot.columns)>0 else None, ascending=False).head(100), use_container_width=True)
+
+    if len(pivot.columns) > 0:
+        stacked = pivot.reset_index().melt(id_vars=colmap["device"], var_name="transaction_type", value_name="count")
+        st.plotly_chart(px.bar(stacked, x="count", y=colmap["device"], color="transaction_type", orientation="h",
+                               title="Device × Transaction Type (stacked)"), use_container_width=True)
+
+    st.markdown("### Med Description Trends")
+    if colmap.get("desc"):
+        # top meds overall and by type
+        med_counts = ev.groupby([colmap["desc"], colmap["type"]]).size().reset_index(name="count")
+        st.dataframe(med_counts.sort_values("count", ascending=False).head(200), use_container_width=True)
+
+        # Per device top meds (optional heavy), so show a selector
+        dev_choice = st.selectbox("Choose a device to view top meds", ["(all)"] + sorted(ev[colmap["device"]].unique()))
+        if dev_choice != "(all)":
+            dev_med = ev[ev[colmap["device"]]==dev_choice].groupby([colmap["desc"], colmap["type"]]).size().reset_index(name="count")
+            st.plotly_chart(
+                px.bar(dev_med.sort_values("count", ascending=False).head(30),
+                       x="count", y=colmap["desc"], color=colmap["type"], orientation="h",
+                       title=f"Top meds at {dev_choice}"),
+                use_container_width=True
+            )
+    else:
+        st.info("No medication description column detected. If your export has one (e.g., 'Med Description'), it will appear here automatically.")
+
 # ------------------ Weekly Summary (Google Sheets History) ------------------
 with tab5:
     st.subheader("Weekly Summary & History")
@@ -297,8 +399,8 @@ with tab5:
         "p90_device_dwell_sec": float(np.nanpercentile(device_stats["avg_dwell_sec"].dropna(), 90)) if device_stats["avg_dwell_sec"].notna().any() else np.nan,
     }
     daily_df = pd.DataFrame([_summary])
-    daily_df["avg_walk_mm:ss"] = daily_df["avg_walk_sec"].apply(lambda x: _seconds_to_hhmmss(x) if pd.notna(x) else "")
-    daily_df["avg_dwell_mm:ss"] = daily_df["avg_dwell_sec"].apply(lambda x: _seconds_to_hhmmss(x) if pd.notna(x) else "")
+    daily_df["avg_walk_mm:ss"] = daily_df["avg_walk_sec"].apply(_seconds_to_hhmmss)
+    daily_df["avg_dwell_mm:ss"] = daily_df["avg_dwell_sec"].apply(_seconds_to_hhmmss)
     st.markdown("**Today’s summary (from current upload/filters):**")
     st.dataframe(daily_df, use_container_width=True)
 
@@ -334,7 +436,6 @@ with tab5:
                 c1, c2 = st.columns(2)
                 with c1:
                     if st.button("Append today’s summary to Google Sheets"):
-                        # ensure headers exist
                         existing = ws.get_all_records()
                         if not existing:
                             ws.clear()
@@ -347,15 +448,12 @@ with tab5:
                         recs = ws.get_all_records()
                         if recs:
                             hist = pd.DataFrame(recs)
-                            # parse date and filter last 7 days
                             hist["date"] = pd.to_datetime(hist["date"], errors="coerce").dt.date
                             end = dt.date.today()
                             start = end - dt.timedelta(days=6)
                             last7 = hist[(hist["date"] >= start) & (hist["date"] <= end)].copy()
                             if not last7.empty:
                                 st.dataframe(last7, use_container_width=True)
-
-                                # Weekly rollup visual
                                 plot_df = last7.copy()
                                 plot_df["date"] = pd.to_datetime(plot_df["date"])
                                 plot_df["avg_walk_sec"] = pd.to_numeric(plot_df["avg_walk_sec"], errors="coerce")
@@ -375,3 +473,4 @@ with tab5:
             st.error(f"Google Sheets error: {e}")
     else:
         st.info("History disabled (USE_SHEETS=False). Enable and add Secrets to persist & summarize weekly.")
+
