@@ -1,28 +1,39 @@
-# All Device Event Insights — Pro (Streamlit)
+# Device Event Insights — v3.1
 
-**New features:**
-- **Historical storage**: Append each day’s upload to a local history file (`./history/events_history.csv.gz`).
-- **Day-over-day comparison**: See changes in volume versus yesterday.
-- **Staffing overlay**: Upload a staffing CSV to overlay hourly workload vs. staffing counts.
+Adds:
+- JIT device/location → role group mapping (Runner/IV/Central)
+- SLA thresholds (events-per-staff-hour, JIT-per-staff-hour)
+- Google Sheets history (append & preview)
 
-## Staffing CSV Template
-Save a CSV like this (included as `staffing_template.csv`):
-```csv
-role,person,start,end
-IV Tech,Liz,2025-10-28 06:00,2025-10-28 14:00
-Runner,Ben,2025-10-28 07:00,2025-10-28 15:00
-Pharmacist,Melissa,2025-10-28 09:00,2025-10-28 17:00
-```
+## Mapping CSV
+Columns (any of these keys to match): device_id, friendly_name, location
+Required: role_group (Runner / IV / Central)
 
-## Run locally
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-streamlit run app.py
-```
+Example:
+device_id,friendly_name,location,role_group
+PYX-4E-01,Pyxis 4th East A,4th East,Runner
+IVC-ROOM-01,IV Compounder 1,IV Room,IV
+CENT-WS-01,Central Workstation 1,Central Pharmacy,Central
 
-**Notes**
-- History is stored in a `history` folder alongside the app. Use the buttons to append or clear.
-- Day-over-day comparison uses the `__upload_day` tag (the min datetime in your upload). Append at least two days to see a delta.
-- The staffing overlay counts staff per hour inclusive of shift endpoints (simple model). We can add roles, weighting, and shift rules if needed.
+## Staffing CSV
+Required: role, person, start, end
+Optional: location, device_group (Runner/IV/Central), notes
+
+## Google Sheets (Streamlit Cloud)
+1. Create a Service Account in Google Cloud (download JSON).
+2. In Streamlit Cloud → Manage app → Settings → Secrets, paste:
+
+[gcp_service_account]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+client_email = "your-sa@your-project.iam.gserviceaccount.com"
+client_id = "..."
+token_uri = "https://oauth2.googleapis.com/token"
+
+[gsheets]
+workbook_url = "https://docs.google.com/spreadsheets/d/XXXXXXXX/edit"
+events_sheet = "events_history"
+
+3. Share the Google Sheet with the service account's client_email.
