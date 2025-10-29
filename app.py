@@ -6,14 +6,14 @@ import datetime as dt
 from io import BytesIO
 
 # ====== Settings ======
-APP_VER = "v4.1 — Delivery Analytics + Weekly Summary + Drilldown (with header de-dupe)"
+APP_VER = "v4.1 — Delivery Analytics + Weekly Summary + Drilldown (header de-dupe + username guard)"
 USE_SHEETS = True          # set False if you don’t want Google Sheets history
 DEFAULT_IDLE_MIN = 15      # minutes of no activity to split delivery runs
 DEFAULT_DRILL_MARGIN = 10  # minutes of context on each side when showing source events
 
 st.set_page_config(page_title=f"Device Event Insights — {APP_VER}", layout="wide")
 st.title(f"📊 All Device Event Insights — {APP_VER}")
-st.caption("Delivery cycle times, walking gaps, device/med trends, and a drilldown inspector. Includes header de-duplication + debug expander.")
+st.caption("Delivery cycle times, walking gaps, device/med trends, and a drilldown inspector. Includes header de-duplication + username guard in column detection.")
 
 # ------------------ Helpers ------------------
 def _dedupe_columns(cols):
@@ -32,22 +32,35 @@ def _dedupe_columns(cols):
 def detect_cols(df):
     """
     Heuristics to find key columns in the daily export.
+    Guard against picking 'UserName' as description.
     """
     colmap = {"datetime": None, "device": None, "type": None, "element": None, "user": None, "desc": None}
+
+    # Pass 1: prioritize unique identifiers first (user & timestamp) to avoid collisions later
+    for c in df.columns:
+        lc = str(c).lower()
+        if colmap["user"] is None and any(k in lc for k in ["username", "user_name", "user", "operator", "tech", "technician", "employee"]):
+            colmap["user"] = c
     for c in df.columns:
         lc = str(c).lower()
         if colmap["datetime"] is None and any(k in lc for k in ["date", "time", "timestamp"]):
             colmap["datetime"] = c
-        if colmap["device"] is None and any(k in lc for k in ["device","host","asset","endpoint","cabinet","station","pyxis"]):
+        if colmap["device"] is None and any(k in lc for k in ["device", "host", "asset", "endpoint", "cabinet", "station", "pyxis"]):
             colmap["device"] = c
-        if colmap["type"] is None and any(k in lc for k in ["transactiontype","trans type","type","event"]):
+        if colmap["type"] is None and any(k in lc for k in ["transactiontype", "trans type", "type", "event"]):
             colmap["type"] = c
-        if colmap["element"] is None and any(k in lc for k in ["element","med","item","ndc","drug","code"]):
-            colmap["element"] = c
-        if colmap["desc"] is None and any(k in lc for k in ["desc","name","title","drug","med"]):
-            colmap["desc"] = c
-        if colmap["user"] is None and any(k in lc for k in ["user","operator","tech","technician","employee"]):
-            colmap["user"] = c
+        # element should NOT match the user column
+        if colmap["element"] is None and any(k in lc for k in ["element", "med", "item", "ndc", "drug", "code"]):
+            if c != colmap["user"]:
+                colmap["element"] = c
+        # desc should NOT be a user/username column; avoid picking anything containing 'user'
+        if colmap["desc"] is None and any(k in lc for k in ["desc", "description", "drug", "med", "name", "title"]):
+            if (c != colmap["user"]) and ("user" not in lc):
+                colmap["desc"] = c
+
+    # Post-guards: if desc accidentally equals user, clear it
+    if colmap["desc"] == colmap["user"]:
+        colmap["desc"] = None
 
     # Required fallbacks
     if colmap["datetime"] is None:
@@ -100,6 +113,9 @@ def build_delivery_analytics(ev, colmap, idle_min=DEFAULT_IDLE_MIN):
 
     needed = [ts, dev, user, colmap["type"]]
     if colmap.get("desc"): needed.append(colmap["desc"])
+    # ✅ ensure unique column labels in the slice (prevents sort_values complaint)
+    needed = list(dict.fromkeys(needed))
+
     data = ev[needed].sort_values([user, ts]).copy()
 
     # next-event per tech
@@ -494,4 +510,5 @@ with tab5:
             st.error(f"Google Sheets error: {e}")
     else:
         st.info("History disabled (USE_SHEETS=False). Enable and add Secrets to persist & summarize weekly.")
+
 
