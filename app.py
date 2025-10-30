@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import re
+
 
 # ----------------------------- CONFIG ---------------------------------
 
@@ -211,6 +213,176 @@ def weekly_summary(ev: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
         .sort_values("week")
     )
     return out
+def _dt_floor_date(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s).dt.floor("D")
+
+def anomalies_top10(ev_all: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> pd.DataFrame:
+    """
+    Build a Top 10 'look-into-this' list using last 7 days vs prior 7 days.
+    Requires combined history (your app already builds 'combined' before filtering).
+    """
+    if ev_all.empty:
+        return pd.DataFrame(columns=["rank","topic","detail","why","severity"])
+
+    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
+
+    df = ev_all.copy()
+    df[ts] = pd.to_datetime(df[ts], errors="coerce")
+    df = df.dropna(subset=[ts])
+
+    end = df[ts].max().floor("D") + pd.Timedelta(days=1)
+    start = end - pd.Timedelta(days=14)
+    cur0  = end - pd.Timedelta(days=7)
+
+    recent = df[(df[ts] >= cur0) & (df[ts] < end)].copy()
+    prior  = df[(df[ts] >= start) & (df[ts] < cur0)].copy()
+
+    out = []
+
+    # 1) Devices with biggest volume spikes
+    if not recent.empty and not prior.empty:
+        r_dev = recent.groupby(dev).size().rename("recent").reset_index()
+        p_dev = prior.groupby(dev).size().rename("prior").reset_index()
+        vol = r_dev.merge(p_dev, on=dev, how="left").fillna(0.0)
+        vol["delta"] = vol["recent"] - vol["prior"].replace(0, np.nan)
+        vol["pct"] = np.where(vol["prior"]>0, (vol["recent"]-vol["prior"])/vol["prior"], np.nan)
+        vol = vol.sort_values(["pct","delta"], ascending=False).head(3)
+        for _, r in vol.iterrows():
+            out.append({
+                "topic":"Device volume spike",
+                "detail":f"{r[dev]} recent {int(r['recent'])} vs prior {int(r['prior'])}",
+                "why":"Sudden workload shift; check staffing/stocking cadence",
+                "severity": "high" if (r["pct"]>=0.5 and r["recent"]>=50) else "med"
+            })
+
+    # 2) Techs with largest median walk gap
+    if not data.empty:
+        twalk = data["__walk_gap_s"].groupby(data[colmap["user"]]).median().dropna()
+        if not twalk.empty:
+            top_walk = twalk.sort_values(ascending=False).head(3)
+            for u, s in top_walk.items():
+                out.append({
+                    "topic":"High walking time",
+                    "detail":f"{u} median walk gap {int(s)}s",
+                    "why":"Inefficient routing or distant devices in their run",
+                    "severity": "med" if s>=120 else "low"
+                })
+
+    # 3) Devices with largest median dwell (same-device gap)
+    if not data.empty:
+        dwell = (
+            data.loc[~data["__device_change"], "__gap_s"]
+            .groupby(data[colmap["device"]]).median().dropna()
+        )
+        if not dwell.empty:
+            top_dwell = dwell.sort_values(ascending=False).head(3)
+            for d, s in top_dwell.items():
+                out.append({
+                    "topic":"Long dwell at device",
+                    "detail":f"{d} median dwell {int(s)}s",
+                    "why":"Many refills per stop or slow transactions; check slot layout",
+                    "severity":"med" if s>=60 else "low"
+                })
+
+    # 4) Hours with unusually high load (events per hour)
+    if not recent.empty:
+        rh = recent.groupby(recent[ts].dt.floor("H")).size()
+        if not rh.empty:
+            hr_top = rh.sort_values(ascending=False).head(2)
+            for h, n in hr_top.items():
+                out.append({
+                    "topic":"Rush hour",
+                    "detail":f"{h:%Y-%m-%d %H:%M} had {int(n)} events",
+                    "why":"Consider JIT timing / more techs in this window",
+                    "severity":"med" if n>=100 else "low"
+                })
+
+    # 5) Transaction-type surges (verify+refill vs loads/unloads/outdates)
+    if not recent.empty and not prior.empty:
+        r_t = recent.groupby(typ).size().rename("recent").reset_index()
+        p_t = prior.groupby(typ).size().rename("prior").reset_index()
+        typd = r_t.merge(p_t, on=typ, how="left").fillna(0.0)
+        typd["delta"] = typd["recent"]-typd["prior"]
+        typd = typd.sort_values("delta", ascending=False).head(2)
+        for _, r in typd.iterrows():
+            out.append({
+                "topic":"Transaction-type surge",
+                "detail":f"{r[typ]} recent {int(r['recent'])} vs prior {int(r['prior'])}",
+                "why":"Upstream demand or workflow change",
+                "severity":"med" if r["delta"]>=30 else "low"
+            })
+
+    # Rank and trim
+    if not out:
+        return pd.DataFrame(columns=["rank","topic","detail","why","severity"])
+    df_out = pd.DataFrame(out)
+    # simple severity ranking
+    sev_rank = df_out["severity"].map({"high":3,"med":2,"low":1}).fillna(1)
+    df_out = df_out.iloc[sev_rank.sort_values(ascending=False).index].reset_index(drop=True)
+    df_out.insert(0, "rank", np.arange(1, len(df_out)+1))
+    return df_out.head(10)
+
+def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> Tuple[str, pd.DataFrame]:
+    """
+    Lightweight Q&A without an LLM. Pattern-matches common asks and returns
+    a short answer + a table backing it up. Extend with new patterns anytime.
+    """
+    q = question.strip().lower()
+    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
+
+    # 1) "top devices" (by events)
+    if re.search(r"\b(top|most)\b.*\bdevices?\b", q):
+        t = ev.groupby(dev).size().rename("events").reset_index().sort_values("events", ascending=False).head(10)
+        ans = f"Top devices by event volume (showing {len(t)}):"
+        return ans, t
+
+    # 2) "longest dwell devices"
+    if "longest" in q and "dwell" in q:
+        if data.empty:
+            return "No dwell data in current filter.", pd.DataFrame()
+        t = (
+            data.loc[~data["__device_change"], ["__gap_s"]]
+            .groupby(data[dev]).median().rename(columns={"__gap_s":"median_dwell_s"})
+            .sort_values("median_dwell_s", ascending=False).head(10).reset_index()
+        )
+        t["median_dwell_hms"] = t["median_dwell_s"].map(fmt_hms)
+        return "Devices with longest median dwell:", t
+
+    # 3) "median walk gap for <tech>"
+    m = re.search(r"median .*walk.* for (.+)", q)
+    if m:
+        name = m.group(1).strip()
+        sub = data[data[usr].str.lower()==name.lower()]
+        if sub.empty:
+            return f"No rows found for user '{name}'.", pd.DataFrame()
+        val = np.nanmedian(sub["__walk_gap_s"].values)
+        return f"Median walk gap for {name}: {fmt_hms(val)} ({int(val)}s)", pd.DataFrame()
+
+    # 4) "events by hour" / "busiest hour"
+    if "hour" in q:
+        t = ev.groupby(ev[ts].dt.floor("H")).size().rename("events").reset_index().rename(columns={ts:"hour"})
+        if t.empty:
+            return "No hourly data in current filter.", pd.DataFrame()
+        top = t.sort_values("events", ascending=False).head(1).iloc[0]
+        ans = f"Busiest hour: {top['hour']:%Y-%m-%d %H:%M} with {int(top['events'])} events."
+        return ans, t.sort_values("hour")
+
+    # 5) "which tech has the highest/lowest median walk gap"
+    if "which tech" in q and "median walk" in q:
+        if data.empty:
+            return "No walk-gap data in current filter.", pd.DataFrame()
+        t = data.groupby(usr)["__walk_gap_s"].median().reset_index().rename(columns={"__walk_gap_s":"median_walk_s"})
+        t = t.sort_values("median_walk_s", ascending=False)
+        top = t.iloc[0]
+        ans = f"Highest median walk gap: {top[usr]} at {fmt_hms(top['median_walk_s'])}."
+        return ans, t
+
+    # default fallback
+    # return basic overview
+    ans = "Try asks like: 'top devices', 'longest dwell devices', 'median walk gap for Alice', 'busiest hour'."
+    tbl = ev[[ts, usr, dev, typ]].head(50)
+    return ans, tbl
+
 
 def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
     if col not in df.columns:
@@ -309,10 +481,11 @@ data["dwell_hms"]    = data["__dwell_s"].map(fmt_hms)
 data["visit_hms"]    = data["visit_duration_s"].map(fmt_hms)
 
 # Tabs
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
     ["📈 Overview", "🚶 Delivery Analytics", "🧑‍🔧 Tech Comparison",
-     "📦 Devices", "⏱ Hourly", "🧪 Drill-down"]
+     "📦 Devices", "⏱ Hourly", "🧪 Drill-down", "🔟 Weekly Top 10", "❓ Ask the data"]
 )
+
 
 with tab1:
     st.subheader("Overview")
@@ -417,3 +590,34 @@ with tab6:
     )
 
 st.caption("Slider uses native Python datetimes; duplicate column names are auto-deduped. Drill-down shows H:MM:SS plus raw seconds for auditability.")
+with tab7:
+    st.subheader("Weekly Top 10 (last 7d vs prior 7d)")
+    # 'combined' already exists earlier (history + new). Use it for anomalies.
+    try:
+        top10 = anomalies_top10(combined, data, colmap)
+        if top10.empty:
+            st.info("Not enough history yet to compute a weekly digest.")
+        else:
+            st.dataframe(top10, use_container_width=True, height=480)
+            dl = top10.to_csv(index=False).encode("utf-8")
+            st.download_button("Download Top 10 as CSV", dl, "weekly_top10.csv", "text/csv")
+    except Exception as e:
+        st.error(f"Could not build Top 10: {e}")
+
+with tab8:
+    st.subheader("Ask the data")
+    q = st.text_input("Type a question (e.g., 'top devices', 'median walk gap for Melissa')")
+    if q:
+        ans, tbl = qa_answer(q, ev, data, colmap)
+        st.write(ans)
+        if not tbl.empty:
+            st.dataframe(tbl, use_container_width=True, height=420)
+            st.download_button(
+                "Download answer table as CSV",
+                tbl.to_csv(index=False).encode("utf-8"),
+                "qa_answer.csv",
+                "text/csv"
+            )
+    else:
+        st.info("Examples: 'top devices', 'longest dwell devices', 'median walk gap for <name>', 'busiest hour'.")
+
