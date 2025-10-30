@@ -13,6 +13,29 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 import re
+import os
+
+LOCAL_HISTORY_FILE = "event_history.parquet"
+if os.path.exists(LOCAL_HISTORY_FILE):
+    history = pd.read_parquet(LOCAL_HISTORY_FILE)
+else:
+    history = pd.DataFrame()
+    # Deduplicate against history
+if not history.empty:
+    combined = pd.concat([history, to_save], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["pk"])
+else:
+    combined = to_save.copy()
+
+# Save back to local parquet file
+combined.to_parquet(LOCAL_HISTORY_FILE, index=False)
+
+# Update history in memory
+history = combined
+
+st.success(f"Added {len(to_save)} new rows. Total history: {len(history)} rows.")
+
+
 
 
 # ----------------------------- CONFIG ---------------------------------
