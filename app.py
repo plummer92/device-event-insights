@@ -136,14 +136,28 @@ if ev.empty:
 
 st.sidebar.header("3) Filters")
 
-min_ts, max_ts = ev[colmap["datetime"]].min(), ev[colmap["datetime"]].max()
+from datetime import timedelta
+
+# Get min/max from your selected datetime column
+_min = pd.to_datetime(ev[colmap["datetime"]].min())
+_max = pd.to_datetime(ev[colmap["datetime"]].max())
+
+# Convert pandas Timestamps -> native Python datetimes
+min_ts = _min.to_pydatetime()
+max_ts = _max.to_pydatetime()
+
+# If identical (single-timestamp file), pad the max a bit so slider works
+if min_ts == max_ts:
+    max_ts = min_ts + timedelta(minutes=1)
+
 rng = st.sidebar.slider(
     "Time range",
-    value=(pd.to_datetime(min_ts), pd.to_datetime(max_ts)),
-    min_value=pd.to_datetime(min_ts),
-    max_value=pd.to_datetime(max_ts),
-    format="YYYY-MM-DD HH:mm"
+    min_value=min_ts,
+    max_value=max_ts,
+    value=(min_ts, max_ts),
+    format="YYYY-MM-DD HH:mm",
 )
+
 
 devices = sorted(ev[colmap["device"]].dropna().unique().tolist())
 users   = sorted(ev[colmap["user"]].dropna().unique().tolist())
