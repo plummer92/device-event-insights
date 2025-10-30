@@ -1,14 +1,15 @@
 # app.py
-# Device Event Insights — Delivery Analytics & Drill-down
-# - Fixes: duplicate column names, Timestamp slider errors, safe datetime parsing
-# - Built for daily XLSX uploads with weekly summary and on-click drill-down
+# Device Event Insights — Pro
+# - Dedupes duplicate columns on upload
+# - Safe datetime parsing + native datetime slider
+# - Delivery analytics (walk gaps, dwell)
+# - Drill-down with H:MM:SS, per-visit durations, CSV exports
 
-import io
 from datetime import timedelta
 from typing import Dict, Tuple, List
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import plotly.express as px
 import streamlit as st
 
@@ -31,53 +32,31 @@ DEFAULT_COLMAP = {
     "medid": "MedID",
 }
 
-EVENT_LABELS = {
-    "Refill": {"kind": "refill"},
-    "Verify Inventory": {"kind": "verify"},
-    "Unload": {"kind": "unload"},
-    "Load": {"kind": "load"},
-}
-
-# idle gap (seconds) considered "walk/travel" to next device
-DEFAULT_IDLE_MIN = 30
+DEFAULT_IDLE_MIN = 30  # seconds to consider as a walking/travel gap
 
 # ----------------------------- HELPERS --------------------------------
 
-
 def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure column names are unique: if exact dupes exist, keep first."""
-    # Fast path: drop exact duplicate names
+    """Ensure column names are unique by dropping exact dupes; trim whitespace."""
     if df.columns.duplicated().any():
         df = df.loc[:, ~df.columns.duplicated()].copy()
-
-    # Also normalize whitespace/casing a bit (no rename collisions)
-    # (Keep original names for now, only strip whitespace)
     df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
     return df
 
-
 def parse_datetime_series(s: pd.Series) -> pd.Series:
-    """Parse to pandas datetime; coerce errors; ensure tz-naive for consistency."""
+    """Parse to pandas datetime (UTC, tz-naive for consistency)."""
     out = pd.to_datetime(s, errors="coerce", utc=True)
-    # Make tz-naive for consistent comparison/plotting
     if pd.api.types.is_datetime64tz_dtype(out):
         out = out.dt.tz_convert("UTC").dt.tz_localize(None)
     return out
 
-
 def base_clean(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
-    """
-    1) Dedup columns
-    2) Parse datetime
-    3) Standardize types
-    """
     out = dedupe_columns(df_raw).copy()
 
-    # Handle possible duplicate datetime label returning a DataFrame
+    # Handle possible duplicate-named datetime columns (DataFrame-like)
     dtcol = colmap["datetime"]
     s = out[dtcol]
     if isinstance(s, pd.DataFrame):
-        # if multiple columns with same *displayed* label, take first
         s = s.iloc[:, 0]
     out[dtcol] = parse_datetime_series(s)
 
@@ -91,23 +70,19 @@ def base_clean(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
         if c and c in out.columns:
             out[c] = out[c].astype("string").str.strip()
 
-    # drop rows with no datetime
     out = out.dropna(subset=[dtcol]).copy()
     out = out.sort_values(dtcol).reset_index(drop=True)
 
-    # Add engineered columns
+    # engineered calendar columns
     out["__date"] = out[dtcol].dt.date
     out["__hour"] = out[dtcol].dt.hour
     out["__dow"] = out[dtcol].dt.day_name()
-
     return out
-
 
 def build_delivery_analytics(
     ev: pd.DataFrame, colmap: Dict[str, str], idle_min: int
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Compute per-tech sequences, walk gaps, device and tech stats, and hourly view.
     Returns:
       data: events with next-event/gap annotations
       device_stats: per device volume and median dwell
@@ -115,26 +90,23 @@ def build_delivery_analytics(
       run_stats: per (tech, run group) sequences
       hourly: hourly counts
     """
-    ts = colmap["datetime"]
+    ts  = colmap["datetime"]
     dev = colmap["device"]
-    user = colmap["user"]
+    usr = colmap["user"]
     typ = colmap["type"]
 
-    needed = [ts, dev, user, typ]
-    if colmap.get("desc"):
-        needed.append(colmap["desc"])
-    if colmap.get("medid"):
-        needed.append(colmap["medid"])
-    if colmap.get("qty"):
-        needed.append(colmap["qty"])
+    needed = [ts, dev, usr, typ]
+    if colmap.get("desc") and colmap["desc"] in ev.columns: needed.append(colmap["desc"])
+    if colmap.get("medid") and colmap["medid"] in ev.columns: needed.append(colmap["medid"])
+    if colmap.get("qty")   and colmap["qty"]   in ev.columns: needed.append(colmap["qty"])
 
-    data = ev[needed].sort_values([user, ts]).copy()
+    data = ev[needed].sort_values([usr, ts]).copy()
 
     # Next-event per tech
-    data["__next_ts"] = data.groupby(user)[ts].shift(-1)
-    data["__next_dev"] = data.groupby(user)[dev].shift(-1)
+    data["__next_ts"]  = data.groupby(usr)[ts].shift(-1)
+    data["__next_dev"] = data.groupby(usr)[dev].shift(-1)
 
-    # Gaps (seconds) and whether they changed device
+    # Gaps (seconds) and device change
     data["__gap_s"] = (data["__next_ts"] - data[ts]).dt.total_seconds()
     data["__device_change"] = (data[dev] != data["__next_dev"]) & data["__next_dev"].notna()
 
@@ -145,6 +117,31 @@ def build_delivery_analytics(
         np.nan,
     )
 
+    # Dwell (same-device) gap
+    data["__dwell_s"] = np.where(~data["__device_change"], data["__gap_s"], np.nan)
+
+    # Visit ID: increments whenever device changes for a given tech
+    data["__visit_id"] = (
+        data.groupby(usr)[dev]
+            .apply(lambda x: (x != x.shift()).cumsum())
+            .reset_index(level=0, drop=True)
+    )
+
+    # Visit summary: start/end/duration for each (tech, visit_id, device)
+    visit = (
+        data.groupby([usr, "__visit_id", dev])
+            .agg(start=(ts, "min"), end=(ts, "max"))
+            .reset_index()
+    )
+    visit["visit_duration_s"] = (visit["end"] - visit["start"]).dt.total_seconds()
+
+    # Attach visit duration back onto each event row
+    data = data.merge(
+        visit[[usr, "__visit_id", "visit_duration_s"]],
+        on=[usr, "__visit_id"],
+        how="left"
+    )
+
     # Device stats
     cnt = data.groupby(dev).size().rename("events")
     dwell = (
@@ -153,18 +150,28 @@ def build_delivery_analytics(
         .median()
         .rename("median_dwell_s")
     )
-    device_stats = pd.concat([cnt, dwell], axis=1).fillna(0).sort_values("events", ascending=False).reset_index()
+    device_stats = (
+        pd.concat([cnt, dwell], axis=1)
+        .fillna(0)
+        .sort_values("events", ascending=False)
+        .reset_index()
+    )
 
     # Tech stats
-    tcnt = data.groupby(user).size().rename("events")
-    twalk = data["__walk_gap_s"].groupby(data[user]).median().rename("median_walk_gap_s")
-    tech_stats = pd.concat([tcnt, twalk], axis=1).fillna(0).sort_values("events", ascending=False).reset_index()
+    tcnt = data.groupby(usr).size().rename("events")
+    twalk = data["__walk_gap_s"].groupby(data[usr]).median().rename("median_walk_gap_s")
+    tech_stats = (
+        pd.concat([tcnt, twalk], axis=1)
+        .fillna(0)
+        .sort_values("events", ascending=False)
+        .reset_index()
+    )
 
-    # Run sequences (simple: consecutive actions until a long idle+device change)
+    # Run sequences (simple heuristic)
     data["__is_break"] = (data["__walk_gap_s"] >= idle_min).fillna(False)
-    data["__run_id"] = data.groupby(user)["__is_break"].cumsum()
+    data["__run_id"] = data.groupby(usr)["__is_break"].cumsum()
     run_stats = (
-        data.groupby([user, "__run_id"])
+        data.groupby([usr, "__run_id"])
         .agg(
             start=(ts, "min"),
             end=(ts, "max"),
@@ -177,15 +184,18 @@ def build_delivery_analytics(
     run_stats["duration_s"] = (run_stats["end"] - run_stats["start"]).dt.total_seconds()
 
     # Hourly
-    hourly = data.groupby(data[ts].dt.floor("H")).size().rename("events").reset_index().rename(columns={ts: "hour"})
+    hourly = (
+        data.groupby(data[ts].dt.floor("H"))
+        .size().rename("events").reset_index()
+        .rename(columns={ts: "hour"})
+    )
 
-    return data, device_stats, tech_stats, run_stats, hourly
-
+    return data, device_stats, tech_stats, run_stats, hourly, visit
 
 def weekly_summary(ev: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
-    ts = colmap["datetime"]
+    ts  = colmap["datetime"]
     dev = colmap["device"]
-    user = colmap["user"]
+    usr = colmap["user"]
     typ = colmap["type"]
 
     df = ev.copy()
@@ -195,22 +205,27 @@ def weekly_summary(ev: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
         .agg(
             events=(typ, "count"),
             devices=(dev, "nunique"),
-            techs=(user, "nunique"),
+            techs=(usr, "nunique"),
         )
         .reset_index()
         .sort_values("week")
     )
     return out
 
-
 def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
     if col not in df.columns:
         return []
     return sorted([x for x in df[col].dropna().astype(str).unique()])
 
+def fmt_hms(x) -> str:
+    if pd.isna(x):
+        return ""
+    x = int(round(float(x)))
+    h, r = divmod(x, 3600)
+    m, s = divmod(r, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
 
 # ----------------------------- UI ------------------------------------
-
 
 st.title("All Device Event Insights — Pro")
 
@@ -231,7 +246,7 @@ else:
 st.sidebar.header("2) Map columns")
 colmap = {}
 for k, default in DEFAULT_COLMAP.items():
-    opts = [c for c in df_raw.columns]
+    opts = list(df_raw.columns)
     sel = st.sidebar.selectbox(
         f"{k.capitalize()} column",
         options=opts,
@@ -244,10 +259,9 @@ for k, default in DEFAULT_COLMAP.items():
 # Clean + Engineer
 ev = base_clean(df_raw, colmap)
 
-# 3) Filters (with fixed slider)
+# 3) Filters (native datetime slider)
 st.sidebar.header("3) Filters")
 
-# Slider requires native datetime
 _min = pd.to_datetime(ev[colmap["datetime"]].min())
 _max = pd.to_datetime(ev[colmap["datetime"]].max())
 min_ts = _min.to_pydatetime()
@@ -263,10 +277,10 @@ rng = st.sidebar.slider(
     format="YYYY-MM-DD HH:mm",
 )
 
-# other filters
 pick_devices = st.sidebar.multiselect("Devices", safe_unique(ev, colmap["device"]))
-pick_users = st.sidebar.multiselect("Users", safe_unique(ev, colmap["user"]))
-pick_types = st.sidebar.multiselect("Transaction types", safe_unique(ev, colmap["type"]))
+pick_users   = st.sidebar.multiselect("Users", safe_unique(ev, colmap["user"]))
+pick_types   = st.sidebar.multiselect("Transaction types", safe_unique(ev, colmap["type"]))
+idle_min = st.sidebar.number_input("Walk gap threshold (seconds)", min_value=5, max_value=900, value=DEFAULT_IDLE_MIN, step=5)
 
 # Apply mask (convert picked datetimes back to pandas for comparison)
 mask = (
@@ -285,12 +299,16 @@ if ev.empty:
     st.warning("No events in current filter range.")
     st.stop()
 
-idle_min = st.sidebar.number_input("Walk gap threshold (seconds)", min_value=5, max_value=900, value=DEFAULT_IDLE_MIN, step=5)
-
 # Compute analytics
-data, device_stats, tech_stats, run_stats, hourly = build_delivery_analytics(ev, colmap, idle_min=idle_min)
+data, device_stats, tech_stats, run_stats, hourly, visit = build_delivery_analytics(ev, colmap, idle_min=idle_min)
 
-# Tabs (make sure counts match)
+# Pre-format H:MM:SS fields for drill-down
+data["gap_hms"]      = data["__gap_s"].map(fmt_hms)
+data["walk_gap_hms"] = data["__walk_gap_s"].map(fmt_hms)
+data["dwell_hms"]    = data["__dwell_s"].map(fmt_hms)
+data["visit_hms"]    = data["visit_duration_s"].map(fmt_hms)
+
+# Tabs
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     ["📈 Overview", "🚶 Delivery Analytics", "🧑‍🔧 Tech Comparison",
      "📦 Devices", "⏱ Hourly", "🧪 Drill-down"]
@@ -311,14 +329,14 @@ with tab1:
 
 with tab2:
     st.subheader("Delivery Analytics (per-tech sequences)")
-
     c1, c2 = st.columns(2)
+
     # Walking gaps histogram
     hg = data["__walk_gap_s"].dropna()
     if not hg.empty:
         fig = px.histogram(hg, nbins=40, title="Walking/Travel gaps (seconds)")
         c1.plotly_chart(fig, use_container_width=True)
-        c1.caption("X-axis = seconds between finishing a device and starting the next device (≥ threshold & device changed).")
+        c1.caption("X-axis = seconds between finishing a device and starting the next (≥ threshold & device changed).")
 
     # Dwell (same-device) gaps histogram
     dw = data.loc[~data["__device_change"], "__gap_s"].dropna()
@@ -326,7 +344,7 @@ with tab2:
         fig2 = px.histogram(dw, nbins=40, title="Same-device dwell gaps (seconds)")
         c2.plotly_chart(fig2, use_container_width=True)
 
-    st.markdown("**Pro tip:** Click the *Drill-down* tab and filter by user/device to inspect the exact rows behind any long gap.")
+    st.markdown("**Tip:** Use the *Drill-down* tab to inspect rows behind any long gaps.")
 
 with tab3:
     st.subheader("Tech comparison")
@@ -351,24 +369,51 @@ with tab5:
 
 with tab6:
     st.subheader("Drill-down (click a row → review source)")
-    # Show essential columns + gap annotations
+
+    # Columns to show in the table, with both raw and formatted times
     show_cols = [
         colmap["datetime"], colmap["user"], colmap["device"], colmap["type"],
-        "__gap_s", "__walk_gap_s", "__device_change"
+        # human-friendly time fields:
+        "gap_hms", "walk_gap_hms", "dwell_hms", "visit_hms",
+        # raw seconds (for sorting/export/audits):
+        "__gap_s", "__walk_gap_s", "__dwell_s", "visit_duration_s",
+        "__device_change",
     ]
     if colmap.get("desc") and colmap["desc"] in data.columns:
-        show_cols.append(colmap["desc"])
+        show_cols.insert(4, colmap["desc"])  # put description right after type
     if colmap.get("qty") and colmap["qty"] in data.columns:
-        show_cols.append(colmap["qty"])
+        show_cols.insert(5, colmap["qty"])
     if colmap.get("medid") and colmap["medid"] in data.columns:
-        show_cols.append(colmap["medid"])
+        show_cols.insert(6, colmap["medid"])
 
+    show_cols = [c for c in show_cols if c in data.columns]
     table = data[show_cols].copy()
-    st.dataframe(table, use_container_width=True, height=500)
 
-    # CSV export for validation
+    st.dataframe(table, use_container_width=True, height=520)
     csv = table.to_csv(index=False).encode("utf-8")
-    st.download_button("Download current drill-down as CSV", data=csv, file_name="drilldown.csv", mime="text/csv")
+    st.download_button(
+        "Download current drill-down as CSV",
+        data=csv,
+        file_name="drilldown.csv",
+        mime="text/csv"
+    )
 
-# Footer
-st.caption("Slider uses native Python datetimes to avoid Timestamp type errors; duplicate column names are auto-deduped.")
+    st.markdown("### Per-visit summary (time per continuous stop at a device)")
+    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]
+    visit_show = visit[[usr, dev, "start", "end", "visit_duration_s"]].copy()
+    visit_show["visit_hms"] = visit_show["visit_duration_s"].map(fmt_hms)
+
+    st.dataframe(
+        visit_show[[usr, dev, "start", "end", "visit_hms", "visit_duration_s"]],
+        use_container_width=True,
+        height=360
+    )
+    csv2 = visit_show.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download visit summary as CSV",
+        data=csv2,
+        file_name="visit_summary.csv",
+        mime="text/csv"
+    )
+
+st.caption("Slider uses native Python datetimes; duplicate column names are auto-deduped. Drill-down shows H:MM:SS plus raw seconds for auditability.")
