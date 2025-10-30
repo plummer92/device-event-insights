@@ -14,26 +14,7 @@ import plotly.express as px
 import streamlit as st
 import re
 import os
-
 LOCAL_HISTORY_FILE = "event_history.parquet"
-if os.path.exists(LOCAL_HISTORY_FILE):
-    history = pd.read_parquet(LOCAL_HISTORY_FILE)
-else:
-    history = pd.DataFrame()
-    # Deduplicate against history
-if not history.empty:
-    combined = pd.concat([history, to_save], ignore_index=True)
-    combined = combined.drop_duplicates(subset=["pk"])
-else:
-    combined = to_save.copy()
-
-# Save back to local parquet file
-combined.to_parquet(LOCAL_HISTORY_FILE, index=False)
-
-# Update history in memory
-history = combined
-
-st.success(f"Added {len(to_save)} new rows. Total history: {len(history)} rows.")
 
 
 
@@ -239,28 +220,74 @@ def weekly_summary(ev: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
 def _dt_floor_date(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s).dt.floor("D")
 
-def anomalies_top10(ev_all: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> pd.DataFrame:
-    """
-    Build a Top 10 'look-into-this' list using last 7 days vs prior 7 days.
-    Requires combined history (your app already builds 'combined' before filtering).
-    """
-    if ev_all.empty:
-        return pd.DataFrame(columns=["rank","topic","detail","why","severity"])
+# ---------- LOCAL PERSISTENCE (Parquet) ----------
+# Load existing local history (if any)
+def load_history():
+    if os.path.exists(LOCAL_HISTORY_FILE):
+        try:
+            return pd.read_parquet(LOCAL_HISTORY_FILE)
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
 
-    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
+history = load_history()
 
-    df = ev_all.copy()
-    df[ts] = pd.to_datetime(df[ts], errors="coerce")
-    df = df.dropna(subset=[ts])
+# Build pk helper (same logic you use elsewhere)
+def _build_pk(df):
+    cols = []
+    for k in ["datetime","device","user","type","desc","qty","medid"]:
+        c = colmap.get(k)
+        if c in df.columns:
+            cols.append(df[c].astype(str))
+        else:
+            cols.append(pd.Series([""], index=df.index))
+    arr = np.vstack([c.values for c in cols]).T
+    out = [hashlib.sha1("|".join(row).encode("utf-8")).hexdigest() for row in arr]
+    return pd.Series(out, index=df.index)
 
-    end = df[ts].max().floor("D") + pd.Timedelta(days=1)
-    start = end - pd.Timedelta(days=14)
-    cur0  = end - pd.Timedelta(days=7)
+# Ensure new uploads have pk (if you created new_ev above)
+if not new_ev.empty:
+    if colmap["datetime"] in new_ev.columns:
+        new_ev[colmap["datetime"]] = parse_datetime_series(new_ev[colmap["datetime"]])
+    if "pk" not in new_ev.columns:
+        new_ev["pk"] = _build_pk(new_ev)
 
-    recent = df[(df[ts] >= cur0) & (df[ts] < end)].copy()
-    prior  = df[(df[ts] >= start) & (df[ts] < cur0)].copy()
+# Make sure history schema is compatible and has pk too
+if not history.empty:
+    if colmap["datetime"] in history.columns:
+        history[colmap["datetime"]] = parse_datetime_series(history[colmap["datetime"]])
+    if "pk" not in history.columns:
+        history["pk"] = _build_pk(history)
+    # add any new columns present in new_ev but missing in history
+    for c in new_ev.columns if not new_ev.empty else []:
+        if c not in history.columns:
+            history[c] = pd.NA
 
-    out = []
+# Combine and dedupe
+if not new_ev.empty and not history.empty:
+    combined = pd.concat([history, new_ev], ignore_index=True)
+elif not history.empty:
+    combined = history.copy()
+else:
+    combined = new_ev.copy()
+
+if combined.empty:
+    st.warning("No data to analyze yet. Upload files to start building local history.")
+    st.stop()
+
+combined = combined.drop_duplicates(subset=["pk"]).reset_index(drop=True)
+
+# Save back to local parquet
+try:
+    combined.to_parquet(LOCAL_HISTORY_FILE, index=False)
+    st.sidebar.success(f"Saved local history: {len(combined):,} rows → {LOCAL_HISTORY_FILE}")
+except Exception as e:
+    st.sidebar.error(f"Could not save local history: {e}")
+
+# Use 'combined' for the rest of the app
+ev = combined.copy()
+# ---------- END LOCAL PERSISTENCE ----------
+
 
     # 1) Devices with biggest volume spikes
     if not recent.empty and not prior.empty:
