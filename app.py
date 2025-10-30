@@ -1,23 +1,22 @@
 # app.py
-# Device Event Insights — Pro
-# - Dedupes duplicate columns on upload
-# - Safe datetime parsing + native datetime slider
-# - Delivery analytics (walk gaps, dwell)
-# - Drill-down with H:MM:SS, per-visit durations, CSV exports
+# Device Event Insights — Pro (local persistence)
+# - Deduped columns, safe datetime parsing, native datetime slider
+# - Delivery analytics (walk gaps, dwell, visit times)
+# - Drill-down with H:MM:SS & CSV exports
+# - Local Parquet history w/ PK dedupe
+# - Weekly Top 10 & lightweight Q&A
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Dict, Tuple, List
-
+import hashlib
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 import re
 import os
+
 LOCAL_HISTORY_FILE = "event_history.parquet"
-
-
-
 
 # ----------------------------- CONFIG ---------------------------------
 
@@ -85,9 +84,22 @@ def base_clean(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
     out["__dow"] = out[dtcol].dt.day_name()
     return out
 
+def fmt_hms(x) -> str:
+    if pd.isna(x):
+        return ""
+    x = int(round(float(x)))
+    h, r = divmod(x, 3600)
+    m, s = divmod(r, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+
+def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
+    if col not in df.columns:
+        return []
+    return sorted([x for x in df[col].dropna().astype(str).unique()])
+
 def build_delivery_analytics(
     ev: pd.DataFrame, colmap: Dict[str, str], idle_min: int
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Returns:
       data: events with next-event/gap annotations
@@ -95,6 +107,7 @@ def build_delivery_analytics(
       tech_stats: per tech totals and median walk gap
       run_stats: per (tech, run group) sequences
       hourly: hourly counts
+      visit: per-visit durations (time per continuous stop at a device)
     """
     ts  = colmap["datetime"]
     dev = colmap["device"]
@@ -217,84 +230,29 @@ def weekly_summary(ev: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
         .sort_values("week")
     )
     return out
-def _dt_floor_date(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s).dt.floor("D")
 
-# ---------- LOCAL PERSISTENCE (Parquet) ----------
-# Load existing local history (if any)
-def load_history():
-    if os.path.exists(LOCAL_HISTORY_FILE):
-        try:
-            return pd.read_parquet(LOCAL_HISTORY_FILE)
-        except Exception:
-            return pd.DataFrame()
-    return pd.DataFrame()
+def anomalies_top10(ev_all: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> pd.DataFrame:
+    """
+    Simple weekly digest: last 7d vs prior 7d on volume & types,
+    plus largest median walk/dwell and rush hours.
+    """
+    out = []
+    if ev_all.empty:
+        return pd.DataFrame(columns=["rank","topic","detail","why","severity"])
 
-history = load_history()
-
-# Build pk helper (same logic you use elsewhere)
-def _build_pk(df):
-    cols = []
-    for k in ["datetime","device","user","type","desc","qty","medid"]:
-        c = colmap.get(k)
-        if c in df.columns:
-            cols.append(df[c].astype(str))
-        else:
-            cols.append(pd.Series([""], index=df.index))
-    arr = np.vstack([c.values for c in cols]).T
-    out = [hashlib.sha1("|".join(row).encode("utf-8")).hexdigest() for row in arr]
-    return pd.Series(out, index=df.index)
-
-# Ensure new uploads have pk (if you created new_ev above)
-if not new_ev.empty:
-    if colmap["datetime"] in new_ev.columns:
-        new_ev[colmap["datetime"]] = parse_datetime_series(new_ev[colmap["datetime"]])
-    if "pk" not in new_ev.columns:
-        new_ev["pk"] = _build_pk(new_ev)
-
-# Make sure history schema is compatible and has pk too
-if not history.empty:
-    if colmap["datetime"] in history.columns:
-        history[colmap["datetime"]] = parse_datetime_series(history[colmap["datetime"]])
-    if "pk" not in history.columns:
-        history["pk"] = _build_pk(history)
-    # add any new columns present in new_ev but missing in history
-    for c in new_ev.columns if not new_ev.empty else []:
-        if c not in history.columns:
-            history[c] = pd.NA
-
-# Combine and dedupe
-if not new_ev.empty and not history.empty:
-    combined = pd.concat([history, new_ev], ignore_index=True)
-elif not history.empty:
-    combined = history.copy()
-else:
-    combined = new_ev.copy()
-
-if combined.empty:
-    st.warning("No data to analyze yet. Upload files to start building local history.")
-    st.stop()
-
-combined = combined.drop_duplicates(subset=["pk"]).reset_index(drop=True)
-
-# Save back to local parquet
-try:
-    combined.to_parquet(LOCAL_HISTORY_FILE, index=False)
-    st.sidebar.success(f"Saved local history: {len(combined):,} rows → {LOCAL_HISTORY_FILE}")
-except Exception as e:
-    st.sidebar.error(f"Could not save local history: {e}")
-
-# Use 'combined' for the rest of the app
-ev = combined.copy()
-# ---------- END LOCAL PERSISTENCE ----------
-
+    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
+    now = ev_all[ts].max()
+    start_recent = (now - pd.Timedelta(days=7)).floor("D")
+    start_prior  = (now - pd.Timedelta(days=14)).floor("D")
+    prior = ev_all[(ev_all[ts] >= start_prior) & (ev_all[ts] < start_recent)]
+    recent = ev_all[(ev_all[ts] >= start_recent) & (ev_all[ts] <= now)]
 
     # 1) Devices with biggest volume spikes
     if not recent.empty and not prior.empty:
         r_dev = recent.groupby(dev).size().rename("recent").reset_index()
         p_dev = prior.groupby(dev).size().rename("prior").reset_index()
         vol = r_dev.merge(p_dev, on=dev, how="left").fillna(0.0)
-        vol["delta"] = vol["recent"] - vol["prior"].replace(0, np.nan)
+        vol["delta"] = vol["recent"] - vol["prior"]
         vol["pct"] = np.where(vol["prior"]>0, (vol["recent"]-vol["prior"])/vol["prior"], np.nan)
         vol = vol.sort_values(["pct","delta"], ascending=False).head(3)
         for _, r in vol.iterrows():
@@ -307,13 +265,13 @@ ev = combined.copy()
 
     # 2) Techs with largest median walk gap
     if not data.empty:
-        twalk = data["__walk_gap_s"].groupby(data[colmap["user"]]).median().dropna()
+        twalk = data["__walk_gap_s"].groupby(data[usr]).median().dropna()
         if not twalk.empty:
             top_walk = twalk.sort_values(ascending=False).head(3)
             for u, s in top_walk.items():
                 out.append({
                     "topic":"High walking time",
-                    "detail":f"{u} median walk gap {int(s)}s",
+                    "detail":f"{u} median walk gap {fmt_hms(s)} ({int(s)}s)",
                     "why":"Inefficient routing or distant devices in their run",
                     "severity": "med" if s>=120 else "low"
                 })
@@ -322,14 +280,14 @@ ev = combined.copy()
     if not data.empty:
         dwell = (
             data.loc[~data["__device_change"], "__gap_s"]
-            .groupby(data[colmap["device"]]).median().dropna()
+            .groupby(data[dev]).median().dropna()
         )
         if not dwell.empty:
             top_dwell = dwell.sort_values(ascending=False).head(3)
             for d, s in top_dwell.items():
                 out.append({
                     "topic":"Long dwell at device",
-                    "detail":f"{d} median dwell {int(s)}s",
+                    "detail":f"{d} median dwell {fmt_hms(s)} ({int(s)}s)",
                     "why":"Many refills per stop or slow transactions; check slot layout",
                     "severity":"med" if s>=60 else "low"
                 })
@@ -347,7 +305,7 @@ ev = combined.copy()
                     "severity":"med" if n>=100 else "low"
                 })
 
-    # 5) Transaction-type surges (verify+refill vs loads/unloads/outdates)
+    # 5) Transaction-type surges
     if not recent.empty and not prior.empty:
         r_t = recent.groupby(typ).size().rename("recent").reset_index()
         p_t = prior.groupby(typ).size().rename("prior").reset_index()
@@ -362,21 +320,17 @@ ev = combined.copy()
                 "severity":"med" if r["delta"]>=30 else "low"
             })
 
-    # Rank and trim
     if not out:
         return pd.DataFrame(columns=["rank","topic","detail","why","severity"])
+
     df_out = pd.DataFrame(out)
-    # simple severity ranking
     sev_rank = df_out["severity"].map({"high":3,"med":2,"low":1}).fillna(1)
     df_out = df_out.iloc[sev_rank.sort_values(ascending=False).index].reset_index(drop=True)
     df_out.insert(0, "rank", np.arange(1, len(df_out)+1))
     return df_out.head(10)
 
 def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> Tuple[str, pd.DataFrame]:
-    """
-    Lightweight Q&A without an LLM. Pattern-matches common asks and returns
-    a short answer + a table backing it up. Extend with new patterns anytime.
-    """
+    """Lightweight Q&A without an LLM."""
     q = question.strip().lower()
     ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
 
@@ -427,25 +381,9 @@ def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[
         ans = f"Highest median walk gap: {top[usr]} at {fmt_hms(top['median_walk_s'])}."
         return ans, t
 
-    # default fallback
-    # return basic overview
-    ans = "Try asks like: 'top devices', 'longest dwell devices', 'median walk gap for Alice', 'busiest hour'."
+    ans = "Try asks like: 'top devices', 'longest dwell devices', 'median walk gap for Melissa', 'busiest hour'."
     tbl = ev[[ts, usr, dev, typ]].head(50)
     return ans, tbl
-
-
-def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
-    if col not in df.columns:
-        return []
-    return sorted([x for x in df[col].dropna().astype(str).unique()])
-
-def fmt_hms(x) -> str:
-    if pd.isna(x):
-        return ""
-    x = int(round(float(x)))
-    h, r = divmod(x, 3600)
-    m, s = divmod(r, 60)
-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
 
 # ----------------------------- UI ------------------------------------
 
@@ -478,8 +416,74 @@ for k, default in DEFAULT_COLMAP.items():
     )
     colmap[k] = sel
 
-# Clean + Engineer
-ev = base_clean(df_raw, colmap)
+# Clean + Engineer current upload
+new_ev = base_clean(df_raw, colmap)
+
+# ---------- LOCAL PERSISTENCE (Parquet) ----------
+def load_history() -> pd.DataFrame:
+    if os.path.exists(LOCAL_HISTORY_FILE):
+        try:
+            return pd.read_parquet(LOCAL_HISTORY_FILE)
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+history = load_history()
+
+def _build_pk(df: pd.DataFrame) -> pd.Series:
+    cols = []
+    for k in ["datetime","device","user","type","desc","qty","medid"]:
+        c = colmap.get(k)
+        if c in df.columns:
+            cols.append(df[c].astype(str))
+        else:
+            cols.append(pd.Series([""], index=df.index))
+    arr = np.vstack([c.values for c in cols]).T
+    out = [hashlib.sha1("|".join(row).encode("utf-8")).hexdigest() for row in arr]
+    return pd.Series(out, index=df.index)
+
+# ensure PK & datetime on new_ev
+if not new_ev.empty:
+    if colmap["datetime"] in new_ev.columns:
+        new_ev[colmap["datetime"]] = parse_datetime_series(new_ev[colmap["datetime"]])
+    if "pk" not in new_ev.columns:
+        new_ev["pk"] = _build_pk(new_ev)
+
+# ensure PK on history; align columns
+if not history.empty:
+    if colmap["datetime"] in history.columns:
+        history[colmap["datetime"]] = parse_datetime_series(history[colmap["datetime"]])
+    if "pk" not in history.columns and not history.empty:
+        history["pk"] = _build_pk(history)
+    # add any missing cols from new_ev
+    for c in (new_ev.columns if not new_ev.empty else []):
+        if c not in history.columns:
+            history[c] = pd.NA
+
+# combine & dedupe
+if not new_ev.empty and not history.empty:
+    combined = pd.concat([history, new_ev], ignore_index=True)
+elif not history.empty:
+    combined = history.copy()
+else:
+    combined = new_ev.copy()
+
+if combined.empty:
+    st.warning("No data to analyze yet. Upload files to start building local history.")
+    st.stop()
+
+combined = combined.drop_duplicates(subset=["pk"]).reset_index(drop=True)
+
+# Save back to local parquet
+try:
+    combined.to_parquet(LOCAL_HISTORY_FILE, index=False)
+    st.sidebar.success(f"Saved local history: {len(combined):,} rows → {LOCAL_HISTORY_FILE}")
+except Exception as e:
+    st.sidebar.error(f"Could not save local history: {e}")
+
+# Use current upload (new_ev) for interactive filtering/analytics
+ev = new_ev.copy()
+# ---------- END LOCAL PERSISTENCE ----------
 
 # 3) Filters (native datetime slider)
 st.sidebar.header("3) Filters")
@@ -521,7 +525,7 @@ if ev.empty:
     st.warning("No events in current filter range.")
     st.stop()
 
-# Compute analytics
+# Compute analytics on filtered current upload
 data, device_stats, tech_stats, run_stats, hourly, visit = build_delivery_analytics(ev, colmap, idle_min=idle_min)
 
 # Pre-format H:MM:SS fields for drill-down
@@ -535,7 +539,6 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
     ["📈 Overview", "🚶 Delivery Analytics", "🧑‍🔧 Tech Comparison",
      "📦 Devices", "⏱ Hourly", "🧪 Drill-down", "🔟 Weekly Top 10", "❓ Ask the data"]
 )
-
 
 with tab1:
     st.subheader("Overview")
@@ -640,9 +643,9 @@ with tab6:
     )
 
 st.caption("Slider uses native Python datetimes; duplicate column names are auto-deduped. Drill-down shows H:MM:SS plus raw seconds for auditability.")
+
 with tab7:
     st.subheader("Weekly Top 10 (last 7d vs prior 7d)")
-    # 'combined' already exists earlier (history + new). Use it for anomalies.
     try:
         top10 = anomalies_top10(combined, data, colmap)
         if top10.empty:
@@ -670,4 +673,3 @@ with tab8:
             )
     else:
         st.info("Examples: 'top devices', 'longest dwell devices', 'median walk gap for <name>', 'busiest hour'.")
-
