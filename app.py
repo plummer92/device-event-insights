@@ -453,24 +453,132 @@ def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[
     return ("Try asks like: 'top devices', 'longest dwell devices', "
             "'median walk gap for Melissa', 'busiest hour'."), tbl
 
-# ------------------------- PERSISTENCE (LOCAL) ------------------------
 
-def load_history() -> pd.DataFrame:
-    if os.path.exists(LOCAL_HISTORY_FILE):
-        try:
-            return pd.read_parquet(LOCAL_HISTORY_FILE)
-        except Exception:
-            return pd.DataFrame()
-    return pd.DataFrame()
+# ------------------------- PERSISTENCE (POSTGRES via Supabase) ----------------------
+# Requires: sqlalchemy, psycopg2-binary in requirements.txt
+from sqlalchemy import create_engine, text
 
-def save_history(df: pd.DataFrame, colmap: Dict[str,str]) -> Tuple[bool, str]:
+@st.cache_resource
+def get_engine():
+    url = st.secrets["DB_URL"]  # e.g., "postgresql+psycopg2://postgres:...@.../postgres"
+    return create_engine(url, pool_pre_ping=True)
+
+def init_db(eng):
+    # Canonical schema with stable names. We'll alias back to your current colmap on load.
+    ddl = """
+    CREATE TABLE IF NOT EXISTS events (
+        pk     TEXT PRIMARY KEY,
+        dt     TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+        device TEXT,
+        "user" TEXT,
+        "type" TEXT,
+        "desc" TEXT,
+        qty    DOUBLE PRECISION,
+        medid  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_events_dt     ON events (dt);
+    CREATE INDEX IF NOT EXISTS idx_events_device ON events (device);
+    CREATE INDEX IF NOT EXISTS idx_events_user   ON events ("user");
+    CREATE INDEX IF NOT EXISTS idx_events_type   ON events ("type");
+    """
+    with eng.begin() as con:
+        # split on semicolons to be safe across drivers
+        for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
+            con.execute(text(stmt))
+
+def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict]:
+    """Map your dynamic DataFrame columns into the canonical SQL columns."""
+    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
+    get = lambda k: (colmap.get(k) in df.columns) if colmap.get(k) else False
+
+    rows = []
+    for _, r in df.iterrows():
+        rows.append({
+            "pk":    r["pk"],
+            "dt":    pd.to_datetime(r[ts]).to_pydatetime() if pd.notna(r[ts]) else None,
+            "device": r.get(dev, None),
+            "user":   r.get(usr, None),
+            "type":   r.get(typ, None),
+            "desc":   r.get(colmap.get("desc", ""), None) if get("desc") else None,
+            "qty":    float(r[colmap["qty"]]) if get("qty") and pd.notna(r[colmap["qty"]]) else None,
+            "medid":  r.get(colmap.get("medid",""), None) if get("medid") else None,
+        })
+    return rows
+
+def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str]) -> tuple[bool, str]:
+    """UPSERT by pk into Postgres (chunked for large loads)."""
     try:
-        keep_dt = [colmap["datetime"]] if colmap.get("datetime") else []
-        safe = sanitize_for_parquet(df, keep_dt_cols=keep_dt)
-        safe.to_parquet(LOCAL_HISTORY_FILE, index=False)
-        return True, f"Saved local history: {len(safe):,} rows → {LOCAL_HISTORY_FILE}"
+        eng = get_engine()
+        init_db(eng)
+        rows = _df_to_rows_canonical(df, colmap)
+        if not rows:
+            return True, "No rows to save."
+
+        upsert_sql = text("""
+        INSERT INTO events (pk, dt, device, "user", "type", "desc", qty, medid)
+        VALUES (:pk, :dt, :device, :user, :type, :desc, :qty, :medid)
+        ON CONFLICT (pk) DO UPDATE SET
+            dt=EXCLUDED.dt,
+            device=EXCLUDED.device,
+            "user"=EXCLUDED."user",
+            "type"=EXCLUDED."type",
+            "desc"=EXCLUDED."desc",
+            qty=EXCLUDED.qty,
+            medid=EXCLUDED.medid;
+        """)
+
+        CHUNK = 5000
+        total = 0
+        with eng.begin() as con:
+            for i in range(0, len(rows), CHUNK):
+                batch = rows[i:i+CHUNK]
+                con.execute(upsert_sql, batch)
+                total += len(batch)
+        return True, f"Saved to Postgres: {total:,} rows (upserted by pk)."
     except Exception as e:
-        return False, f"Could not save local history: {e}"
+        return False, f"DB save error: {e}"
+
+def load_history_sql(colmap: Dict[str, str]) -> pd.DataFrame:
+    """
+    Load from canonical table and alias columns back to whatever your current mapping is,
+    so the rest of your code (which expects original names) keeps working.
+    """
+    try:
+        eng = get_engine()
+        init_db(eng)
+        # Pull canonical columns
+        sql = """
+            SELECT pk, dt, device, "user", "type", "desc", qty, medid
+            FROM events
+            ORDER BY dt
+        """
+        raw = pd.read_sql(sql, eng)
+
+        if raw.empty:
+            return raw
+
+        # Alias to current colmap keys to match your new_ev schema
+        rename_back = {
+            "dt": colmap["datetime"],
+            "device": colmap["device"],
+            "user": colmap["user"],
+            "type": colmap["type"],
+        }
+        if colmap.get("desc"):
+            rename_back["desc"] = colmap["desc"]
+        if colmap.get("qty"):
+            rename_back["qty"] = colmap["qty"]
+        if colmap.get("medid"):
+            rename_back["medid"] = colmap["medid"]
+
+        out = raw.rename(columns=rename_back)
+        # Ensure datetime dtype
+        out[colmap["datetime"]] = pd.to_datetime(out[colmap["datetime"]], errors="coerce")
+        return out
+    except Exception:
+        return pd.DataFrame()
+# ------------------------------------------------------------------------------------
+
 
 # ----------------------------- UI ------------------------------------
 
