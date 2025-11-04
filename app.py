@@ -9,6 +9,9 @@
 # - Weekly summary + Top-10 anomalies (last 7d vs prior 7d)
 # - Outliers (IQR) per user / device
 # - Lightweight "Ask the data" Q&A
+# - UPDATED: concurrent index creation + session timeouts
+# - UPDATED: pandas deprecation fixes ("H"->"h", datetime tz checks, concat)
+# - UPDATED: safer groupby/apply paths
 
 from __future__ import annotations
 
@@ -24,6 +27,9 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from sqlalchemy import create_engine, text
+
+# ---- NEW: for future-proof datetime dtype checks
+from pandas.api.types import DatetimeTZDtype, is_datetime64_any_dtype
 
 # ----------------------------- CONFIG ---------------------------------
 
@@ -55,11 +61,21 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
     return df
 
+# ---- UPDATED: future-proof tz-aware check
+def _is_tz_aware(series: pd.Series) -> bool:
+    try:
+        return isinstance(series.dtype, DatetimeTZDtype)
+    except Exception:
+        return is_datetime64_any_dtype(series) and getattr(series.dt, "tz", None) is not None
+
 def parse_datetime_series(s: pd.Series) -> pd.Series:
     """Parse to pandas datetime (UTC-naive)."""
     out = pd.to_datetime(s, errors="coerce", utc=True)
-    if pd.api.types.is_datetime64tz_dtype(out):
+    if _is_tz_aware(out):
         out = out.dt.tz_convert("UTC").dt.tz_localize(None)
+    else:
+        # If it's naive-but-UTC intended, it's still fine as is
+        out = out.dt.tz_localize(None)
     return out
 
 def base_clean(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
@@ -160,8 +176,8 @@ def build_delivery_analytics(
     data = ev[needed].sort_values([usr, ts]).copy()
 
     # next-event per tech
-    data["__next_ts"]  = data.groupby(usr)[ts].shift(-1)
-    data["__next_dev"] = data.groupby(usr)[dev].shift(-1)
+    data["__next_ts"]  = data.groupby(usr, group_keys=False)[ts].shift(-1)
+    data["__next_dev"] = data.groupby(usr, group_keys=False)[dev].shift(-1)
 
     # gaps (s) and device change flag
     data["__gap_s"] = (data["__next_ts"] - data[ts]).dt.total_seconds()
@@ -178,17 +194,17 @@ def build_delivery_analytics(
     data["__dwell_s"] = np.where(~data["__device_change"], data["__gap_s"], np.nan)
 
     # visit id: increments whenever device changes for a given tech
-    data["__visit_id"] = (
-        data.groupby(usr)[dev]
-            .apply(lambda x: (x != x.shift()).cumsum())
-            .reset_index(level=0, drop=True)
+    # (Use transform with shift to avoid DataFrameGroupBy.apply deprecation noise)
+    visit_increments = (
+        data.groupby(usr, group_keys=False)[dev]
+            .transform(lambda s: (s != s.shift()).astype(int))
     )
+    data["__visit_id"] = visit_increments.groupby(data[usr]).cumsum()
 
     # visit summary: start/end/duration for each (tech, visit_id, device)
     visit = (
-        data.groupby([usr, "__visit_id", dev])
+        data.groupby([usr, "__visit_id", dev], as_index=False)
             .agg(start=(ts, "min"), end=(ts, "max"))
-            .reset_index()
     )
     visit["visit_duration_s"] = (visit["end"] - visit["start"]).dt.total_seconds()
 
@@ -200,7 +216,7 @@ def build_delivery_analytics(
     )
 
     # device stats
-    cnt = data.groupby(dev).size().rename("events")
+    cnt = data.groupby(dev, dropna=False).size().rename("events")
     dwell = (
         data.loc[~data["__device_change"], "__gap_s"]
         .groupby(data[dev])
@@ -215,7 +231,7 @@ def build_delivery_analytics(
     )
 
     # tech stats
-    tcnt = data.groupby(usr).size().rename("events")
+    tcnt = data.groupby(usr, dropna=False).size().rename("events")
     twalk = data["__walk_gap_s"].groupby(data[usr]).median().rename("median_walk_gap_s")
     tech_stats = (
         pd.concat([tcnt, twalk], axis=1)
@@ -228,7 +244,7 @@ def build_delivery_analytics(
     data["__is_break"] = (data["__walk_gap_s"] >= idle_min).fillna(False)
     data["__run_id"] = data.groupby(usr)["__is_break"].cumsum()
     run_stats = (
-        data.groupby([usr, "__run_id"])
+        data.groupby([usr, "__run_id"], as_index=False)
         .agg(
             start=(ts, "min"),
             end=(ts, "max"),
@@ -236,13 +252,12 @@ def build_delivery_analytics(
             n_devices=(dev, "nunique"),
             total_walk_s=("__walk_gap_s", lambda s: np.nansum(s.values)),
         )
-        .reset_index()
     )
     run_stats["duration_s"] = (run_stats["end"] - run_stats["start"]).dt.total_seconds()
 
-    # hourly
+    # hourly  ---- UPDATED "H" -> "h"
     hourly = (
-        data.groupby(data[ts].dt.floor("H"))
+        data.groupby(data[ts].dt.floor("h"))
         .size().rename("events").reset_index()
         .rename(columns={ts: "hour"})
     )
@@ -322,9 +337,9 @@ def anomalies_top10(history: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,
                     "severity":"med" if s>=60 else "low"
                 })
 
-    # 4) Busiest hours (recent)
+    # 4) Busiest hours (recent) ---- UPDATED "H" -> "h"
     if not recent.empty:
-        rh = recent.groupby(recent[ts].dt.floor("H")).size()
+        rh = recent.groupby(recent[ts].dt.floor("h")).size()
         if not rh.empty:
             hr_top = rh.sort_values(ascending=False).head(2)
             for h, n in hr_top.items():
@@ -376,7 +391,7 @@ def outliers_iqr(data: pd.DataFrame, key_col: str, value_col: str, label: str) -
             z_note=f"{label}: > Q3+1.5*IQR (>{upper:.1f}s)"
         )
 
-    out = df.groupby(key_col, dropna=True).apply(_flag).reset_index(drop=True)
+    out = df.groupby(key_col, dropna=True, group_keys=False).apply(_flag).reset_index(drop=True)
     return out
 
 def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> Tuple[str, pd.DataFrame]:
@@ -402,14 +417,15 @@ def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[
     m = re.search(r"median .*walk.* for (.+)", q)
     if m:
         name = m.group(1).strip()
-        sub = data[data[usr].str.lower()==name.lower()]
+        sub = data[data[usr].astype(str).str.lower()==name.lower()]
         if sub.empty:
             return f"No rows found for user '{name}'.", pd.DataFrame()
         val = np.nanmedian(sub["__walk_gap_s"].values)
         return f"Median walk gap for {name}: {fmt_hms(val)} ({int(val)}s)", pd.DataFrame()
 
     if "hour" in q:
-        t = ev.groupby(ev[ts].dt.floor("H")).size().rename("events").reset_index().rename(columns={ts:"hour"})
+        # ---- UPDATED "H" -> "h"
+        t = ev.groupby(ev[ts].dt.floor("h")).size().rename("events").reset_index().rename(columns={ts:"hour"})
         if t.empty:
             return "No hourly data in current filter.", pd.DataFrame()
         top = t.sort_values("events", ascending=False).head(1).iloc[0]
@@ -436,7 +452,7 @@ def get_engine(db_url: str, salt: str):
     return create_engine(db_url, pool_pre_ping=True)
 
 def init_db(eng):
-    """Create canonical schema & indexes."""
+    """Create canonical schema (tables only)."""
     ddl = """
     CREATE TABLE IF NOT EXISTS events (
         pk     TEXT PRIMARY KEY,
@@ -448,14 +464,31 @@ def init_db(eng):
         qty    DOUBLE PRECISION,
         medid  TEXT
     );
-    CREATE INDEX IF NOT EXISTS idx_events_dt     ON events (dt);
-    CREATE INDEX IF NOT EXISTS idx_events_device ON events (device);
-    CREATE INDEX IF NOT EXISTS idx_events_user   ON events ("user");
-    CREATE INDEX IF NOT EXISTS idx_events_type   ON events ("type");
     """
     with eng.begin() as con:
         for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
             con.execute(text(stmt))
+
+# ---- NEW: Non-blocking index builds with longer session timeout
+def ensure_indexes(eng):
+    """
+    Build indexes concurrently (no long locks), with a higher session statement_timeout.
+    Safe to call multiple times; IF NOT EXISTS is idempotent.
+    """
+    with eng.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text("SET statement_timeout = '10min'"))
+        conn.execute(text("SET lock_timeout = '30s'"))
+
+        # Core indexes
+        conn.execute(text("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_dt     ON events (dt)"))
+        conn.execute(text("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_device ON events (device)"))
+        conn.execute(text("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_user   ON events (\"user\")"))
+        conn.execute(text("CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_type   ON events (\"type\")"))
+
+        # Optional functional index to accelerate hourly aggregations
+        conn.execute(text(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_dt_hour ON events (date_trunc('hour', dt))"
+        ))
 
 def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict]:
     """Map dynamic DataFrame columns into canonical SQL columns."""
@@ -478,7 +511,9 @@ def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict
 def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[bool, str]:
     """UPSERT by pk into Postgres (chunked for large loads)."""
     try:
-        init_db(eng)
+        init_db(eng)          # ensure table
+        ensure_indexes(eng)   # ensure indexes (concurrent & idempotent)
+
         rows = _df_to_rows_canonical(df, colmap)
         if not rows:
             return True, "No rows to save."
@@ -499,6 +534,8 @@ def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[boo
         CHUNK = 5000
         total = 0
         with eng.begin() as con:
+            # Mildly raise timeout for write bursts (harmless if server ignores)
+            con.execute(text("SET statement_timeout = '5min'"))
             for i in range(0, len(rows), CHUNK):
                 batch = rows[i:i+CHUNK]
                 con.execute(upsert_sql, batch)
@@ -548,6 +585,13 @@ DB_URL = st.secrets["DB_URL"]
 ENGINE_SALT = st.secrets.get("ENGINE_SALT", "")
 eng = get_engine(DB_URL, ENGINE_SALT)
 
+# Ensure base schema + indexes exist early (safe to call every run)
+try:
+    init_db(eng)
+    ensure_indexes(eng)
+except Exception as e:
+    st.warning(f"Initialization warning (schema/index): {e}")
+
 # 1) Upload — multiple files allowed
 st.sidebar.header("1) Upload")
 uploads = st.sidebar.file_uploader(
@@ -560,18 +604,22 @@ if not uploads:
     st.info("Upload one or more daily exports to get started.")
     st.stop()
 
-# Read all files
+# Read all files (safer concat: skip empty/all-NA frames)
 frames = []
 for up in uploads:
     try:
         if up.name.lower().endswith(".xlsx"):
-            frames.append(pd.read_excel(up))
+            df = pd.read_excel(up)
         else:
             try:
-                frames.append(pd.read_csv(up))
+                df = pd.read_csv(up)
             except UnicodeDecodeError:
                 up.seek(0)
-                frames.append(pd.read_csv(up, encoding="latin-1"))
+                df = pd.read_csv(up, encoding="latin-1")
+        if isinstance(df, pd.DataFrame) and not df.empty and not df.isna().all(axis=None):
+            frames.append(df)
+        else:
+            st.warning(f"{up.name}: empty or all-NA; skipped.")
     except Exception as e:
         st.error(f"Failed to read {up.name}: {e}")
 
@@ -627,6 +675,7 @@ if not history.empty:
             history["pk"] = build_pk(history, colmap)
         except Exception:
             history["pk"] = pd.util.hash_pandas_object(history.astype(str), index=False).astype(str)
+    # Bring missing columns to parity before concat
     for c in new_ev.columns:
         if c not in history.columns:
             history[c] = pd.NA
@@ -819,4 +868,3 @@ with tab9:
         st.write(ans)
         if not tbl.empty:
             st.dataframe(tbl, use_container_width=True)
-
