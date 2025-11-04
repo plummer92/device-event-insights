@@ -1,5 +1,5 @@
 # app.py
-# Device Event Insights — Pro (Supabase Postgres persistence + Outliers + Weekly digest)
+# Device Event Insights — Pro (Supabase Postgres + cache-busted engine)
 # - Multi-file upload (xlsx/csv)
 # - Column mapping with duplicate mapping guard
 # - Safe datetime parsing; duplicate header trimming
@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from sqlalchemy import create_engine, text  # <-- NEW
+from sqlalchemy import create_engine, text
 
 # ----------------------------- CONFIG ---------------------------------
 
@@ -251,7 +251,7 @@ def build_delivery_analytics(
 
 def anomalies_top10(history: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> pd.DataFrame:
     """
-    Simple digest: compare last 7 days vs prior 7 days for:
+    Compare last 7 days vs prior 7 days for:
       - device volume spikes
       - high median walk gap per tech
       - high median dwell per device
@@ -359,21 +359,17 @@ def anomalies_top10(history: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,
     return df_out.head(10)
 
 def outliers_iqr(data: pd.DataFrame, key_col: str, value_col: str, label: str) -> pd.DataFrame:
-    """
-    IQR-based outlier detection per key_col (e.g., by user or device) on value_col.
-    Returns rows flagged as outliers with helpful columns.
-    """
+    """IQR-based outlier detection per key_col on value_col."""
     df = data[[key_col, value_col]].dropna().copy()
     if df.empty:
         return pd.DataFrame(columns=[key_col, value_col, "z_note"])
 
-    # compute per-group quartiles and bounds
     def _flag(group):
         q1 = group[value_col].quantile(0.25)
         q3 = group[value_col].quantile(0.75)
         iqr = q3 - q1
         if iqr == 0:
-            upper = q3 + 1.5  # degenerate; still allow tiny tolerance
+            upper = q3 + 1.5
         else:
             upper = q3 + 1.5 * iqr
         return group[group[value_col] > upper].assign(
@@ -384,19 +380,14 @@ def outliers_iqr(data: pd.DataFrame, key_col: str, value_col: str, label: str) -
     return out
 
 def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> Tuple[str, pd.DataFrame]:
-    """
-    Lightweight Q&A without an LLM. Pattern-matches common asks and returns
-    a short answer + a table backing it up.
-    """
+    """Lightweight pattern Q&A."""
     q = question.strip().lower()
     ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
 
-    # 1) "top devices"
     if re.search(r"\b(top|most)\b.*\bdevices?\b", q):
         t = ev.groupby(dev).size().rename("events").reset_index().sort_values("events", ascending=False).head(10)
         return f"Top devices by event volume (showing {len(t)}):", t
 
-    # 2) "longest dwell devices"
     if "longest" in q and "dwell" in q:
         if data.empty:
             return "No dwell data in current filter.", pd.DataFrame()
@@ -408,7 +399,6 @@ def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[
         t["median_dwell_hms"] = t["median_dwell_s"].map(fmt_hms)
         return "Devices with longest median dwell:", t
 
-    # 3) "median walk gap for <tech>"
     m = re.search(r"median .*walk.* for (.+)", q)
     if m:
         name = m.group(1).strip()
@@ -418,7 +408,6 @@ def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[
         val = np.nanmedian(sub["__walk_gap_s"].values)
         return f"Median walk gap for {name}: {fmt_hms(val)} ({int(val)}s)", pd.DataFrame()
 
-    # 4) "busiest hour"
     if "hour" in q:
         t = ev.groupby(ev[ts].dt.floor("H")).size().rename("events").reset_index().rename(columns={ts:"hour"})
         if t.empty:
@@ -426,7 +415,6 @@ def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[
         top = t.sort_values("events", ascending=False).head(1).iloc[0]
         return f"Busiest hour: {top['hour']:%Y-%m-%d %H:%M} with {int(top['events'])} events.", t.sort_values("hour")
 
-    # 5) "which tech ... median walk"
     if "which tech" in q and "median walk" in q:
         if data.empty:
             return "No walk-gap data in current filter.", pd.DataFrame()
@@ -435,7 +423,6 @@ def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[
         top = t.iloc[0]
         return f"Highest median walk gap: {top[usr]} at {fmt_hms(top['median_walk_s'])}.", t
 
-    # default
     tbl = ev[[ts, usr, dev, typ]].head(50)
     return ("Try asks like: 'top devices', 'longest dwell devices', "
             "'median walk gap for Melissa', 'busiest hour'."), tbl
@@ -444,12 +431,12 @@ def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[
 # ------------------------- PERSISTENCE (POSTGRES via Supabase) ----------------------
 
 @st.cache_resource
-def get_engine():
-    url = st.secrets["DB_URL"]  # e.g., "postgresql+psycopg2://postgres:...@.../postgres"
-    return create_engine(url, pool_pre_ping=True)
+def get_engine(db_url: str, salt: str):
+    """Create a cached SQLAlchemy engine. Changing db_url or salt busts the cache."""
+    return create_engine(db_url, pool_pre_ping=True)
 
 def init_db(eng):
-    # Canonical schema with stable names. We'll alias back to your current colmap on load.
+    """Create canonical schema & indexes."""
     ddl = """
     CREATE TABLE IF NOT EXISTS events (
         pk     TEXT PRIMARY KEY,
@@ -471,10 +458,9 @@ def init_db(eng):
             con.execute(text(stmt))
 
 def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict]:
-    """Map your dynamic DataFrame columns into the canonical SQL columns."""
+    """Map dynamic DataFrame columns into canonical SQL columns."""
     ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
     get = lambda k: (colmap.get(k) in df.columns) if colmap.get(k) else False
-
     rows = []
     for _, r in df.iterrows():
         rows.append({
@@ -489,26 +475,25 @@ def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict
         })
     return rows
 
-def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str]) -> tuple[bool, str]:
+def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[bool, str]:
     """UPSERT by pk into Postgres (chunked for large loads)."""
     try:
-        eng = get_engine()
         init_db(eng)
         rows = _df_to_rows_canonical(df, colmap)
         if not rows:
             return True, "No rows to save."
 
         upsert_sql = text("""
-        INSERT INTO events (pk, dt, device, "user", "type", "desc", qty, medid)
-        VALUES (:pk, :dt, :device, :user, :type, :desc, :qty, :medid)
-        ON CONFLICT (pk) DO UPDATE SET
-            dt=EXCLUDED.dt,
-            device=EXCLUDED.device,
-            "user"=EXCLUDED."user",
-            "type"=EXCLUDED."type",
-            "desc"=EXCLUDED."desc",
-            qty=EXCLUDED.qty,
-            medid=EXCLUDED.medid;
+            INSERT INTO events (pk, dt, device, "user", "type", "desc", qty, medid)
+            VALUES (:pk, :dt, :device, :user, :type, :desc, :qty, :medid)
+            ON CONFLICT (pk) DO UPDATE SET
+                dt=EXCLUDED.dt,
+                device=EXCLUDED.device,
+                "user"=EXCLUDED."user",
+                "type"=EXCLUDED."type",
+                "desc"=EXCLUDED."desc",
+                qty=EXCLUDED.qty,
+                medid=EXCLUDED.medid;
         """)
 
         CHUNK = 5000
@@ -522,51 +507,46 @@ def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str]) -> tuple[bool, st
     except Exception as e:
         return False, f"DB save error: {e}"
 
-def load_history_sql(colmap: Dict[str, str]) -> pd.DataFrame:
-    """
-    Load from canonical table and alias columns back to whatever your current mapping is,
-    so the rest of your code (which expects original names) keeps working.
-    """
+def load_history_sql(colmap: Dict[str, str], eng) -> pd.DataFrame:
+    """Load canonical table and alias columns back to current mapping."""
     try:
-        eng = get_engine()
         init_db(eng)
-        # Pull canonical columns
         sql = """
             SELECT pk, dt, device, "user", "type", "desc", qty, medid
             FROM events
             ORDER BY dt
         """
         raw = pd.read_sql(sql, eng)
-
         if raw.empty:
             return raw
 
-        # Alias to current colmap keys to match your new_ev schema
         rename_back = {
             "dt": colmap["datetime"],
             "device": colmap["device"],
             "user": colmap["user"],
             "type": colmap["type"],
         }
-        if colmap.get("desc"):
-            rename_back["desc"] = colmap["desc"]
-        if colmap.get("qty"):
-            rename_back["qty"] = colmap["qty"]
-        if colmap.get("medid"):
-            rename_back["medid"] = colmap["medid"]
+        if colmap.get("desc"):  rename_back["desc"]  = colmap["desc"]
+        if colmap.get("qty"):   rename_back["qty"]   = colmap["qty"]
+        if colmap.get("medid"): rename_back["medid"] = colmap["medid"]
 
         out = raw.rename(columns=rename_back)
-        # Ensure datetime dtype
         out[colmap["datetime"]] = pd.to_datetime(out[colmap["datetime"]], errors="coerce")
         return out
     except Exception:
         return pd.DataFrame()
+
 # ------------------------------------------------------------------------------------
 
 
 # ----------------------------- UI ------------------------------------
 
 st.title("All Device Event Insights — Pro")
+
+# Build engine once (cache-busted by secrets)
+DB_URL = st.secrets["DB_URL"]
+ENGINE_SALT = st.secrets.get("ENGINE_SALT", "")
+eng = get_engine(DB_URL, ENGINE_SALT)
 
 # 1) Upload — multiple files allowed
 st.sidebar.header("1) Upload")
@@ -587,7 +567,6 @@ for up in uploads:
         if up.name.lower().endswith(".xlsx"):
             frames.append(pd.read_excel(up))
         else:
-            # try utf-8, fallback latin-1
             try:
                 frames.append(pd.read_csv(up))
             except UnicodeDecodeError:
@@ -639,9 +618,8 @@ except Exception as e:
 new_ev["pk"] = build_pk(new_ev, colmap)
 
 # Merge with history (if any), then save
-history = load_history_sql(colmap)  # <-- Postgres load
+history = load_history_sql(colmap, eng)  # <-- Postgres load (using cached engine)
 if not history.empty:
-    # ensure presence of pk in history (backfill if missing)
     if "pk" not in history.columns:
         try:
             if colmap["datetime"] in history.columns:
@@ -649,7 +627,6 @@ if not history.empty:
             history["pk"] = build_pk(history, colmap)
         except Exception:
             history["pk"] = pd.util.hash_pandas_object(history.astype(str), index=False).astype(str)
-    # align schemas
     for c in new_ev.columns:
         if c not in history.columns:
             history[c] = pd.NA
@@ -660,7 +637,7 @@ else:
 # Deduplicate by pk
 combined = combined.drop_duplicates(subset=["pk"]).reset_index(drop=True)
 
-ok, msg = save_history_sql(combined, colmap)  # <-- Postgres save
+ok, msg = save_history_sql(combined, colmap, eng)  # <-- Postgres save (using cached engine)
 if ok:
     st.sidebar.success(msg)
 else:
@@ -744,14 +721,12 @@ with tab2:
     st.subheader("Delivery Analytics (per-tech sequences)")
     c1, c2 = st.columns(2)
 
-    # Walking gaps histogram
     hg = data["__walk_gap_s"].dropna()
     if not hg.empty:
         fig = px.histogram(hg, nbins=40, title="Walking/Travel gaps (seconds)")
         c1.plotly_chart(fig, use_container_width=True)
         c1.caption("X-axis = seconds between finishing a device and starting the next (≥ threshold & device changed).")
 
-    # Dwell histogram
     dw = data.loc[~data["__device_change"], "__gap_s"].dropna()
     if not dw.empty:
         fig2 = px.histogram(dw, nbins=40, title="Same-device dwell gaps (seconds)")
@@ -783,12 +758,9 @@ with tab5:
 with tab6:
     st.subheader("Drill-down (exportable)")
 
-    # Columns to show
     show_cols = [
         colmap["datetime"], colmap["user"], colmap["device"], colmap["type"],
-        # human-friendly durations:
         "gap_hms", "walk_gap_hms", "dwell_hms", "visit_hms",
-        # raw seconds:
         "__gap_s", "__walk_gap_s", "__dwell_s", "visit_duration_s",
         "__device_change",
     ]
@@ -823,7 +795,6 @@ with tab6:
 
 with tab7:
     st.subheader("Weekly Top 10 (signals)")
-    # Use the entire saved history (combined) for digest vs last 7d
     digest = anomalies_top10(combined, data, colmap)
     if digest.empty:
         st.info("No notable anomalies in the last 7 days window.")
@@ -832,7 +803,6 @@ with tab7:
 
 with tab8:
     st.subheader("Outliers")
-    # Example outliers: longest walk gaps per user and longest dwell per device
     ow = outliers_iqr(data.dropna(subset=["__walk_gap_s"]), colmap["user"], "__walk_gap_s", "Walk gap")
     od = outliers_iqr(data.dropna(subset=["__dwell_s"]),    colmap["device"], "__dwell_s",    "Dwell")
     c1, c2 = st.columns(2)
@@ -849,3 +819,4 @@ with tab9:
         st.write(ans)
         if not tbl.empty:
             st.dataframe(tbl, use_container_width=True)
+
