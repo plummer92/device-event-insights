@@ -1,9 +1,9 @@
 # app.py
-# Device Event Insights — Pro (Local history + Outliers + Weekly digest)
+# Device Event Insights — Pro (Supabase Postgres persistence + Outliers + Weekly digest)
 # - Multi-file upload (xlsx/csv)
 # - Column mapping with duplicate mapping guard
 # - Safe datetime parsing; duplicate header trimming
-# - Local parquet history (type-safe)
+# - Durable history in Postgres (UPSERT by pk)
 # - Delivery analytics: walk gaps, dwell, per-visit duration
 # - Drill-down with H:MM:SS + CSV export
 # - Weekly summary + Top-10 anomalies (last 7d vs prior 7d)
@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from sqlalchemy import create_engine, text  # <-- NEW
 
 # ----------------------------- CONFIG ---------------------------------
 
@@ -31,8 +32,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-LOCAL_HISTORY_FILE = "event_history.parquet"
 
 DEFAULT_COLMAP = {
     "datetime": "TransactionDateTime",
@@ -106,18 +105,6 @@ def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
     if col not in df.columns:
         return []
     return sorted([x for x in df[col].dropna().astype(str).unique()])
-
-def sanitize_for_parquet(df: pd.DataFrame, keep_dt_cols: List[str]) -> pd.DataFrame:
-    """Ensure we can write to parquet: cast non-datetime object columns to string."""
-    out = df.copy()
-    for c in out.columns:
-        if c in keep_dt_cols:
-            # ensure datetime type
-            out[c] = pd.to_datetime(out[c], errors="coerce")
-            continue
-        if pd.api.types.is_object_dtype(out[c]):
-            out[c] = out[c].astype("string")
-    return out
 
 def build_pk(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.Series:
     cols = []
@@ -455,8 +442,6 @@ def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[
 
 
 # ------------------------- PERSISTENCE (POSTGRES via Supabase) ----------------------
-# Requires: sqlalchemy, psycopg2-binary in requirements.txt
-from sqlalchemy import create_engine, text
 
 @st.cache_resource
 def get_engine():
@@ -482,7 +467,6 @@ def init_db(eng):
     CREATE INDEX IF NOT EXISTS idx_events_type   ON events ("type");
     """
     with eng.begin() as con:
-        # split on semicolons to be safe across drivers
         for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
             con.execute(text(stmt))
 
@@ -655,7 +639,7 @@ except Exception as e:
 new_ev["pk"] = build_pk(new_ev, colmap)
 
 # Merge with history (if any), then save
-history = load_history()
+history = load_history_sql(colmap)  # <-- Postgres load
 if not history.empty:
     # ensure presence of pk in history (backfill if missing)
     if "pk" not in history.columns:
@@ -676,7 +660,7 @@ else:
 # Deduplicate by pk
 combined = combined.drop_duplicates(subset=["pk"]).reset_index(drop=True)
 
-ok, msg = save_history(combined, colmap)
+ok, msg = save_history_sql(combined, colmap)  # <-- Postgres save
 if ok:
     st.sidebar.success(msg)
 else:
@@ -835,4 +819,33 @@ with tab6:
         visit_show[[usr, dev, "start", "end", "visit_hms", "visit_duration_s"]],
         use_container_width=True,
         height=360
+    )
 
+with tab7:
+    st.subheader("Weekly Top 10 (signals)")
+    # Use the entire saved history (combined) for digest vs last 7d
+    digest = anomalies_top10(combined, data, colmap)
+    if digest.empty:
+        st.info("No notable anomalies in the last 7 days window.")
+    else:
+        st.dataframe(digest, use_container_width=True)
+
+with tab8:
+    st.subheader("Outliers")
+    # Example outliers: longest walk gaps per user and longest dwell per device
+    ow = outliers_iqr(data.dropna(subset=["__walk_gap_s"]), colmap["user"], "__walk_gap_s", "Walk gap")
+    od = outliers_iqr(data.dropna(subset=["__dwell_s"]),    colmap["device"], "__dwell_s",    "Dwell")
+    c1, c2 = st.columns(2)
+    c1.write("By user (walk gap):")
+    c1.dataframe(ow, use_container_width=True, height=320)
+    c2.write("By device (dwell):")
+    c2.dataframe(od, use_container_width=True, height=320)
+
+with tab9:
+    st.subheader("Ask the data ❓")
+    q = st.text_input("Try e.g. 'top devices', 'longest dwell devices', 'median walk gap for Melissa', 'busiest hour'")
+    if q:
+        ans, tbl = qa_answer(q, ev, data, colmap)
+        st.write(ans)
+        if not tbl.empty:
+            st.dataframe(tbl, use_container_width=True)
