@@ -155,46 +155,60 @@ def build_delivery_analytics(
       hourly: events by hour
       visit: per-visit (tech, device) durations
     """
-    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
+    ts  = colmap["datetime"]
+    dev = colmap["device"]
+    usr = colmap["user"]
+    typ = colmap["type"]
 
-    data = ev.copy()
-    # avoid categoricals in group keys
+    needed = [ts, dev, usr, typ]
+    if colmap.get("desc")  and colmap["desc"]  in ev.columns: needed.append(colmap["desc"])
+    if colmap.get("medid") and colmap["medid"] in ev.columns: needed.append(colmap["medid"])
+    if colmap.get("qty")   and colmap["qty"]   in ev.columns: needed.append(colmap["qty"])
+    needed = list(dict.fromkeys(needed))  # keep order, drop dupes
+
+    # Ensure unique cols / slice and sort
+    ev = ev.loc[:, ~ev.columns.duplicated()].copy()
+    data = ev[needed].sort_values([usr, ts]).copy()
+
+    # Normalize string keys early (prevents nullable booleans and weird groupby edge cases)
     for c in [dev, usr, typ]:
         if c in data.columns:
-            data[c] = data[c].astype("string")
-
-    # Required + Optional columns
-    needed = [ts, dev, usr, typ]
-    for k in ["desc", "medid", "qty"]:
-        if colmap.get(k) and colmap[k] in data.columns:
-            needed.append(colmap[k])
-    needed = list(dict.fromkeys(needed))
-    data = data.loc[:, ~data.columns.duplicated()][needed].sort_values([usr, ts]).copy()
+            data[c] = data[c].astype("string").fillna("[unknown]")
 
     # next-event per tech
-    data["__next_ts"]  = data.groupby(usr, group_keys=False, observed=True)[ts].shift(-1)
-    data["__next_dev"] = data.groupby(usr, group_keys=False, observed=True)[dev].shift(-1)
+    data["__next_ts"]  = data.groupby(usr, observed=True)[ts].shift(-1)
+    data["__next_dev"] = data.groupby(usr, observed=True)[dev].shift(-1)
 
-    # gaps (s) & device change
+    # gaps (seconds)
     data["__gap_s"] = (data["__next_ts"] - data[ts]).dt.total_seconds()
-    data["__device_change"] = (data[dev] != data["__next_dev"]) & data["__next_dev"].notna()
 
-    # walk vs dwell
-    data["__walk_gap_s"] = np.where((data["__device_change"]) & (data["__gap_s"] >= idle_min), data["__gap_s"], np.nan)
-    data["__dwell_s"]    = np.where(~data["__device_change"], data["__gap_s"], np.nan)
+    # device change flag (plain bool; no NA)
+    data["__device_change"] = (data[dev] != data["__next_dev"]).fillna(False)
 
-    # visit id: bump when device changes within tech
-    device_changed = (data[dev] != data.groupby(usr, observed=True)[dev].shift()).astype("int64")
-    data["__visit_id"] = device_changed.groupby(data[usr], observed=True).cumsum()
+    # walk gap: device changed and gap >= threshold
+    data["__walk_gap_s"] = np.where(
+        data["__device_change"] & (data["__gap_s"] >= float(idle_min)),
+        data["__gap_s"],
+        np.nan,
+    )
 
-    # visit summary
+    # dwell: same device consecutive events
+    data["__dwell_s"] = np.where(~data["__device_change"], data["__gap_s"], np.nan)
+
+    # --- visit id: bump when device changes within user (NA-safe) ---
+    prev_dev = data.groupby(usr, observed=True)[dev].shift()
+    device_changed = (data[dev] != prev_dev).fillna(False)  # pure bool
+    # int8 keeps memory small; cumsum per user creates visit segments 0,1,2,...
+    data["__visit_id"] = device_changed.astype("int8").groupby(data[usr], observed=True).cumsum()
+
+    # visit summary: start/end/duration for each (tech, visit_id, device)
     visit = (
-        data.groupby([usr, "__visit_id", dev], observed=True, as_index=False)
+        data.groupby([usr, "__visit_id", dev], as_index=False, observed=True)
             .agg(start=(ts, "min"), end=(ts, "max"))
     )
     visit["visit_duration_s"] = (visit["end"] - visit["start"]).dt.total_seconds()
 
-    # attach visit duration per row
+    # attach visit duration to rows
     data = data.merge(
         visit[[usr, "__visit_id", "visit_duration_s"]],
         on=[usr, "__visit_id"],
@@ -203,50 +217,56 @@ def build_delivery_analytics(
     )
 
     # device stats
-    device_events = data.groupby(dev, observed=True).size().rename("events")
+    device_counts = data.groupby(dev, observed=True).size().rename("events")
     device_dwell  = (
-        data.loc[~data["__device_change"], "__gap_s"]
-            .groupby(data[dev], observed=True).median()
+        data.loc[~data["__device_change"], ["__gap_s", dev]]
+            .groupby(dev, observed=True)["__gap_s"].median()
             .rename("median_dwell_s")
     )
     device_stats = (
-        pd.concat([device_events, device_dwell], axis=1)
-            .fillna(0)
-            .sort_values("events", ascending=False)
-            .reset_index()
+        pd.concat([device_counts, device_dwell], axis=1)
+          .fillna(0)
+          .sort_values("events", ascending=False)
+          .reset_index()
     )
 
     # tech stats
-    tech_events = data.groupby(usr, observed=True).size().rename("events")
-    tech_walk   = data["__walk_gap_s"].groupby(data[usr], observed=True).median().rename("median_walk_gap_s")
+    tech_counts = data.groupby(usr, observed=True).size().rename("events")
+    tech_walk   = data.groupby(usr, observed=True)["__walk_gap_s"].median().rename("median_walk_gap_s")
     tech_stats  = (
-        pd.concat([tech_events, tech_walk], axis=1)
-            .fillna(0)
-            .sort_values("events", ascending=False)
-            .reset_index()
+        pd.concat([tech_counts, tech_walk], axis=1)
+          .fillna(0)
+          .sort_values("events", ascending=False)
+          .reset_index()
     )
 
-    # run sequences (break whenever walk gap ≥ threshold)
-    data["__is_break"] = (data["__walk_gap_s"] >= idle_min).fillna(False)
-    data["__run_id"]   = data.groupby(usr, observed=True)["__is_break"].cumsum()
+    # run sequences: break whenever there is a walk gap (already thresholded)
+    data["__is_break"] = data["__walk_gap_s"].notna()
+    data["__run_id"]   = data["__is_break"].astype("int8").groupby(data[usr], observed=True).cumsum()
+
     run_stats = (
-        data.groupby([usr, "__run_id"], observed=True, as_index=False)
+        data.groupby([usr, "__run_id"], as_index=False, observed=True)
             .agg(
                 start=(ts, "min"),
                 end=(ts, "max"),
                 n_events=(ts, "count"),
                 n_devices=(dev, "nunique"),
-                total_walk_s=("__walk_gap_s", lambda s: np.nansum(s.values)),
+                total_walk_s=("__walk_gap_s", lambda s: float(np.nansum(s.values))),
             )
     )
     run_stats["duration_s"] = (run_stats["end"] - run_stats["start"]).dt.total_seconds()
 
-    # hourly (use 'h' floor; 'H' deprecated)
+    # hourly rollup
     hourly = (
-        data.groupby(data[ts].dt.floor("h")).size().rename("events").reset_index().rename(columns={ts: "hour"})
+        data.groupby(data[ts].dt.floor("h"), observed=True)
+            .size()
+            .rename("events")
+            .reset_index()
+            .rename(columns={ts: "hour"})
     )
 
     return data, device_stats, tech_stats, run_stats, hourly, visit
+
 
 def anomalies_top10(history: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> pd.DataFrame:
     ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
