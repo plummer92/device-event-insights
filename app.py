@@ -42,7 +42,9 @@ DEFAULT_COLMAP = {
 }
 
 # Make a default mapping available immediately (prevents NameError)
+# Make a default mapping available immediately (prevents NameError before mapping UI runs)
 colmap: Dict[str, str] = DEFAULT_COLMAP.copy()
+
 
 DEFAULT_IDLE_MIN = 30  # seconds to qualify as "walk/travel" gap
 
