@@ -434,6 +434,165 @@ def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[
     tbl = ev[[ts, usr, dev, typ]].head(50)
     return ("Try asks like: 'top devices', 'longest dwell devices', "
             "'median walk gap for Melissa', 'busiest hour'."), tbl
+# ==== Load/Unload Insights START ====
+
+# Event name aliases (tune to your export naming as needed)
+LOAD_ALIASES = {"LOAD", "RESTOCK", "ADD", "INITIAL_LOAD"}
+UNLOAD_ALIASES = {"UNLOAD", "REMOVE", "PULL", "RETURN_TO_STOCK", "WASTE_PULL"}
+
+def _classify_direction(evt_type: str) -> str:
+    if not evt_type:
+        return "other"
+    t = str(evt_type).strip().upper()
+    if t in LOAD_ALIASES: return "load"
+    if t in UNLOAD_ALIASES: return "unload"
+    if "LOAD" in t or "RESTOCK" in t or "ADD" in t: return "load"
+    if any(x in t for x in ["UNLOAD", "REMOVE", "PULL", "RETURN", "WASTE"]): return "unload"
+    return "other"
+
+def _build_load_unload_base(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
+    dt = colmap["datetime"]
+    med = colmap.get("desc") or colmap.get("medid") or "MedID"
+    typ = colmap["type"]
+    dev = colmap.get("device", "Device")
+    qty = colmap.get("qty")
+
+    cols = [c for c in [dt, med, typ, dev, qty] if c and c in df.columns]
+    g = df[cols].copy()
+    g[dt] = pd.to_datetime(g[dt], errors="coerce")
+    g["dir"] = g[typ].map(_classify_direction)
+    g = g[g["dir"].isin(["load","unload"])]
+
+    if qty and qty in g.columns:
+        base_qty = pd.to_numeric(g[qty], errors="coerce").fillna(1).astype(float)
+        g["qty_signed"] = base_qty.where(g["dir"].eq("load"), -base_qty)
+        g["events"] = 1
+    else:
+        g["qty_signed"] = g["dir"].map({"load": 1.0, "unload": -1.0})
+        g["events"] = 1
+
+    g["date"] = g[dt].dt.date
+    g["hour"] = g[dt].dt.hour
+    g["weekday"] = g[dt].dt.day_name()
+    return g.rename(columns={med: "med", dev: "device"})
+
+def _agg_daily(g: pd.DataFrame) -> pd.DataFrame:
+    daily = (g.groupby(["date","med","dir"])
+               .agg(events=("events","sum"), qty=("qty_signed","sum"))
+               .reset_index())
+    pivot = (daily.pivot_table(index=["date","med"], columns="dir", values="qty",
+                               aggfunc="sum", fill_value=0)
+                  .reset_index().rename_axis(None, axis=1))
+    for c in ("load","unload"):
+        if c not in pivot: pivot[c] = 0.0
+    pivot["net"] = pivot["load"] + pivot["unload"]  # unload is negative
+    pivot = pivot.sort_values(["med","date"])
+    pivot["roll7"]  = pivot.groupby("med")["net"].transform(lambda s: s.rolling(7,  min_periods=1).sum())
+    pivot["roll30"] = pivot.groupby("med")["net"].transform(lambda s: s.rolling(30, min_periods=1).sum())
+    return pivot
+
+def _top_movers(daily_pivot: pd.DataFrame, window: int = 14) -> pd.DataFrame:
+    if daily_pivot.empty:
+        return pd.DataFrame(columns=["med","net_cur","net_prev","delta","pct"])
+    m = daily_pivot.copy()
+    m["date"] = pd.to_datetime(m["date"])
+    last_date = m["date"].max()
+    cur_start = last_date - pd.Timedelta(days=window-1)
+    prev_start = cur_start - pd.Timedelta(days=window)
+    prev_end   = cur_start - pd.Timedelta(days=1)
+    cur  = m[(m["date"]>=cur_start)&(m["date"]<=last_date)].groupby("med")["net"].sum()
+    prev = m[(m["date"]>=prev_start)&(m["date"]<=prev_end)].groupby("med")["net"].sum()
+    out = (cur.fillna(0).to_frame("net_cur").join(prev.fillna(0).to_frame("net_prev"), how="outer").fillna(0))
+    out["delta"] = out["net_cur"] - out["net_prev"]
+    out["pct"] = (out["delta"] / out["net_prev"].replace(0, pd.NA)).astype(float)
+    return out.sort_values("delta", ascending=False).reset_index()
+
+def _plot_overall_timeseries(daily_pivot: pd.DataFrame, med_filter=None):
+    d = daily_pivot.copy()
+    if med_filter: d = d[d["med"].isin(med_filter)]
+    ts = d.groupby("date")[["load","unload","net"]].sum().reset_index()
+    return px.line(ts, x="date", y=["load","unload","net"], markers=True,
+                   title="Loaded vs Unloaded vs Net (All Meds)")
+
+def _plot_med_timeseries(daily_pivot: pd.DataFrame, med: str):
+    d = daily_pivot[daily_pivot["med"].eq(med)].sort_values("date")
+    return px.line(d, x="date", y=["load","unload","net","roll7","roll30"], markers=True,
+                   title=f"{med} — Load/Unload/Net with 7/30-day rolls")
+
+def _heatmap_by_hour_weekday(g: pd.DataFrame):
+    if g.empty:
+        return px.imshow([[0]], title="No data")
+    p = g.groupby(["weekday","hour"])["qty_signed"].mean().reset_index()
+    order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    p["weekday"] = pd.Categorical(p["weekday"], categories=order, ordered=True)
+    mat = p.pivot(index="weekday", columns="hour", values="qty_signed").reindex(order)
+    return px.imshow(mat, aspect="auto", title="Avg Signed Qty by Hour × Weekday (loads=+, unloads=−)")
+
+def _flag_outliers(daily_pivot: pd.DataFrame) -> pd.DataFrame:
+    if daily_pivot.empty:
+        return pd.DataFrame(columns=["date","med","net","z"])
+    d = daily_pivot.copy()
+    def _z(s):
+        std = s.std(ddof=0)
+        return (s - s.mean()) / (std if std else 1)
+    d["z"] = d.groupby("med")["net"].transform(_z)
+    return d.loc[d["z"].abs() >= 2.5, ["date","med","net","z"]].sort_values("z", ascending=False)
+
+def build_load_unload_section(df: pd.DataFrame, colmap: Dict[str,str]):
+    if df is None or df.empty:
+        st.info("No events in current filter.")
+        return
+    try:
+        g = _build_load_unload_base(df, colmap)
+        daily = _agg_daily(g)
+    except Exception as e:
+        st.error(f"Could not build load/unload views: {e}")
+        return
+
+    meds = sorted(daily["med"].unique().tolist())
+    c1, c2, c3 = st.columns([2,2,1])
+    with c1:
+        med_pick = st.multiselect("Meds", meds, default=meds[:10] if meds else [])
+    with c2:
+        dmin, dmax = pd.to_datetime(daily["date"].min()), pd.to_datetime(daily["date"].max())
+        dr = st.date_input("Date range", value=(dmin, dmax), min_value=dmin, max_value=dmax)
+    with c3:
+        window = st.selectbox("Mover window (days)", [7,14,30], index=1)
+
+    dview = daily.copy()
+    if med_pick:
+        dview = dview[dview["med"].isin(med_pick)]
+    if isinstance(dr, (list, tuple)) and len(dr) == 2:
+        dview = dview[(pd.to_datetime(dview["date"]) >= pd.to_datetime(dr[0])) &
+                      (pd.to_datetime(dview["date"]) <= pd.to_datetime(dr[1]))]
+
+    st.plotly_chart(_plot_overall_timeseries(dview, med_pick), use_container_width=True)
+
+    st.markdown("### Top Movers (Net change vs prior window)")
+    st.dataframe(_top_movers(dview, window=window).head(25), use_container_width=True)
+
+    st.markdown("### Outlier Days (|z| ≥ 2.5 on net)")
+    st.dataframe(_flag_outliers(dview), use_container_width=True)
+
+    st.markdown("### When do pulls spike?")
+    subset = g[g["med"].isin(med_pick)] if med_pick else g
+    st.plotly_chart(_heatmap_by_hour_weekday(subset), use_container_width=True)
+
+    st.markdown("### Per-Med drilldown")
+    if meds:
+        med_drill = st.selectbox("Select a med", meds, index=0)
+        st.plotly_chart(_plot_med_timeseries(dview, med_drill), use_container_width=True)
+
+    st.markdown("### Daily table (net, 7/30-day rolls)")
+    tbl = (dview[["date","med","load","unload","net","roll7","roll30"]]
+           .sort_values(["date","med"], ascending=[False, True]))
+    styled = (tbl.style
+              .background_gradient(subset=["net"], cmap="RdYlGn")
+              .format({"load":"{:.0f}","unload":"{:.0f}","net":"{:.0f}","roll7":"{:.0f}","roll30":"{:.0f}"}))
+    st.write(styled)
+
+# ==== Load/Unload Insights END ====
+
 
 # ------------------------- PERSISTENCE (POSTGRES via Supabase) ----------------------
 @st.cache_resource
@@ -757,11 +916,12 @@ run_stats_f    = run_stats[run_stats[colmap["user"]].isin(data_f[colmap["user"]]
 st.success(f"Loaded {len(data_f):,} events for analysis.")
 
 # =================== TABS ===================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
     ["📈 Overview", "🚶 Delivery Analytics", "🧑‍🔧 Tech Comparison",
      "📦 Devices", "⏱ Hourly", "🧪 Drill-down", "🔟 Weekly Top 10",
-     "🚨 Outliers", "❓ Ask the data"]
+     "🚨 Outliers", "❓ Ask the data", "📥 Load/Unload"]
 )
+
 
 with tab1:
     st.subheader("Overview")
@@ -877,3 +1037,7 @@ with tab9:
         st.write(ans)
         if not tbl.empty:
             st.dataframe(tbl, use_container_width=True)
+with tab10:
+    st.subheader("Load / Unload Insights")
+    build_load_unload_section(ev_time, colmap)
+
