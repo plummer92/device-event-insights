@@ -8,3 +8,5 @@ msal==1.30.0
 sqlalchemy==2.0.36
 psycopg2-binary==2.9.9
 pyarrow==17.0.0
+matplotlib>=3.8
+
