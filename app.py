@@ -142,9 +142,12 @@ def _non_empty_frames(frames: List[pd.DataFrame]) -> List[pd.DataFrame]:
     return out
 
 # ------------------ CORE ANALYTICS (robust, observed=True) ---------------------
-
+# ------------------ CORE ANALYTICS (robust, observed=True) ---------------------
 def build_delivery_analytics(
-    ev: pd.DataFrame, colmap: Dict[str, str], idle_min: int
+    ev: pd.DataFrame,
+    colmap: Dict[str, str],
+    idle_min: int,
+    idle_max: int | None = 1800,   # ← cap long gaps (0 or None disables cap)
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Returns:
@@ -170,7 +173,7 @@ def build_delivery_analytics(
     ev = ev.loc[:, ~ev.columns.duplicated()].copy()
     data = ev[needed].sort_values([usr, ts]).copy()
 
-    # Normalize string keys early (prevents nullable booleans and weird groupby edge cases)
+    # Normalize string keys early (avoid nullable bools & groupby weirdness)
     for c in [dev, usr, typ]:
         if c in data.columns:
             data[c] = data[c].astype("string").fillna("[unknown]")
@@ -185,9 +188,10 @@ def build_delivery_analytics(
     # device change flag (plain bool; no NA)
     data["__device_change"] = (data[dev] != data["__next_dev"]).fillna(False)
 
-    # walk gap: device changed and gap >= threshold
+    # walk gap: device changed and gap >= threshold (and <= idle_max if set)
+    cap_ok = (data["__gap_s"] <= float(idle_max)) if (idle_max and idle_max > 0) else True
     data["__walk_gap_s"] = np.where(
-        data["__device_change"] & (data["__gap_s"] >= float(idle_min)),
+        data["__device_change"] & (data["__gap_s"] >= float(idle_min)) & cap_ok,
         data["__gap_s"],
         np.nan,
     )
@@ -198,7 +202,6 @@ def build_delivery_analytics(
     # --- visit id: bump when device changes within user (NA-safe) ---
     prev_dev = data.groupby(usr, observed=True)[dev].shift()
     device_changed = (data[dev] != prev_dev).fillna(False)  # pure bool
-    # int8 keeps memory small; cumsum per user creates visit segments 0,1,2,...
     data["__visit_id"] = device_changed.astype("int8").groupby(data[usr], observed=True).cumsum()
 
     # visit summary: start/end/duration for each (tech, visit_id, device)
@@ -266,6 +269,8 @@ def build_delivery_analytics(
     )
 
     return data, device_stats, tech_stats, run_stats, hourly, visit
+
+
 
 
 def anomalies_top10(history: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> pd.DataFrame:
@@ -467,6 +472,11 @@ def ensure_indexes(eng, timeout_sec: int = 15):
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_user   ON events ("user")',
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_type   ON events ("type")',
     ]
+
+def refresh_materialized_views(eng):
+    # No materialized views yet; keep as a harmless stub.
+    return True, "Materialized views refresh: skipped (none configured)."
+
     # per-statement timeout
     with eng.begin() as con:
         con.execute(text(f"SET LOCAL lock_timeout = '{timeout_sec}s'"))
@@ -570,19 +580,48 @@ DB_URL = st.secrets["DB_URL"]
 ENGINE_SALT = st.secrets.get("ENGINE_SALT", "")
 eng = get_engine(DB_URL, ENGINE_SALT)
 
-# Sidebar: DB-only toggle + index maintenance
-st.sidebar.header("Session")
-db_only = st.sidebar.toggle("Open with existing DB only (no upload)", value=False, help="Skip uploads and load data already in Postgres.")
-if st.sidebar.button("🛠 Build/repair DB indexes"):
-    try:
-        ensure_indexes(eng)
-        st.sidebar.success("Index build/repair requested (non-blocking).")
-    except Exception as e:
-        st.sidebar.warning(f"Index maintenance skipped: {e}")
+# ================================
+# SIDEBAR: DATA SOURCE + SETTINGS
+# ================================
+st.sidebar.header("Data source")
+data_mode = st.sidebar.radio(
+    "Choose data source",
+    ["Upload files", "Database only"],
+    help="Use 'Database only' to analyze existing Postgres data without uploading new files."
+)
 
-# Upload step (skipped if DB-only)
-frames = []
-if not db_only:
+idle_min = st.sidebar.number_input(
+    "Walk gap threshold min (seconds)",
+    min_value=5, max_value=900, value=60, step=5
+)
+idle_max = st.sidebar.number_input(
+    "Walk gap threshold max (seconds, 0 = unlimited)",
+    min_value=0, max_value=7200, value=1800, step=60,
+    help="Only count walk gaps ≤ this many seconds as walking. Set 0 to disable the cap."
+)
+
+
+st.sidebar.header("Admin")
+if st.sidebar.button("🧹 Daily closeout (refresh & clear caches)"):
+    ok_mv, mv_msg = refresh_materialized_views(eng)
+    if ok_mv:
+        st.sidebar.success(mv_msg)
+    else:
+        st.sidebar.warning(mv_msg)
+    try:
+        st.cache_data.clear()
+        st.cache_resource.clear()
+    except Exception:
+        pass
+    st.sidebar.info("Caches cleared — rerunning app...")
+    st.rerun()
+
+# ===================================
+# DATA LOAD: UPLOAD OR DATABASE MODE
+# ===================================
+history = load_history_sql(colmap, eng)
+uploads = []
+if data_mode == "Upload files":
     st.sidebar.header("1) Upload")
     uploads = st.sidebar.file_uploader(
         "Drag & drop daily XLSX/CSV (one or many)",
@@ -590,161 +629,118 @@ if not db_only:
         accept_multiple_files=True
     )
     if not uploads:
-        st.info("Upload one or more daily exports to get started, or toggle DB-only to view existing data.")
+        st.info("Upload daily files or switch to 'Database only' mode.")
+        st.stop()
+else:
+    if history.empty:
+        st.warning("No records in database yet. Switch to 'Upload files' first.")
         st.stop()
 
+# ============================
+# PROCESS UPLOADS IF PROVIDED
+# ============================
+if uploads:
+    new_files = []
     for up in uploads:
-        try:
-            if up.name.lower().endswith(".xlsx"):
-                frames.append(pd.read_excel(up))
-            else:
-                try:
-                    frames.append(pd.read_csv(up))
-                except UnicodeDecodeError:
-                    up.seek(0)
-                    frames.append(pd.read_csv(up, encoding="latin-1"))
-        except Exception as e:
-            st.error(f"Failed to read {up.name}: {e}")
+        new = base_clean(load_upload(up), colmap)
+        if new.empty:
+            st.warning(f"{up.name}: no valid rows.")
+            continue
+        new_files.append(new)
 
-    frames = _non_empty_frames(frames)
-    if not frames:
-        st.error("No readable (non-empty) files uploaded.")
+    if not new_files:
+        st.warning("No usable files found.")
         st.stop()
 
-    df_raw_all = dedupe_columns(pd.concat(frames, ignore_index=True))
-else:
-    df_raw_all = None
+    new_ev = pd.concat(new_files, ignore_index=True)
+    new_ev = new_ev.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
 
-# 2) Column mapping
-if df_raw_all is not None:
-    st.sidebar.header("2) Map columns")
-    colmap: Dict[str, str] = {}
-    opts = list(df_raw_all.columns)
-    for k, default in DEFAULT_COLMAP.items():
-        sel = st.sidebar.selectbox(
-            f"{k.capitalize()} column",
-            options=opts,
-            index=opts.index(default) if default in opts else 0,
-            key=f"map_{k}",
-            help="Pick the matching column from your export",
-        )
-        colmap[k] = sel
+    # Merge with DB history
+    frames = [history, new_ev] if not history.empty else [new_ev]
+    combined = pd.concat([f for f in frames if not f.empty], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
 
-    # Validate distinct mapping
-    _selected = [v for v in colmap.values() if v is not None]
-    _dups = sorted({c for c in _selected if _selected.count(c) > 1})
-    if _dups:
-        st.error(
-            "You mapped the same column to multiple fields: "
-            + ", ".join(_dups)
-            + ". Please choose distinct columns for each field."
-        )
-        st.stop()
+    # ---- Upload summary ----
+    new_pks = set(new_ev["pk"])
+    old_pks = set(history["pk"]) if not history.empty and "pk" in history.columns else set()
+    num_new = len(new_pks - old_pks)
+    num_dup = len(new_pks & old_pks)
+    earliest = pd.to_datetime(combined[colmap["datetime"]].min())
+    latest = pd.to_datetime(combined[colmap["datetime"]].max())
 
-    # Clean + Engineer
-    try:
-        new_ev = base_clean(df_raw_all, colmap)
-    except Exception as e:
-        st.error(f"Column mapping / cleaning error: {e}")
-        st.stop()
+    with st.expander("📥 Upload summary", expanded=True):
+        st.write(f"**Rows in this upload:** {len(new_ev):,}")
+        st.write(f"- New rows vs DB: **{num_new:,}**")
+        st.write(f"- Already existed (upserts): **{num_dup:,}**")
+        st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
 
-    # Build primary key and merge with history
-    new_ev["pk"] = build_pk(new_ev, colmap)
-else:
-    # When DB-only, we still need a colmap. Use defaults (must match your DB canonical mapping assumptions).
-    colmap = DEFAULT_COLMAP.copy()
-    new_ev = pd.DataFrame()
-
-# Load history and combine
-history = load_history_sql(colmap, eng)  # Postgres load
-parts = _non_empty_frames([history, new_ev])
-combined = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-
-if combined.empty:
-    st.warning("No events available yet. Upload files or verify your DB.")
-    st.stop()
-
-# Deduplicate by pk (if pk exists)
-if "pk" not in combined.columns:
-    # Recreate pk if missing (legacy)
-    try:
-        if colmap["datetime"] in combined.columns:
-            combined[colmap["datetime"]] = parse_datetime_series(combined[colmap["datetime"]])
-        combined["pk"] = build_pk(combined, colmap)
-    except Exception:
-        combined["pk"] = pd.util.hash_pandas_object(combined.astype(str), index=False).astype(str)
-
-combined = combined.drop_duplicates(subset=["pk"]).reset_index(drop=True)
-
-# Save only if we just uploaded (and had new_ev)
-if not db_only and not new_ev.empty:
+    # Save to DB
     ok, msg = save_history_sql(combined, colmap, eng)
-    if ok:
-        st.sidebar.success(msg)
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
-        try:
-            ensure_indexes(eng)
-        except Exception:
-            pass
-    else:
-        st.sidebar.error(msg)
+    st.sidebar.success(msg if ok else msg)
+    ev_all = combined.copy()
 
-# Use combined for analysis
-ev = combined.copy()
+else:
+    ev_all = history.copy()
 
-# 3) Filters (native datetime slider)
-st.sidebar.header("Filters")
-_min = pd.to_datetime(ev[colmap["datetime"]].min())
-_max = pd.to_datetime(ev[colmap["datetime"]].max())
+# ===================
+# TIME RANGE FILTER
+# ===================
+_min = pd.to_datetime(ev_all[colmap["datetime"]].min())
+_max = pd.to_datetime(ev_all[colmap["datetime"]].max())
 min_ts = _min.to_pydatetime()
-max_ts = _max.to_pydatetime()
-if min_ts == max_ts:
-    max_ts = min_ts + timedelta(minutes=1)
+max_ts = _max.to_pydatetime() if _max > _min else (min_ts + timedelta(minutes=1))
 
 rng = st.sidebar.slider(
     "Time range",
     min_value=min_ts,
     max_value=max_ts,
     value=(min_ts, max_ts),
-    format="YYYY-MM-DD HH:mm",
+    format="YYYY-MM-DD HH:mm"
 )
 
-pick_devices = st.sidebar.multiselect("Devices", safe_unique(ev, colmap["device"]))
-pick_users   = st.sidebar.multiselect("Users", safe_unique(ev, colmap["user"]))
-pick_types   = st.sidebar.multiselect("Transaction types", safe_unique(ev, colmap["type"]))
-idle_min = st.sidebar.number_input(
-    "Walk gap threshold (seconds)",
-    min_value=5, max_value=900, value=DEFAULT_IDLE_MIN, step=5
-)
-
-# Mask
-mask = (
-    (ev[colmap["datetime"]] >= pd.to_datetime(rng[0])) &
-    (ev[colmap["datetime"]] <= pd.to_datetime(rng[1]))
-)
-if pick_devices:
-    mask &= ev[colmap["device"]].isin(pick_devices)
-if pick_users:
-    mask &= ev[colmap["user"]].isin(pick_users)
-if pick_types:
-    mask &= ev[colmap["type"]].isin(pick_types)
-
-ev = ev.loc[mask].copy()
-if ev.empty:
-    st.warning("No events in current filter range.")
+ev_time = ev_all[
+    (ev_all[colmap["datetime"]] >= pd.to_datetime(rng[0])) &
+    (ev_all[colmap["datetime"]] <= pd.to_datetime(rng[1]))
+].copy()
+if ev_time.empty:
+    st.warning("No events in selected time range.")
     st.stop()
 
-# Compute analytics
-data, device_stats, tech_stats, run_stats, hourly, visit = build_delivery_analytics(ev, colmap, idle_min=idle_min)
+# ====================================
+# SMARTER ANALYTICS (KEEP FULL SEQUENCE)
+# ====================================
+data, device_stats, tech_stats, run_stats, hourly, visit = build_delivery_analytics(
+    ev, colmap, idle_min=idle_min, idle_max=idle_max
+)
 
-# Pre-format for Drill-down
-data["gap_hms"]      = data["__gap_s"].map(fmt_hms)
-data["walk_gap_hms"] = data["__walk_gap_s"].map(fmt_hms)
-data["dwell_hms"]    = data["__dwell_s"].map(fmt_hms)
-data["visit_hms"]    = data["visit_duration_s"].map(fmt_hms)
+# ===========
+# FILTERS
+# ===========
+pick_devices = st.sidebar.multiselect("Devices", safe_unique(ev_time, colmap["device"]))
+pick_users   = st.sidebar.multiselect("Users", safe_unique(ev_time, colmap["user"]))
+pick_types   = st.sidebar.multiselect("Transaction types", safe_unique(ev_time, colmap["type"]))
+
+mask = pd.Series(True, index=data_full.index)
+if pick_devices:
+    mask &= data_full[colmap["device"]].isin(pick_devices)
+if pick_users:
+    mask &= data_full[colmap["user"]].isin(pick_users)
+if pick_types:
+    mask &= data_full[colmap["type"]].isin(pick_types)
+
+data   = data_full.loc[mask].copy()
+visit  = visit_full[visit_full[colmap["user"]].isin(data[colmap["user"]].unique())]
+hourly = hourly_full
+device_stats = (data.groupby(colmap["device"]).size().rename("events").reset_index()
+                    .sort_values("events", ascending=False))
+tech_stats = (data.groupby(colmap["user"]).size().rename("events").reset_index()
+                  .sort_values("events", ascending=False))
+run_stats = run_stats_full[run_stats_full[colmap["user"]].isin(data[colmap["user"]].unique())]
+
+# ============================
+# CONTINUE TO DASHBOARD BUILD
+# ============================
+st.success(f"Loaded {len(data):,} events for analysis.")
 
 # Tabs
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
