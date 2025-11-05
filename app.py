@@ -4,7 +4,7 @@
 # - Column mapping with duplicate guard
 # - Safe datetime parsing; duplicate header trimming
 # - Durable history in Postgres (UPSERT by pk, chunked)
-# - Delivery analytics: walk gaps, dwell, visit/run durations
+# - Delivery analytics: walk gaps, dwell, visit/run durations (with idle_max cap)
 # - Drill-down with H:MM:SS + CSV export
 # - Weekly summary + Top-10 anomalies (7d vs prior 7d)
 # - Outliers (IQR) per user/device
@@ -141,13 +141,24 @@ def _non_empty_frames(frames: List[pd.DataFrame]) -> List[pd.DataFrame]:
                 out.append(df)
     return out
 
-# ------------------ CORE ANALYTICS (robust, observed=True) ---------------------
+def load_upload(up) -> pd.DataFrame:
+    """Read a CSV/XLSX upload to a DataFrame with deduped headers."""
+    if up.name.lower().endswith(".xlsx"):
+        df = pd.read_excel(up)
+    else:
+        try:
+            df = pd.read_csv(up)
+        except UnicodeDecodeError:
+            up.seek(0)
+            df = pd.read_csv(up, encoding="latin-1")
+    return dedupe_columns(df)
+
 # ------------------ CORE ANALYTICS (robust, observed=True) ---------------------
 def build_delivery_analytics(
     ev: pd.DataFrame,
     colmap: Dict[str, str],
     idle_min: int,
-    idle_max: int | None = 1800,   # ← cap long gaps (0 or None disables cap)
+    idle_max: int | None = 1800,   # 0 or None disables cap
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Returns:
@@ -158,10 +169,7 @@ def build_delivery_analytics(
       hourly: events by hour
       visit: per-visit (tech, device) durations
     """
-    ts  = colmap["datetime"]
-    dev = colmap["device"]
-    usr = colmap["user"]
-    typ = colmap["type"]
+    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
 
     needed = [ts, dev, usr, typ]
     if colmap.get("desc")  and colmap["desc"]  in ev.columns: needed.append(colmap["desc"])
@@ -199,12 +207,12 @@ def build_delivery_analytics(
     # dwell: same device consecutive events
     data["__dwell_s"] = np.where(~data["__device_change"], data["__gap_s"], np.nan)
 
-    # --- visit id: bump when device changes within user (NA-safe) ---
+    # visit id: bump when device changes within user (NA-safe)
     prev_dev = data.groupby(usr, observed=True)[dev].shift()
     device_changed = (data[dev] != prev_dev).fillna(False)  # pure bool
     data["__visit_id"] = device_changed.astype("int8").groupby(data[usr], observed=True).cumsum()
 
-    # visit summary: start/end/duration for each (tech, visit_id, device)
+    # visit summary
     visit = (
         data.groupby([usr, "__visit_id", dev], as_index=False, observed=True)
             .agg(start=(ts, "min"), end=(ts, "max"))
@@ -270,174 +278,6 @@ def build_delivery_analytics(
 
     return data, device_stats, tech_stats, run_stats, hourly, visit
 
-
-
-
-def anomalies_top10(history: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> pd.DataFrame:
-    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
-    out = []
-    if history.empty:
-        return pd.DataFrame(columns=["rank","topic","detail","why","severity"])
-
-    hist = history.copy()
-    hist[ts] = pd.to_datetime(hist[ts], errors="coerce")
-    hist = hist.dropna(subset=[ts])
-    if hist.empty:
-        return pd.DataFrame(columns=["rank","topic","detail","why","severity"])
-
-    end = hist[ts].max()
-    start_recent = end - pd.Timedelta(days=7)
-    start_prior  = start_recent - pd.Timedelta(days=7)
-
-    recent = hist[(hist[ts] > start_recent) & (hist[ts] <= end)]
-    prior  = hist[(hist[ts] > start_prior)  & (hist[ts] <= start_recent)]
-
-    # 1) Device volume spike
-    if not recent.empty and not prior.empty:
-        r_dev = recent.groupby(dev, observed=True).size().rename("recent").reset_index()
-        p_dev = prior.groupby(dev, observed=True).size().rename("prior").reset_index()
-        vol = r_dev.merge(p_dev, on=dev, how="left").fillna(0.0)
-        vol["delta"] = vol["recent"] - vol["prior"]
-        vol["pct"]   = np.where(vol["prior"]>0, (vol["recent"]-vol["prior"])/vol["prior"], np.nan)
-        vol = vol.sort_values(["pct","delta"], ascending=False).head(3)
-        for _, r in vol.iterrows():
-            out.append({
-                "topic":"Device volume spike",
-                "detail":f"{r[dev]} recent {int(r['recent'])} vs prior {int(r['prior'])}",
-                "why":"Sudden workload shift; check staffing/stocking cadence",
-                "severity":"high" if (r["pct"]>=0.5 and r["recent"]>=50) else "med"
-            })
-
-    # 2) Techs with largest median walk gap (current filtered 'data')
-    if not data.empty and usr in data.columns:
-        twalk = data["__walk_gap_s"].groupby(data[usr], observed=True).median().dropna()
-        if not twalk.empty:
-            top_walk = twalk.sort_values(ascending=False).head(3)
-            for u, s in top_walk.items():
-                out.append({
-                    "topic":"High walking time",
-                    "detail":f"{u} median walk gap {fmt_hms(s)} ({int(s)}s)",
-                    "why":"Inefficient routing or distant devices in their run",
-                    "severity":"med" if s>=120 else "low"
-                })
-
-    # 3) Devices with largest median dwell (current filtered 'data')
-    if not data.empty and dev in data.columns:
-        dwell = (
-            data.loc[~data["__device_change"], "__gap_s"]
-            .groupby(data[dev], observed=True).median().dropna()
-        )
-        if not dwell.empty:
-            top_dwell = dwell.sort_values(ascending=False).head(3)
-            for d, s in top_dwell.items():
-                out.append({
-                    "topic":"Long dwell at device",
-                    "detail":f"{d} median dwell {fmt_hms(s)} ({int(s)}s)",
-                    "why":"Many refills per stop or slow transactions; check slot layout",
-                    "severity":"med" if s>=60 else "low"
-                })
-
-    # 4) Busiest hours (recent)
-    if not recent.empty:
-        rh = recent.groupby(recent[ts].dt.floor("h")).size()
-        if not rh.empty:
-            hr_top = rh.sort_values(ascending=False).head(2)
-            for h, n in hr_top.items():
-                out.append({
-                    "topic":"Rush hour",
-                    "detail":f"{h:%Y-%m-%d %H:%M} had {int(n)} events",
-                    "why":"Consider JIT timing / more techs in this window",
-                    "severity":"med" if n>=100 else "low"
-                })
-
-    # 5) Transaction-type surges (recent vs prior)
-    if not recent.empty and not prior.empty and typ in hist.columns:
-        r_t = recent.groupby(typ, observed=True).size().rename("recent").reset_index()
-        p_t = prior.groupby(typ, observed=True).size().rename("prior").reset_index()
-        typd = r_t.merge(p_t, on=typ, how="left").fillna(0.0)
-        typd["delta"] = typd["recent"]-typd["prior"]
-        typd = typd.sort_values("delta", ascending=False).head(2)
-        for _, r in typd.iterrows():
-            out.append({
-                "topic":"Transaction-type surge",
-                "detail":f"{r[typ]} recent {int(r['recent'])} vs prior {int(r['prior'])}",
-                "why":"Upstream demand or workflow change",
-                "severity":"med" if r["delta"]>=30 else "low"
-            })
-
-    if not out:
-        return pd.DataFrame(columns=["rank","topic","detail","why","severity"])
-    df_out = pd.DataFrame(out)
-    sev_rank = df_out["severity"].map({"high":3,"med":2,"low":1}).fillna(1)
-    df_out = df_out.iloc[sev_rank.sort_values(ascending=False).index].reset_index(drop=True)
-    df_out.insert(0, "rank", np.arange(1, len(df_out)+1))
-    return df_out.head(10)
-
-def outliers_iqr(data: pd.DataFrame, key_col: str, value_col: str, label: str) -> pd.DataFrame:
-    """IQR-based outlier detection per key_col on value_col."""
-    df = data[[key_col, value_col]].dropna().copy()
-    if df.empty:
-        return pd.DataFrame(columns=[key_col, value_col, "z_note"])
-
-    def _flag(group):
-        q1 = group[value_col].quantile(0.25)
-        q3 = group[value_col].quantile(0.75)
-        iqr = q3 - q1
-        upper = q3 + (1.5 if iqr == 0 else 1.5 * iqr)
-        return group[group[value_col] > upper].assign(
-            z_note=f"{label}: > Q3+1.5*IQR (>{upper:.1f}s)"
-        )
-
-    out = df.groupby(key_col, dropna=True, observed=True).apply(_flag).reset_index(drop=True)
-    return out
-
-def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> Tuple[str, pd.DataFrame]:
-    q = question.strip().lower()
-    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
-
-    if re.search(r"\b(top|most)\b.*\bdevices?\b", q):
-        t = ev.groupby(dev, observed=True).size().rename("events").reset_index().sort_values("events", ascending=False).head(10)
-        return f"Top devices by event volume (showing {len(t)}):", t
-
-    if "longest" in q and "dwell" in q:
-        if data.empty:
-            return "No dwell data in current filter.", pd.DataFrame()
-        t = (
-            data.loc[~data["__device_change"], ["__gap_s"]]
-            .groupby(data[dev], observed=True).median().rename(columns={"__gap_s":"median_dwell_s"})
-            .sort_values("median_dwell_s", ascending=False).head(10).reset_index()
-        )
-        t["median_dwell_hms"] = t["median_dwell_s"].map(fmt_hms)
-        return "Devices with longest median dwell:", t
-
-    m = re.search(r"median .*walk.* for (.+)", q)
-    if m:
-        name = m.group(1).strip()
-        sub = data[data[usr].str.lower()==name.lower()]
-        if sub.empty:
-            return f"No rows found for user '{name}'.", pd.DataFrame()
-        val = np.nanmedian(sub["__walk_gap_s"].values)
-        return f"Median walk gap for {name}: {fmt_hms(val)} ({int(val)}s)", pd.DataFrame()
-
-    if "hour" in q:
-        t = ev.groupby(ev[ts].dt.floor("h")).size().rename("events").reset_index().rename(columns={ts:"hour"})
-        if t.empty:
-            return "No hourly data in current filter.", pd.DataFrame()
-        top = t.sort_values("events", ascending=False).head(1).iloc[0]
-        return f"Busiest hour: {top['hour']:%Y-%m-%d %H:%M} with {int(top['events'])} events.", t.sort_values("hour")
-
-    if "which tech" in q and "median walk" in q:
-        if data.empty:
-            return "No walk-gap data in current filter.", pd.DataFrame()
-        t = data.groupby(usr, observed=True)["__walk_gap_s"].median().reset_index().rename(columns={"__walk_gap_s":"median_walk_s"})
-        t = t.sort_values("median_walk_s", ascending=False)
-        top = t.iloc[0]
-        return f"Highest median walk gap: {top[usr]} at {fmt_hms(top['median_walk_s'])}.", t
-
-    tbl = ev[[ts, usr, dev, typ]].head(50)
-    return ("Try asks like: 'top devices', 'longest dwell devices', "
-            "'median walk gap for Melissa', 'busiest hour'."), tbl
-
 # ------------------------- PERSISTENCE (POSTGRES via Supabase) ----------------------
 
 @st.cache_resource
@@ -472,12 +312,6 @@ def ensure_indexes(eng, timeout_sec: int = 15):
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_user   ON events ("user")',
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_type   ON events ("type")',
     ]
-
-def refresh_materialized_views(eng):
-    # No materialized views yet; keep as a harmless stub.
-    return True, "Materialized views refresh: skipped (none configured)."
-
-    # per-statement timeout
     with eng.begin() as con:
         con.execute(text(f"SET LOCAL lock_timeout = '{timeout_sec}s'"))
         for s in stmts:
@@ -486,6 +320,10 @@ def refresh_materialized_views(eng):
             except Exception:
                 # Non-fatal: index is busy or being built elsewhere
                 pass
+
+def refresh_materialized_views(eng):
+    # No materialized views yet; keep as a harmless stub.
+    return True, "Materialized views refresh: skipped (none configured)."
 
 def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict]:
     """Map dynamic DataFrame columns into canonical SQL columns."""
@@ -590,6 +428,9 @@ data_mode = st.sidebar.radio(
     help="Use 'Database only' to analyze existing Postgres data without uploading new files."
 )
 
+# Column map (using defaults for now; add UI later if you want)
+colmap: Dict[str, str] = DEFAULT_COLMAP.copy()
+
 idle_min = st.sidebar.number_input(
     "Walk gap threshold min (seconds)",
     min_value=5, max_value=900, value=60, step=5
@@ -600,8 +441,14 @@ idle_max = st.sidebar.number_input(
     help="Only count walk gaps ≤ this many seconds as walking. Set 0 to disable the cap."
 )
 
-
 st.sidebar.header("Admin")
+if st.sidebar.button("🛠 Build/repair DB indexes"):
+    try:
+        ensure_indexes(eng)
+        st.sidebar.success("Index build/repair requested (non-blocking).")
+    except Exception as e:
+        st.sidebar.warning(f"Index maintenance skipped: {e}")
+
 if st.sidebar.button("🧹 Daily closeout (refresh & clear caches)"):
     ok_mv, mv_msg = refresh_materialized_views(eng)
     if ok_mv:
@@ -628,7 +475,7 @@ if data_mode == "Upload files":
         type=["xlsx", "csv"],
         accept_multiple_files=True
     )
-    if not uploads:
+    if not uploads and history.empty:
         st.info("Upload daily files or switch to 'Database only' mode.")
         st.stop()
 else:
@@ -642,11 +489,16 @@ else:
 if uploads:
     new_files = []
     for up in uploads:
-        new = base_clean(load_upload(up), colmap)
-        if new.empty:
-            st.warning(f"{up.name}: no valid rows.")
-            continue
-        new_files.append(new)
+        try:
+            raw = load_upload(up)
+            cleaned = base_clean(raw, colmap)
+            if cleaned.empty:
+                st.warning(f"{up.name}: no valid rows.")
+                continue
+            cleaned["pk"] = build_pk(cleaned, colmap)
+            new_files.append(cleaned)
+        except Exception as e:
+            st.error(f"Failed to read {up.name}: {e}")
 
     if not new_files:
         st.warning("No usable files found.")
@@ -657,16 +509,16 @@ if uploads:
 
     # Merge with DB history
     frames = [history, new_ev] if not history.empty else [new_ev]
-    combined = pd.concat([f for f in frames if not f.empty], ignore_index=True)
-    combined = combined.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
+    ev_all = pd.concat([f for f in frames if not f.empty], ignore_index=True)
+    ev_all = ev_all.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
 
     # ---- Upload summary ----
     new_pks = set(new_ev["pk"])
     old_pks = set(history["pk"]) if not history.empty and "pk" in history.columns else set()
     num_new = len(new_pks - old_pks)
     num_dup = len(new_pks & old_pks)
-    earliest = pd.to_datetime(combined[colmap["datetime"]].min())
-    latest = pd.to_datetime(combined[colmap["datetime"]].max())
+    earliest = pd.to_datetime(ev_all[colmap["datetime"]].min())
+    latest = pd.to_datetime(ev_all[colmap["datetime"]].max())
 
     with st.expander("📥 Upload summary", expanded=True):
         st.write(f"**Rows in this upload:** {len(new_ev):,}")
@@ -675,15 +527,17 @@ if uploads:
         st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
 
     # Save to DB
-    ok, msg = save_history_sql(combined, colmap, eng)
+    ok, msg = save_history_sql(ev_all, colmap, eng)
     st.sidebar.success(msg if ok else msg)
-    ev_all = combined.copy()
-
 else:
     ev_all = history.copy()
 
+if ev_all.empty:
+    st.warning("No events available yet. Upload files or verify your DB.")
+    st.stop()
+
 # ===================
-# TIME RANGE FILTER
+# TIME + BASIC FILTERS (BEFORE ANALYTICS)
 # ===================
 _min = pd.to_datetime(ev_all[colmap["datetime"]].min())
 _max = pd.to_datetime(ev_all[colmap["datetime"]].max())
@@ -706,40 +560,35 @@ if ev_time.empty:
     st.warning("No events in selected time range.")
     st.stop()
 
-# ====================================
-# SMARTER ANALYTICS (KEEP FULL SEQUENCE)
-# ====================================
-data, device_stats, tech_stats, run_stats, hourly, visit = build_delivery_analytics(
-    ev, colmap, idle_min=idle_min, idle_max=idle_max
-)
-
-# ===========
-# FILTERS
-# ===========
+# Side filters applied BEFORE analytics so sequences are consistent
 pick_devices = st.sidebar.multiselect("Devices", safe_unique(ev_time, colmap["device"]))
 pick_users   = st.sidebar.multiselect("Users", safe_unique(ev_time, colmap["user"]))
 pick_types   = st.sidebar.multiselect("Transaction types", safe_unique(ev_time, colmap["type"]))
 
-mask = pd.Series(True, index=data_full.index)
 if pick_devices:
-    mask &= data_full[colmap["device"]].isin(pick_devices)
+    ev_time = ev_time[ev_time[colmap["device"]].isin(pick_devices)]
 if pick_users:
-    mask &= data_full[colmap["user"]].isin(pick_users)
+    ev_time = ev_time[ev_time[colmap["user"]].isin(pick_users)]
 if pick_types:
-    mask &= data_full[colmap["type"]].isin(pick_types)
+    ev_time = ev_time[ev_time[colmap["type"]].isin(pick_types)]
 
-data   = data_full.loc[mask].copy()
-visit  = visit_full[visit_full[colmap["user"]].isin(data[colmap["user"]].unique())]
-hourly = hourly_full
-device_stats = (data.groupby(colmap["device"]).size().rename("events").reset_index()
-                    .sort_values("events", ascending=False))
-tech_stats = (data.groupby(colmap["user"]).size().rename("events").reset_index()
-                  .sort_values("events", ascending=False))
-run_stats = run_stats_full[run_stats_full[colmap["user"]].isin(data[colmap["user"]].unique())]
+if ev_time.empty:
+    st.warning("No events after applying device/user/type filters.")
+    st.stop()
 
-# ============================
-# CONTINUE TO DASHBOARD BUILD
-# ============================
+# ====================================
+# ANALYTICS
+# ====================================
+data, device_stats, tech_stats, run_stats, hourly, visit = build_delivery_analytics(
+    ev_time, colmap, idle_min=idle_min, idle_max=idle_max
+)
+
+# Pre-format for Drill-down
+data["gap_hms"]      = data["__gap_s"].map(fmt_hms)
+data["walk_gap_hms"] = data["__walk_gap_s"].map(fmt_hms)
+data["dwell_hms"]    = data["__dwell_s"].map(fmt_hms)
+data["visit_hms"]    = data["visit_duration_s"].map(fmt_hms)
+
 st.success(f"Loaded {len(data):,} events for analysis.")
 
 # Tabs
@@ -752,12 +601,12 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
 with tab1:
     st.subheader("Overview")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Events", f"{len(ev):,}")
-    c2.metric("Devices", f"{ev[colmap['device']].nunique():,}")
-    c3.metric("Users", f"{ev[colmap['user']].nunique():,}")
-    c4.metric("Types", f"{ev[colmap['type']].nunique():,}")
+    c1.metric("Events", f"{len(ev_time):,}")
+    c2.metric("Devices", f"{ev_time[colmap['device']].nunique():,}")
+    c3.metric("Users", f"{ev_time[colmap['user']].nunique():,}")
+    c4.metric("Types", f"{ev_time[colmap['type']].nunique():,}")
 
-    week_df = weekly_summary(ev, colmap)
+    week_df = weekly_summary(ev_time, colmap)
     if not week_df.empty:
         fig = px.bar(week_df, x="week", y="events", title="Weekly events")
         st.plotly_chart(fig, use_container_width=True)
@@ -802,7 +651,6 @@ with tab5:
 
 with tab6:
     st.subheader("Drill-down (exportable)")
-
     show_cols = [
         colmap["datetime"], colmap["user"], colmap["device"], colmap["type"],
         "gap_hms", "walk_gap_hms", "dwell_hms", "visit_hms",
@@ -840,7 +688,7 @@ with tab6:
 
 with tab7:
     st.subheader("Weekly Top 10 (signals)")
-    digest = anomalies_top10(combined, data, colmap)
+    digest = anomalies_top10(ev_all, data, colmap)  # use the full history frame
     if digest.empty:
         st.info("No notable anomalies in the last 7 days window.")
     else:
@@ -860,8 +708,7 @@ with tab9:
     st.subheader("Ask the data ❓")
     q = st.text_input("Try e.g. 'top devices', 'longest dwell devices', 'median walk gap for Melissa', 'busiest hour'")
     if q:
-        ans, tbl = qa_answer(q, ev, data, colmap)
+        ans, tbl = qa_answer(q, ev_time, data, colmap)
         st.write(ans)
         if not tbl.empty:
             st.dataframe(tbl, use_container_width=True)
-
