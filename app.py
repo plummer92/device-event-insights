@@ -1,15 +1,13 @@
 # app.py
 # Device Event Insights — Pro (Supabase Postgres + cache-busted engine)
-# - Multi-file upload (xlsx/csv)  |  DB-only resume toggle
-# - Column mapping with duplicate guard
-# - Safe datetime parsing; duplicate header trimming
-# - Durable history in Postgres (UPSERT by pk, chunked)
-# - Delivery analytics: walk gaps, dwell, visit/run durations (with idle_max cap)
+# - Upload CSV/XLSX OR analyze Postgres history only
+# - Column mapping UI with duplicate guard
+# - Durable history (UPSERT by pk), chunked
+# - Delivery analytics: walk gaps (min+max cap), dwell, visits, runs
 # - Drill-down with H:MM:SS + CSV export
-# - Weekly summary + Top-10 anomalies (7d vs prior 7d)
-# - Outliers (IQR) per user/device
-# - Index maintenance button (concurrent create)
-# - FutureWarning-safe (observed=True, no categorical group keys)
+# - Weekly summary, anomalies (7d vs prior 7d), IQR outliers
+# - Index maintenance (CONCURRENTLY) with lock timeout
+# - FutureWarning-safe (observed=True; no categoricals)
 from __future__ import annotations
 
 import hashlib
@@ -34,19 +32,21 @@ st.set_page_config(
 
 DEFAULT_COLMAP = {
     "datetime": "TransactionDateTime",
-    "device": "Device",
-    "user": "UserName",
-    "type": "TransactionType",
+    "device":   "Device",
+    "user":     "UserName",
+    "type":     "TransactionType",
     # optional:
-    "desc": "MedDescription",
-    "qty": "Quantity",
-    "medid": "MedID",
+    "desc":     "MedDescription",
+    "qty":      "Quantity",
+    "medid":    "MedID",
 }
 
-DEFAULT_IDLE_MIN = 30  # seconds to qualify as a "walk/travel" gap
+# Make a default mapping available immediately (prevents NameError)
+colmap: Dict[str, str] = DEFAULT_COLMAP.copy()
+
+DEFAULT_IDLE_MIN = 30  # seconds to qualify as "walk/travel" gap
 
 # ----------------------------- HELPERS --------------------------------
-
 def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure column names are unique by dropping exact dupes; trim whitespace."""
     if df.columns.duplicated().any():
@@ -61,10 +61,21 @@ def parse_datetime_series(s: pd.Series) -> pd.Series:
         out = out.dt.tz_convert("UTC").dt.tz_localize(None)
     return out
 
+def load_upload(up) -> pd.DataFrame:
+    """Robust reader for CSV/XLSX uploads."""
+    name = up.name.lower()
+    if name.endswith(".xlsx"):
+        return pd.read_excel(up)
+    # CSV: try utf-8 then latin-1
+    try:
+        up.seek(0)
+        return pd.read_csv(up)
+    except UnicodeDecodeError:
+        up.seek(0)
+        return pd.read_csv(up, encoding="latin-1")
+
 def base_clean(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
     out = dedupe_columns(df_raw).copy()
-
-    # Safe handle for possible duplicate-named datetime columns
     dtcol = colmap["datetime"]
     if dtcol not in out.columns:
         raise ValueError(f"Mapped datetime column '{dtcol}' not found in file.")
@@ -73,11 +84,9 @@ def base_clean(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
         s = s.iloc[:, 0]
     out[dtcol] = parse_datetime_series(s)
 
-    # Optional numerics
     if colmap.get("qty") and colmap["qty"] in out.columns:
         out[colmap["qty"]] = pd.to_numeric(out[colmap["qty"]], errors="coerce")
 
-    # Sanitize strings (use string dtype; avoid categoricals to prevent groupby blowups)
     for key in ["device", "user", "type", "desc", "medid"]:
         c = colmap.get(key)
         if c and c in out.columns:
@@ -85,11 +94,9 @@ def base_clean(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
 
     out = out.dropna(subset=[dtcol]).copy()
     out = out.sort_values(dtcol).reset_index(drop=True)
-
-    # Engineered calendar columns
     out["__date"] = out[dtcol].dt.date
     out["__hour"] = out[dtcol].dt.hour
-    out["__dow"] = out[dtcol].dt.day_name()
+    out["__dow"]  = out[dtcol].dt.day_name()
     return out
 
 def fmt_hms(x) -> str:
@@ -118,18 +125,14 @@ def build_pk(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.Series:
     return pd.Series(out, index=df.index, dtype="string")
 
 def weekly_summary(ev: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
-    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
+    ts, dev, usr, typ = colmap["datetime"], colmap["device"], colmap["user"], colmap["type"]
     df = ev.copy()
     df["week"] = df[ts].dt.to_period("W-SUN").apply(lambda p: p.start_time.date())
     out = (
         df.groupby("week", observed=True)
-        .agg(
-            events=(typ, "count"),
-            devices=(dev, "nunique"),
-            techs=(usr, "nunique"),
-        )
-        .reset_index()
-        .sort_values("week")
+          .agg(events=(typ, "count"), devices=(dev, "nunique"), techs=(usr, "nunique"))
+          .reset_index()
+          .sort_values("week")
     )
     return out
 
@@ -141,24 +144,12 @@ def _non_empty_frames(frames: List[pd.DataFrame]) -> List[pd.DataFrame]:
                 out.append(df)
     return out
 
-def load_upload(up) -> pd.DataFrame:
-    """Read a CSV/XLSX upload to a DataFrame with deduped headers."""
-    if up.name.lower().endswith(".xlsx"):
-        df = pd.read_excel(up)
-    else:
-        try:
-            df = pd.read_csv(up)
-        except UnicodeDecodeError:
-            up.seek(0)
-            df = pd.read_csv(up, encoding="latin-1")
-    return dedupe_columns(df)
-
 # ------------------ CORE ANALYTICS (robust, observed=True) ---------------------
 def build_delivery_analytics(
     ev: pd.DataFrame,
     colmap: Dict[str, str],
     idle_min: int,
-    idle_max: int | None = 1800,   # 0 or None disables cap
+    idle_max: int | None = 1800,   # 0/None disables cap
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Returns:
@@ -169,19 +160,18 @@ def build_delivery_analytics(
       hourly: events by hour
       visit: per-visit (tech, device) durations
     """
-    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
+    ts, dev, usr, typ = colmap["datetime"], colmap["device"], colmap["user"], colmap["type"]
 
     needed = [ts, dev, usr, typ]
-    if colmap.get("desc")  and colmap["desc"]  in ev.columns: needed.append(colmap["desc"])
-    if colmap.get("medid") and colmap["medid"] in ev.columns: needed.append(colmap["medid"])
-    if colmap.get("qty")   and colmap["qty"]   in ev.columns: needed.append(colmap["qty"])
-    needed = list(dict.fromkeys(needed))  # keep order, drop dupes
+    for k in ["desc", "medid", "qty"]:
+        c = colmap.get(k)
+        if c and c in ev.columns:
+            needed.append(c)
+    needed = list(dict.fromkeys(needed))
 
-    # Ensure unique cols / slice and sort
     ev = ev.loc[:, ~ev.columns.duplicated()].copy()
     data = ev[needed].sort_values([usr, ts]).copy()
 
-    # Normalize string keys early (avoid nullable bools & groupby weirdness)
     for c in [dev, usr, typ]:
         if c in data.columns:
             data[c] = data[c].astype("string").fillna("[unknown]")
@@ -196,7 +186,7 @@ def build_delivery_analytics(
     # device change flag (plain bool; no NA)
     data["__device_change"] = (data[dev] != data["__next_dev"]).fillna(False)
 
-    # walk gap: device changed and gap >= threshold (and <= idle_max if set)
+    # walk gap with min+max cap
     cap_ok = (data["__gap_s"] <= float(idle_max)) if (idle_max and idle_max > 0) else True
     data["__walk_gap_s"] = np.where(
         data["__device_change"] & (data["__gap_s"] >= float(idle_min)) & cap_ok,
@@ -209,7 +199,7 @@ def build_delivery_analytics(
 
     # visit id: bump when device changes within user (NA-safe)
     prev_dev = data.groupby(usr, observed=True)[dev].shift()
-    device_changed = (data[dev] != prev_dev).fillna(False)  # pure bool
+    device_changed = (data[dev] != prev_dev).fillna(False)
     data["__visit_id"] = device_changed.astype("int8").groupby(data[usr], observed=True).cumsum()
 
     # visit summary
@@ -251,7 +241,7 @@ def build_delivery_analytics(
           .reset_index()
     )
 
-    # run sequences: break whenever there is a walk gap (already thresholded)
+    # run sequences: break whenever there is a walk gap
     data["__is_break"] = data["__walk_gap_s"].notna()
     data["__run_id"]   = data["__is_break"].astype("int8").groupby(data[usr], observed=True).cumsum()
 
@@ -278,15 +268,178 @@ def build_delivery_analytics(
 
     return data, device_stats, tech_stats, run_stats, hourly, visit
 
-# ------------------------- PERSISTENCE (POSTGRES via Supabase) ----------------------
+def anomalies_top10(history: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> pd.DataFrame:
+    ts, dev, usr, typ = colmap["datetime"], colmap["device"], colmap["user"], colmap["type"]
+    out = []
+    if history.empty:
+        return pd.DataFrame(columns=["rank","topic","detail","why","severity"])
 
+    hist = history.copy()
+    hist[ts] = pd.to_datetime(hist[ts], errors="coerce")
+    hist = hist.dropna(subset=[ts])
+    if hist.empty:
+        return pd.DataFrame(columns=["rank","topic","detail","why","severity"])
+
+    end = hist[ts].max()
+    start_recent = end - pd.Timedelta(days=7)
+    start_prior  = start_recent - pd.Timedelta(days=7)
+
+    recent = hist[(hist[ts] > start_recent) & (hist[ts] <= end)]
+    prior  = hist[(hist[ts] > start_prior)  & (hist[ts] <= start_recent)]
+
+    # 1) Device volume spike
+    if not recent.empty and not prior.empty:
+        r_dev = recent.groupby(dev, observed=True).size().rename("recent").reset_index()
+        p_dev = prior.groupby(dev, observed=True).size().rename("prior").reset_index()
+        vol = r_dev.merge(p_dev, on=dev, how="left").fillna(0.0)
+        vol["delta"] = vol["recent"] - vol["prior"]
+        vol["pct"]   = np.where(vol["prior"]>0, (vol["recent"]-vol["prior"])/vol["prior"], np.nan)
+        vol = vol.sort_values(["pct","delta"], ascending=False).head(3)
+        for _, r in vol.iterrows():
+            out.append({
+                "topic":"Device volume spike",
+                "detail":f"{r[dev]} recent {int(r['recent'])} vs prior {int(r['prior'])}",
+                "why":"Sudden workload shift; check staffing/stocking cadence",
+                "severity":"high" if (r["pct"]>=0.5 and r["recent"]>=50) else "med"
+            })
+
+    # 2) Techs with largest median walk gap (current filtered 'data')
+    if not data.empty and usr in data.columns:
+        twalk = data["__walk_gap_s"].groupby(data[usr], observed=True).median().dropna()
+        if not twalk.empty:
+            top_walk = twalk.sort_values(ascending=False).head(3)
+            for u, s in top_walk.items():
+                out.append({
+                    "topic":"High walking time",
+                    "detail":f"{u} median walk gap {fmt_hms(s)} ({int(s)}s)",
+                    "why":"Inefficient routing or distant devices in their run",
+                    "severity":"med" if s>=120 else "low"
+                })
+
+    # 3) Devices with largest median dwell (current filtered 'data')
+    if not data.empty and dev in data.columns:
+        dwell = (
+            data.loc[~data["__device_change"], "__gap_s"]
+            .groupby(data[dev], observed=True).median().dropna()
+        )
+        if not dwell.empty:
+            top_dwell = dwell.sort_values(ascending=False).head(3)
+            for d, s in top_dwell.items():
+                out.append({
+                    "topic":"Long dwell at device",
+                    "detail":f"{d} median dwell {fmt_hms(s)} ({int(s)}s)",
+                    "why":"Many refills per stop or slow transactions; check slot layout",
+                    "severity":"med" if s>=60 else "low"
+                })
+
+    # 4) Busiest hours (recent)
+    if not recent.empty:
+        rh = recent.groupby(recent[ts].dt.floor("h")).size()
+        if not rh.empty:
+            hr_top = rh.sort_values(ascending=False).head(2)
+            for h, n in hr_top.items():
+                out.append({
+                    "topic":"Rush hour",
+                    "detail":f"{h:%Y-%m-%d %H:%M} had {int(n)} events",
+                    "why":"Consider JIT timing / more techs in this window",
+                    "severity":"med" if n>=100 else "low"
+                })
+
+    # 5) Transaction-type surges
+    if not recent.empty and not prior.empty and typ in hist.columns:
+        r_t = recent.groupby(typ, observed=True).size().rename("recent").reset_index()
+        p_t = prior.groupby(typ, observed=True).size().rename("prior").reset_index()
+        typd = r_t.merge(p_t, on=typ, how="left").fillna(0.0)
+        typd["delta"] = typd["recent"]-typd["prior"]
+        typd = typd.sort_values("delta", ascending=False).head(2)
+        for _, r in typd.iterrows():
+            out.append({
+                "topic":"Transaction-type surge",
+                "detail":f"{r[typ]} recent {int(r['recent'])} vs prior {int(r['prior'])}",
+                "why":"Upstream demand or workflow change",
+                "severity":"med" if r["delta"]>=30 else "low"
+            })
+
+    if not out:
+        return pd.DataFrame(columns=["rank","topic","detail","why","severity"])
+    df_out = pd.DataFrame(out)
+    sev_rank = df_out["severity"].map({"high":3,"med":2,"low":1}).fillna(1)
+    df_out = df_out.iloc[sev_rank.sort_values(ascending=False).index].reset_index(drop=True)
+    df_out.insert(0, "rank", np.arange(1, len(df_out)+1))
+    return df_out.head(10)
+
+def outliers_iqr(data: pd.DataFrame, key_col: str, value_col: str, label: str) -> pd.DataFrame:
+    """IQR-based outlier detection per key_col on value_col."""
+    df = data[[key_col, value_col]].dropna().copy()
+    if df.empty:
+        return pd.DataFrame(columns=[key_col, value_col, "z_note"])
+
+    def _flag(group):
+        q1 = group[value_col].quantile(0.25)
+        q3 = group[value_col].quantile(0.75)
+        iqr = q3 - q1
+        upper = q3 + (1.5 if iqr == 0 else 1.5 * iqr)
+        return group[group[value_col] > upper].assign(
+            z_note=f"{label}: > Q3+1.5*IQR (>{upper:.1f}s)"
+        )
+
+    out = df.groupby(key_col, dropna=True, observed=True).apply(_flag).reset_index(drop=True)
+    return out
+
+def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> Tuple[str, pd.DataFrame]:
+    q = question.strip().lower()
+    ts, dev, usr, typ = colmap["datetime"], colmap["device"], colmap["user"], colmap["type"]
+
+    if re.search(r"\b(top|most)\b.*\bdevices?\b", q):
+        t = ev.groupby(dev, observed=True).size().rename("events").reset_index().sort_values("events", ascending=False).head(10)
+        return f"Top devices by event volume (showing {len(t)}):", t
+
+    if "longest" in q and "dwell" in q:
+        if data.empty:
+            return "No dwell data in current filter.", pd.DataFrame()
+        t = (
+            data.loc[~data["__device_change"], ["__gap_s"]]
+                .groupby(data[dev], observed=True).median().rename(columns={"__gap_s":"median_dwell_s"})
+                .sort_values("median_dwell_s", descending=True if hasattr(pd, "NA") else False).head(10).reset_index()
+        )
+        t["median_dwell_hms"] = t["median_dwell_s"].map(fmt_hms)
+        return "Devices with longest median dwell:", t
+
+    m = re.search(r"median .*walk.* for (.+)", q)
+    if m:
+        name = m.group(1).strip()
+        sub = data[data[usr].str.lower()==name.lower()]
+        if sub.empty:
+            return f"No rows found for user '{name}'.", pd.DataFrame()
+        val = np.nanmedian(sub["__walk_gap_s"].values)
+        return f"Median walk gap for {name}: {fmt_hms(val)} ({int(val)}s)", pd.DataFrame()
+
+    if "hour" in q:
+        t = ev.groupby(ev[ts].dt.floor("h")).size().rename("events").reset_index().rename(columns={ts:"hour"})
+        if t.empty:
+            return "No hourly data in current filter.", pd.DataFrame()
+        top = t.sort_values("events", ascending=False).head(1).iloc[0]
+        return f"Busiest hour: {top['hour']:%Y-%m-%d %H:%M} with {int(top['events'])} events.", t.sort_values("hour")
+
+    if "which tech" in q and "median walk" in q:
+        if data.empty:
+            return "No walk-gap data in current filter.", pd.DataFrame()
+        t = data.groupby(usr, observed=True)["__walk_gap_s"].median().reset_index().rename(columns={"__walk_gap_s":"median_walk_s"})
+        t = t.sort_values("median_walk_s", ascending=False)
+        top = t.iloc[0]
+        return f"Highest median walk gap: {top[usr]} at {fmt_hms(top['median_walk_s'])}.", t
+
+    tbl = ev[[ts, usr, dev, typ]].head(50)
+    return ("Try asks like: 'top devices', 'longest dwell devices', "
+            "'median walk gap for Melissa', 'busiest hour'."), tbl
+
+# ------------------------- PERSISTENCE (POSTGRES via Supabase) ----------------------
 @st.cache_resource
 def get_engine(db_url: str, salt: str):
     """Create a cached SQLAlchemy engine. Changing db_url or salt busts the cache."""
     return create_engine(db_url, pool_pre_ping=True)
 
 def init_db(eng):
-    """Create canonical schema & indexes (fast statements)."""
     ddl = """
     CREATE TABLE IF NOT EXISTS events (
         pk     TEXT PRIMARY KEY,
@@ -303,9 +456,7 @@ def init_db(eng):
         con.execute(text(ddl))
 
 def ensure_indexes(eng, timeout_sec: int = 15):
-    """
-    Create/repair indexes concurrently and quickly. If DB is busy, just skip.
-    """
+    """Create/repair indexes concurrently; skip if busy."""
     stmts = [
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_dt     ON events (dt)',
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_device ON events (device)',
@@ -318,16 +469,14 @@ def ensure_indexes(eng, timeout_sec: int = 15):
             try:
                 con.execute(text(s))
             except Exception:
-                # Non-fatal: index is busy or being built elsewhere
-                pass
+                pass  # non-fatal
 
 def refresh_materialized_views(eng):
-    # No materialized views yet; keep as a harmless stub.
+    # No MVs yet; placeholder
     return True, "Materialized views refresh: skipped (none configured)."
 
 def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict]:
-    """Map dynamic DataFrame columns into canonical SQL columns."""
-    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]; typ = colmap["type"]
+    ts, dev, usr, typ = colmap["datetime"], colmap["device"], colmap["user"], colmap["type"]
     get = lambda k: (colmap.get(k) in df.columns) if colmap.get(k) else False
     rows = []
     for _, r in df.iterrows():
@@ -344,7 +493,7 @@ def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict
     return rows
 
 def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[bool, str]:
-    """UPSERT by pk into Postgres (chunked for large loads)."""
+    """UPSERT by pk into Postgres (chunked)."""
     try:
         init_db(eng)
         rows = _df_to_rows_canonical(df, colmap)
@@ -400,7 +549,6 @@ def load_history_sql(colmap: Dict[str, str], eng) -> pd.DataFrame:
 
         out = raw.rename(columns=rename_back)
         out[colmap["datetime"]] = pd.to_datetime(out[colmap["datetime"]], errors="coerce")
-        # Keep string types for groupby keys
         for c in [colmap["device"], colmap["user"], colmap["type"]]:
             if c in out.columns:
                 out[c] = out[c].astype("string")
@@ -413,14 +561,12 @@ def load_history_sql(colmap: Dict[str, str], eng) -> pd.DataFrame:
 # ----------------------------- UI ------------------------------------
 st.title("All Device Event Insights — Pro")
 
-# Build engine once (cache-busted by secrets)
+# Engine (cached)
 DB_URL = st.secrets["DB_URL"]
 ENGINE_SALT = st.secrets.get("ENGINE_SALT", "")
 eng = get_engine(DB_URL, ENGINE_SALT)
 
-# ================================
-# SIDEBAR: DATA SOURCE + SETTINGS
-# ================================
+# ================================ SIDEBAR ==============================
 st.sidebar.header("Data source")
 data_mode = st.sidebar.radio(
     "Choose data source",
@@ -428,12 +574,9 @@ data_mode = st.sidebar.radio(
     help="Use 'Database only' to analyze existing Postgres data without uploading new files."
 )
 
-# Column map (using defaults for now; add UI later if you want)
-colmap: Dict[str, str] = DEFAULT_COLMAP.copy()
-
 idle_min = st.sidebar.number_input(
     "Walk gap threshold min (seconds)",
-    min_value=5, max_value=900, value=60, step=5
+    min_value=5, max_value=900, value=DEFAULT_IDLE_MIN, step=5
 )
 idle_max = st.sidebar.number_input(
     "Walk gap threshold max (seconds, 0 = unlimited)",
@@ -442,19 +585,9 @@ idle_max = st.sidebar.number_input(
 )
 
 st.sidebar.header("Admin")
-if st.sidebar.button("🛠 Build/repair DB indexes"):
-    try:
-        ensure_indexes(eng)
-        st.sidebar.success("Index build/repair requested (non-blocking).")
-    except Exception as e:
-        st.sidebar.warning(f"Index maintenance skipped: {e}")
-
 if st.sidebar.button("🧹 Daily closeout (refresh & clear caches)"):
     ok_mv, mv_msg = refresh_materialized_views(eng)
-    if ok_mv:
-        st.sidebar.success(mv_msg)
-    else:
-        st.sidebar.warning(mv_msg)
+    st.sidebar.success(mv_msg if ok_mv else mv_msg)
     try:
         st.cache_data.clear()
         st.cache_resource.clear()
@@ -463,10 +596,17 @@ if st.sidebar.button("🧹 Daily closeout (refresh & clear caches)"):
     st.sidebar.info("Caches cleared — rerunning app...")
     st.rerun()
 
-# ===================================
-# DATA LOAD: UPLOAD OR DATABASE MODE
-# ===================================
+if st.sidebar.button("🛠 Build/repair DB indexes"):
+    try:
+        ensure_indexes(eng)
+        st.sidebar.success("Index build/repair requested.")
+    except Exception as e:
+        st.sidebar.warning(f"Index maintenance skipped: {e}")
+
+# ===================== LOAD HISTORY (needed early) =====================
 history = load_history_sql(colmap, eng)
+
+# =================================== DATA INPUT ===================================
 uploads = []
 if data_mode == "Upload files":
     st.sidebar.header("1) Upload")
@@ -480,12 +620,35 @@ if data_mode == "Upload files":
         st.stop()
 else:
     if history.empty:
-        st.warning("No records in database yet. Switch to 'Upload files' first.")
+        st.warning("No records in database yet. Switch to 'Upload files' to seed data.")
         st.stop()
 
-# ============================
-# PROCESS UPLOADS IF PROVIDED
-# ============================
+# Column mapping UI (only when we have an upload to inspect)
+if uploads:
+    # Peek first file to build mapping options
+    sample_df = load_upload(uploads[0])
+    sample_df = dedupe_columns(sample_df)
+    st.sidebar.header("2) Map columns")
+    # Start from defaults but allow override
+    for k, default in DEFAULT_COLMAP.items():
+        opts = list(sample_df.columns)
+        sel = st.sidebar.selectbox(
+            f"{k.capitalize()} column",
+            options=opts,
+            index=opts.index(default) if default in opts else 0,
+            key=f"map_{k}",
+            help="Pick the matching column from your export",
+        )
+        colmap[k] = sel
+
+    # Guard: no duplicated mappings
+    _selected = [v for v in colmap.values() if v]
+    _dups = sorted({c for c in _selected if _selected.count(c) > 1})
+    if _dups:
+        st.error("You mapped the same column to multiple fields: " + ", ".join(_dups))
+        st.stop()
+
+# ============================ PROCESS UPLOADS ============================
 if uploads:
     new_files = []
     for up in uploads:
@@ -495,7 +658,6 @@ if uploads:
             if cleaned.empty:
                 st.warning(f"{up.name}: no valid rows.")
                 continue
-            cleaned["pk"] = build_pk(cleaned, colmap)
             new_files.append(cleaned)
         except Exception as e:
             st.error(f"Failed to read {up.name}: {e}")
@@ -505,6 +667,8 @@ if uploads:
         st.stop()
 
     new_ev = pd.concat(new_files, ignore_index=True)
+    # Build pk for upload rows (needed for UPSERT)
+    new_ev["pk"] = build_pk(new_ev, colmap)
     new_ev = new_ev.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
 
     # Merge with DB history
@@ -512,13 +676,13 @@ if uploads:
     ev_all = pd.concat([f for f in frames if not f.empty], ignore_index=True)
     ev_all = ev_all.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
 
-    # ---- Upload summary ----
+    # Upload summary
     new_pks = set(new_ev["pk"])
     old_pks = set(history["pk"]) if not history.empty and "pk" in history.columns else set()
     num_new = len(new_pks - old_pks)
     num_dup = len(new_pks & old_pks)
     earliest = pd.to_datetime(ev_all[colmap["datetime"]].min())
-    latest = pd.to_datetime(ev_all[colmap["datetime"]].max())
+    latest   = pd.to_datetime(ev_all[colmap["datetime"]].max())
 
     with st.expander("📥 Upload summary", expanded=True):
         st.write(f"**Rows in this upload:** {len(new_ev):,}")
@@ -526,9 +690,8 @@ if uploads:
         st.write(f"- Already existed (upserts): **{num_dup:,}**")
         st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
 
-    # Save to DB
     ok, msg = save_history_sql(ev_all, colmap, eng)
-    st.sidebar.success(msg if ok else msg)
+    (st.sidebar.success if ok else st.sidebar.error)(msg)
 else:
     ev_all = history.copy()
 
@@ -536,9 +699,7 @@ if ev_all.empty:
     st.warning("No events available yet. Upload files or verify your DB.")
     st.stop()
 
-# ===================
-# TIME + BASIC FILTERS (BEFORE ANALYTICS)
-# ===================
+# =================== TIME RANGE FILTER ===================
 _min = pd.to_datetime(ev_all[colmap["datetime"]].min())
 _max = pd.to_datetime(ev_all[colmap["datetime"]].max())
 min_ts = _min.to_pydatetime()
@@ -546,9 +707,7 @@ max_ts = _max.to_pydatetime() if _max > _min else (min_ts + timedelta(minutes=1)
 
 rng = st.sidebar.slider(
     "Time range",
-    min_value=min_ts,
-    max_value=max_ts,
-    value=(min_ts, max_ts),
+    min_value=min_ts, max_value=max_ts, value=(min_ts, max_ts),
     format="YYYY-MM-DD HH:mm"
 )
 
@@ -560,25 +719,7 @@ if ev_time.empty:
     st.warning("No events in selected time range.")
     st.stop()
 
-# Side filters applied BEFORE analytics so sequences are consistent
-pick_devices = st.sidebar.multiselect("Devices", safe_unique(ev_time, colmap["device"]))
-pick_users   = st.sidebar.multiselect("Users", safe_unique(ev_time, colmap["user"]))
-pick_types   = st.sidebar.multiselect("Transaction types", safe_unique(ev_time, colmap["type"]))
-
-if pick_devices:
-    ev_time = ev_time[ev_time[colmap["device"]].isin(pick_devices)]
-if pick_users:
-    ev_time = ev_time[ev_time[colmap["user"]].isin(pick_users)]
-if pick_types:
-    ev_time = ev_time[ev_time[colmap["type"]].isin(pick_types)]
-
-if ev_time.empty:
-    st.warning("No events after applying device/user/type filters.")
-    st.stop()
-
-# ====================================
-# ANALYTICS
-# ====================================
+# =================== ANALYTICS ===================
 data, device_stats, tech_stats, run_stats, hourly, visit = build_delivery_analytics(
     ev_time, colmap, idle_min=idle_min, idle_max=idle_max
 )
@@ -589,9 +730,31 @@ data["walk_gap_hms"] = data["__walk_gap_s"].map(fmt_hms)
 data["dwell_hms"]    = data["__dwell_s"].map(fmt_hms)
 data["visit_hms"]    = data["visit_duration_s"].map(fmt_hms)
 
-st.success(f"Loaded {len(data):,} events for analysis.")
+# =================== FILTERS (post-analytics) ===================
+pick_devices = st.sidebar.multiselect("Devices", safe_unique(ev_time, colmap["device"]))
+pick_users   = st.sidebar.multiselect("Users", safe_unique(ev_time, colmap["user"]))
+pick_types   = st.sidebar.multiselect("Transaction types", safe_unique(ev_time, colmap["type"]))
 
-# Tabs
+mask = pd.Series(True, index=data.index)
+if pick_devices:
+    mask &= data[colmap["device"]].isin(pick_devices)
+if pick_users:
+    mask &= data[colmap["user"]].isin(pick_users)
+if pick_types:
+    mask &= data[colmap["type"]].isin(pick_types)
+
+data_f   = data.loc[mask].copy()
+visit_f  = visit[visit[colmap["user"]].isin(data_f[colmap["user"]].unique())]
+hourly_f = hourly
+device_stats_f = (data_f.groupby(colmap["device"]).size().rename("events").reset_index()
+                     .sort_values("events", ascending=False))
+tech_stats_f   = (data_f.groupby(colmap["user"]).size().rename("events").reset_index()
+                     .sort_values("events", ascending=False))
+run_stats_f    = run_stats[run_stats[colmap["user"]].isin(data_f[colmap["user"]].unique())]
+
+st.success(f"Loaded {len(data_f):,} events for analysis.")
+
+# =================== TABS ===================
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
     ["📈 Overview", "🚶 Delivery Analytics", "🧑‍🔧 Tech Comparison",
      "📦 Devices", "⏱ Hourly", "🧪 Drill-down", "🔟 Weekly Top 10",
@@ -601,10 +764,10 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
 with tab1:
     st.subheader("Overview")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Events", f"{len(ev_time):,}")
+    c1.metric("Events",  f"{len(ev_time):,}")
     c2.metric("Devices", f"{ev_time[colmap['device']].nunique():,}")
-    c3.metric("Users", f"{ev_time[colmap['user']].nunique():,}")
-    c4.metric("Types", f"{ev_time[colmap['type']].nunique():,}")
+    c3.metric("Users",   f"{ev_time[colmap['user']].nunique():,}")
+    c4.metric("Types",   f"{ev_time[colmap['type']].nunique():,}")
 
     week_df = weekly_summary(ev_time, colmap)
     if not week_df.empty:
@@ -615,13 +778,13 @@ with tab2:
     st.subheader("Delivery Analytics (per-tech sequences)")
     c1, c2 = st.columns(2)
 
-    hg = data["__walk_gap_s"].dropna()
+    hg = data_f["__walk_gap_s"].dropna()
     if not hg.empty:
         fig = px.histogram(hg, nbins=40, title="Walking/Travel gaps (seconds)")
         c1.plotly_chart(fig, use_container_width=True)
-        c1.caption("X-axis = seconds between finishing a device and starting the next (≥ threshold & device changed).")
+        c1.caption("X-axis = seconds between finishing a device and starting the next (≥ min & ≤ max; device changed).")
 
-    dw = data.loc[~data["__device_change"], "__gap_s"].dropna()
+    dw = data_f.loc[~data_f["__device_change"], "__gap_s"].dropna()
     if not dw.empty:
         fig2 = px.histogram(dw, nbins=40, title="Same-device dwell gaps (seconds)")
         c2.plotly_chart(fig2, use_container_width=True)
@@ -630,23 +793,26 @@ with tab2:
 
 with tab3:
     st.subheader("Tech comparison")
-    st.dataframe(tech_stats, use_container_width=True)
+    st.dataframe(tech_stats_f, use_container_width=True)
     if not tech_stats.empty:
-        fig = px.bar(tech_stats, x=colmap["user"], y="median_walk_gap_s", title="Median walk gap by tech (s)")
+        # If you want a bar of median walk, recompute from data_f:
+        med_walk = data_f.groupby(colmap["user"], observed=True)["__walk_gap_s"].median().reset_index()
+        med_walk = med_walk.rename(columns={"__walk_gap_s":"median_walk_gap_s"}).fillna(0)
+        fig = px.bar(med_walk, x=colmap["user"], y="median_walk_gap_s", title="Median walk gap by tech (s)")
         st.plotly_chart(fig, use_container_width=True)
 
 with tab4:
     st.subheader("Devices")
-    st.dataframe(device_stats, use_container_width=True)
-    if not device_stats.empty:
-        fig = px.bar(device_stats.head(25), x=colmap["device"], y="events", title="Top devices by event volume")
+    st.dataframe(device_stats_f, use_container_width=True)
+    if not device_stats_f.empty:
+        fig = px.bar(device_stats_f.head(25), x=colmap["device"], y="events", title="Top devices by event volume")
         st.plotly_chart(fig, use_container_width=True)
 
 with tab5:
     st.subheader("Hourly cadence")
-    st.dataframe(hourly, use_container_width=True)
-    if not hourly.empty:
-        fig = px.line(hourly, x="hour", y="events", markers=True, title="Events by hour")
+    st.dataframe(hourly_f, use_container_width=True)
+    if not hourly_f.empty:
+        fig = px.line(hourly_f, x="hour", y="events", markers=True, title="Events by hour")
         st.plotly_chart(fig, use_container_width=True)
 
 with tab6:
@@ -657,15 +823,13 @@ with tab6:
         "__gap_s", "__walk_gap_s", "__dwell_s", "visit_duration_s",
         "__device_change",
     ]
-    if colmap.get("desc") and colmap["desc"] in data.columns:
-        show_cols.insert(4, colmap["desc"])
-    if colmap.get("qty") and colmap["qty"] in data.columns:
-        show_cols.insert(5, colmap["qty"])
-    if colmap.get("medid") and colmap["medid"] in data.columns:
-        show_cols.insert(6, colmap["medid"])
-    show_cols = [c for c in show_cols if c in data.columns]
+    for opt in ["desc","qty","medid"]:
+        c = colmap.get(opt)
+        if c and c in data_f.columns:
+            show_cols.insert(4, c)  # keep details near the left
+    show_cols = [c for c in show_cols if c in data_f.columns]
 
-    table = data[show_cols].copy()
+    table = data_f[show_cols].copy()
     st.dataframe(table, use_container_width=True, height=520)
 
     st.download_button(
@@ -676,10 +840,9 @@ with tab6:
     )
 
     st.markdown("### Per-visit summary (continuous time at a device)")
-    ts  = colmap["datetime"]; dev = colmap["device"]; usr = colmap["user"]
-    visit_show = visit[[usr, dev, "start", "end", "visit_duration_s"]].copy()
+    ts, dev, usr = colmap["datetime"], colmap["device"], colmap["user"]
+    visit_show = visit_f[[usr, dev, "start", "end", "visit_duration_s"]].copy()
     visit_show["visit_hms"] = visit_show["visit_duration_s"].map(fmt_hms)
-
     st.dataframe(
         visit_show[[usr, dev, "start", "end", "visit_hms", "visit_duration_s"]],
         use_container_width=True,
@@ -688,7 +851,7 @@ with tab6:
 
 with tab7:
     st.subheader("Weekly Top 10 (signals)")
-    digest = anomalies_top10(ev_all, data, colmap)  # use the full history frame
+    digest = anomalies_top10(ev_all, data_f, colmap)
     if digest.empty:
         st.info("No notable anomalies in the last 7 days window.")
     else:
@@ -696,8 +859,8 @@ with tab7:
 
 with tab8:
     st.subheader("Outliers")
-    ow = outliers_iqr(data.dropna(subset=["__walk_gap_s"]), colmap["user"], "__walk_gap_s", "Walk gap")
-    od = outliers_iqr(data.dropna(subset=["__dwell_s"]),    colmap["device"], "__dwell_s",    "Dwell")
+    ow = outliers_iqr(data_f.dropna(subset=["__walk_gap_s"]), colmap["user"], "__walk_gap_s", "Walk gap")
+    od = outliers_iqr(data_f.dropna(subset=["__dwell_s"]),    colmap["device"], "__dwell_s",    "Dwell")
     c1, c2 = st.columns(2)
     c1.write("By user (walk gap):")
     c1.dataframe(ow, use_container_width=True, height=320)
@@ -708,7 +871,7 @@ with tab9:
     st.subheader("Ask the data ❓")
     q = st.text_input("Try e.g. 'top devices', 'longest dwell devices', 'median walk gap for Melissa', 'busiest hour'")
     if q:
-        ans, tbl = qa_answer(q, ev_time, data, colmap)
+        ans, tbl = qa_answer(q, ev_time, data_f, colmap)
         st.write(ans)
         if not tbl.empty:
             st.dataframe(tbl, use_container_width=True)
