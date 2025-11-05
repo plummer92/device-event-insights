@@ -22,6 +22,8 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from sqlalchemy import create_engine, text
+import matplotlib.pyplot as plt  # needed for pandas Styler gradients
+
 
 # ----------------------------- CONFIG ---------------------------------
 st.set_page_config(
