@@ -449,7 +449,6 @@ def _classify_direction(evt_type: str) -> str:
     if "LOAD" in t or "RESTOCK" in t or "ADD" in t: return "load"
     if any(x in t for x in ["UNLOAD", "REMOVE", "PULL", "RETURN", "WASTE"]): return "unload"
     return "other"
-
 def _build_load_unload_base(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
     dt = colmap["datetime"]
     med = colmap.get("desc") or colmap.get("medid") or "MedID"
@@ -459,15 +458,18 @@ def _build_load_unload_base(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.Data
 
     cols = [c for c in [dt, med, typ, dev, qty] if c and c in df.columns]
     g = df[cols].copy()
+
     g[dt] = pd.to_datetime(g[dt], errors="coerce")
+    g["ts"] = g[dt]  # keep original timestamp for extremes
     g["dir"] = g[typ].map(_classify_direction)
     g = g[g["dir"].isin(["load","unload"])]
 
     if qty and qty in g.columns:
-        base_qty = pd.to_numeric(g[qty], errors="coerce").fillna(1).astype(float)
-        g["qty_signed"] = base_qty.where(g["dir"].eq("load"), -base_qty)
+        g["orig_qty"] = pd.to_numeric(g[qty], errors="coerce").fillna(1).astype(float)
+        g["qty_signed"] = g["orig_qty"].where(g["dir"].eq("load"), -g["orig_qty"])
         g["events"] = 1
     else:
+        g["orig_qty"] = 1.0
         g["qty_signed"] = g["dir"].map({"load": 1.0, "unload": -1.0})
         g["events"] = 1
 
@@ -527,6 +529,65 @@ def _heatmap_by_hour_weekday(g: pd.DataFrame):
     p["weekday"] = pd.Categorical(p["weekday"], categories=order, ordered=True)
     mat = p.pivot(index="weekday", columns="hour", values="qty_signed").reindex(order)
     return px.imshow(mat, aspect="auto", title="Avg Signed Qty by Hour × Weekday (loads=+, unloads=−)")
+def _by_device(g: pd.DataFrame) -> pd.DataFrame:
+    base = (g.groupby(["device","dir"]).agg(events=("events","sum"), qty=("qty_signed","sum")).reset_index())
+    pv = (base.pivot_table(index="device", columns="dir", values="qty", aggfunc="sum", fill_value=0)
+               .reset_index().rename_axis(None, axis=1))
+    for c in ("load","unload"):
+        if c not in pv: pv[c] = 0.0
+    pv["net"] = pv["load"] + pv["unload"]
+    evt = (base.pivot_table(index="device", columns="dir", values="events", aggfunc="sum", fill_value=0)
+                 .reset_index().rename_axis(None, axis=1))
+    for c in ("load","unload"):
+        if c not in evt: evt[c] = 0
+    evt = evt.rename(columns={"load":"load_events","unload":"unload_events"})
+    return pv.merge(evt, on="device", how="left").sort_values("net", ascending=False)
+
+def _med_device_breakdown(g: pd.DataFrame, med: str) -> pd.DataFrame:
+    sub = g[g["med"] == med]
+    if sub.empty:
+        return pd.DataFrame(columns=["device","load","unload","net","load_events","unload_events"])
+    return _by_device(sub)
+
+def _extremes_by_group(g: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    if "orig_qty" not in g.columns:
+        g = g.copy(); g["orig_qty"] = 1.0
+    loads   = g[g["dir"] == "load"].copy()
+    unloads = g[g["dir"] == "unload"].copy()
+
+    def _agg_ext(df, sign: str):
+        if df.empty:
+            cols = group_cols + [f"{sign}_qty_max", f"{sign}_ts_at_max", f"{sign}_device_at_max",
+                                 f"{sign}_qty_min", f"{sign}_ts_at_min", f"{sign}_device_at_min"]
+            return pd.DataFrame(columns=cols)
+        df["orig_qty"] = pd.to_numeric(df["orig_qty"], errors="coerce").fillna(1.0)
+        grp = df.groupby(group_cols, as_index=False)
+        idx_max = grp["orig_qty"].idxmax()
+        idx_min = grp["orig_qty"].idxmin()
+        r_max = df.loc[idx_max, group_cols + ["orig_qty","ts","device"]].rename(
+            columns={"orig_qty":f"{sign}_qty_max","ts":f"{sign}_ts_at_max","device":f"{sign}_device_at_max"})
+        r_min = df.loc[idx_min, group_cols + ["orig_qty","ts","device"]].rename(
+            columns={"orig_qty":f"{sign}_qty_min","ts":f"{sign}_ts_at_min","device":f"{sign}_device_at_min"})
+        return pd.merge(r_max, r_min, on=group_cols, how="outer")
+
+    a = _agg_ext(loads, "load"); b = _agg_ext(unloads, "unload")
+    if a.empty and b.empty:
+        cols = group_cols + ["load_qty_max","load_ts_at_max","load_device_at_max",
+                             "load_qty_min","load_ts_at_min","load_device_at_min",
+                             "unload_qty_max","unload_ts_at_max","unload_device_at_max",
+                             "unload_qty_min","unload_ts_at_min","unload_device_at_min"]
+        return pd.DataFrame(columns=cols)
+    return pd.merge(a, b, on=group_cols, how="outer")
+
+def _time_of_day_profile(g: pd.DataFrame) -> pd.DataFrame:
+    prof = (g.groupby(["hour","dir"])["qty_signed"].mean().reset_index())
+    pv = (prof.pivot_table(index="hour", columns="dir", values="qty_signed", aggfunc="mean", fill_value=0)
+               .reset_index().rename_axis(None, axis=1))
+    for c in ("load","unload"):
+        if c not in pv: pv[c] = 0.0
+    pv["net"] = pv["load"] + pv["unload"]
+    return pv.sort_values("hour")
+
 
 def _flag_outliers(daily_pivot: pd.DataFrame) -> pd.DataFrame:
     if daily_pivot.empty:
