@@ -496,19 +496,39 @@ def _agg_daily(g: pd.DataFrame) -> pd.DataFrame:
     return pivot
 
 def _top_movers(daily_pivot: pd.DataFrame, window: int = 14) -> pd.DataFrame:
-    if daily_pivot.empty:
-        return pd.DataFrame(columns=["med","net_cur","net_prev","delta","pct"])
+    if daily_pivot is None or daily_pivot.empty:
+        return pd.DataFrame(columns=["med", "net_cur", "net_prev", "delta", "pct"])
+
     m = daily_pivot.copy()
-    m["date"] = pd.to_datetime(m["date"])
+    m["date"] = pd.to_datetime(m["date"], errors="coerce")
+    m = m.dropna(subset=["date"])
+    if m.empty:
+        return pd.DataFrame(columns=["med", "net_cur", "net_prev", "delta", "pct"])
+
+    # Ensure numeric nets
+    for col in ("net", "load", "unload"):
+        if col in m.columns:
+            m[col] = pd.to_numeric(m[col], errors="coerce").fillna(0.0)
+
     last_date = m["date"].max()
-    cur_start = last_date - pd.Timedelta(days=window-1)
+    cur_start = last_date - pd.Timedelta(days=window - 1)
     prev_start = cur_start - pd.Timedelta(days=window)
-    prev_end   = cur_start - pd.Timedelta(days=1)
-    cur  = m[(m["date"]>=cur_start)&(m["date"]<=last_date)].groupby("med")["net"].sum()
-    prev = m[(m["date"]>=prev_start)&(m["date"]<=prev_end)].groupby("med")["net"].sum()
-    out = (cur.fillna(0).to_frame("net_cur").join(prev.fillna(0).to_frame("net_prev"), how="outer").fillna(0))
+    prev_end = cur_start - pd.Timedelta(days=1)
+
+    cur = m[(m["date"] >= cur_start) & (m["date"] <= last_date)].groupby("med")["net"].sum()
+    prev = m[(m["date"] >= prev_start) & (m["date"] <= prev_end)].groupby("med")["net"].sum()
+
+    out = (
+        cur.fillna(0.0).to_frame("net_cur")
+        .join(prev.fillna(0.0).to_frame("net_prev"), how="outer")
+        .fillna(0.0)
+        .astype({"net_cur": "float64", "net_prev": "float64"})
+    )
     out["delta"] = out["net_cur"] - out["net_prev"]
-    out["pct"] = (out["delta"] / out["net_prev"].replace(0, pd.NA)).astype(float)
+
+    # Safe percentage: np.where avoids object dtypes; division-by-zero → np.nan
+    out["pct"] = np.where(out["net_prev"] != 0.0, out["delta"] / out["net_prev"], np.nan).astype("float64")
+
     return out.sort_values("delta", ascending=False).reset_index()
 
 def _plot_overall_timeseries(daily_pivot: pd.DataFrame, med_filter=None):
