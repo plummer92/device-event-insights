@@ -999,18 +999,20 @@ def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[boo
             INSERT INTO events (pk, dt, device, "user", "type", "desc", qty, medid)
             VALUES (:pk, :dt, :device, :user, :type, :desc, :qty, :medid)
             ON CONFLICT (pk) DO UPDATE SET
-                dt=EXCLUDED.dt,
-                device=EXCLUDED.device,
-                "user"=EXCLUDED."user",
-                "type"=EXCLUDED."type",
-                "desc"=EXCLUDED."desc",
-                qty=EXCLUDED.qty,
-                medid=EXCLUDED.medid;
+                dt     = EXCLUDED.dt,
+                device = EXCLUDED.device,
+                "user" = EXCLUDED."user",
+                "type" = EXCLUDED."type",
+                "desc" = EXCLUDED."desc",
+                qty    = EXCLUDED.qty,
+                medid  = EXCLUDED.medid;
         """)
 
-        CHUNK = 5000
+        CHUNK = 1000  # smaller batch
         total = 0
         with eng.begin() as con:
+            con.execute(text("SET LOCAL statement_timeout = '120s'"))
+            con.execute(text("SET LOCAL synchronous_commit = OFF"))
             for i in range(0, len(rows), CHUNK):
                 batch = rows[i:i+CHUNK]
                 con.execute(upsert_sql, batch)
@@ -1018,6 +1020,7 @@ def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[boo
         return True, f"Saved to Postgres: {total:,} rows (upserted by pk)."
     except Exception as e:
         return False, f"DB save error: {e}"
+
 
 def load_history_sql(colmap: Dict[str, str], eng) -> pd.DataFrame:
     """Load canonical table and alias columns back to current mapping."""
@@ -1185,17 +1188,23 @@ if uploads:
         st.write(f"- Already existed (upserts): **{num_dup:,}**")
         st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
 
-   # Save only new rows (huge speedup; avoids hammering indexes)
-to_save = new_ev
-if not history.empty and "pk" in history.columns:
-    old_pks = set(history["pk"])
-    to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
+# --- SAVE (uploads only) ---
+if uploads:
+    # Save only new rows (huge speedup; avoids hammering indexes)
+    if history.empty or "pk" not in history.columns:
+        to_save = new_ev
+    else:
+        old_pks = set(history["pk"])
+        to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
 
-if to_save.empty:
-    st.sidebar.info("No new rows to save.")
+    if to_save.empty:
+        st.sidebar.info("No new rows to save.")
+    else:
+        ok, msg = save_history_sql(to_save, colmap, eng)
+        (st.sidebar.success if ok else st.sidebar.error)(msg)
 else:
-    ok, msg = save_history_sql(to_save, colmap, eng)
-    (st.sidebar.success if ok else st.sidebar.error)(msg)
+    # Database-only mode; nothing to write
+    pass
 
 # =================== TIME RANGE FILTER ===================
 _min = pd.to_datetime(ev_all[colmap["datetime"]].min())
