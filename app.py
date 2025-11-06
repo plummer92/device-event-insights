@@ -1190,18 +1190,12 @@ to_save = new_ev
 if not history.empty and "pk" in history.columns:
     old_pks = set(history["pk"])
     to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
+
 if to_save.empty:
     st.sidebar.info("No new rows to save.")
 else:
     ok, msg = save_history_sql(to_save, colmap, eng)
     (st.sidebar.success if ok else st.sidebar.error)(msg)
-
-else:
-    ev_all = history.copy()
-
-if ev_all.empty:
-    st.warning("No events available yet. Upload files or verify your DB.")
-    st.stop()
 
 # =================== TIME RANGE FILTER ===================
 _min = pd.to_datetime(ev_all[colmap["datetime"]].min())
