@@ -1209,19 +1209,19 @@ else:
 # =================== TIME RANGE FILTER ===================
 # ============================ MERGE & SAVE ============================
 if uploads:
-    # new_ev was built above from uploaded files
-    # Merge with history for analysis & summary
+    # new_ev was already created above from uploaded files
     frames = []
     if isinstance(history, pd.DataFrame) and not history.empty:
         frames.append(history)
     frames.append(new_ev)
+
     ev_all = (
         pd.concat(frames, ignore_index=True)
           .drop_duplicates(subset=["pk"])
           .sort_values(colmap["datetime"])
     )
 
-    # Upload summary (based on ev_all + new_ev vs history)
+    # Upload summary
     new_pks = set(new_ev["pk"])
     old_pks = set(history["pk"]) if (isinstance(history, pd.DataFrame) and "pk" in history.columns) else set()
     num_new = len(new_pks - old_pks)
@@ -1236,11 +1236,7 @@ if uploads:
         st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
 
     # --- SAVE (uploads only): write only the delta ---
-    if not old_pks:
-        to_save = new_ev
-    else:
-        to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
-
+    to_save = new_ev if not old_pks else new_ev[~new_ev["pk"].isin(old_pks)].copy()
     if to_save.empty:
         st.sidebar.info("No new rows to save.")
     else:
@@ -1248,13 +1244,35 @@ if uploads:
         (st.sidebar.success if ok else st.sidebar.error)(msg)
 
 else:
-    # Database-only mode; just analyze the current DB contents
+    # Database-only mode; analyze what’s already in Postgres
     ev_all = history.copy()
 
-# Guard: if for any reason ev_all is still missing/empty
+# Guard: stop early if nothing to analyze
 if not isinstance(ev_all, pd.DataFrame) or ev_all.empty:
     st.warning("No events available yet. Upload files or verify your DB.")
     st.stop()
+
+# =================== TIME RANGE FILTER ===================
+_min = pd.to_datetime(ev_all[colmap["datetime"]].min())
+_max = pd.to_datetime(ev_all[colmap["datetime"]].max())
+min_ts = _min.to_pydatetime()
+max_ts = _max.to_pydatetime() if _max > _min else (min_ts + timedelta(minutes=1))
+
+rng = st.sidebar.slider(
+    "Time range",
+    min_value=min_ts, max_value=max_ts, value=(min_ts, max_ts),
+    format="YYYY-MM-DD HH:mm"
+)
+
+ev_time = ev_all[
+    (ev_all[colmap["datetime"]] >= pd.to_datetime(rng[0])) &
+    (ev_all[colmap["datetime"]] <= pd.to_datetime(rng[1]))
+].copy()
+
+if ev_time.empty:
+    st.warning("No events in selected time range.")
+    st.stop()
+
 
 
 # =================== ANALYTICS ===================
