@@ -1207,24 +1207,55 @@ else:
     pass
 
 # =================== TIME RANGE FILTER ===================
-_min = pd.to_datetime(ev_all[colmap["datetime"]].min())
-_max = pd.to_datetime(ev_all[colmap["datetime"]].max())
-min_ts = _min.to_pydatetime()
-max_ts = _max.to_pydatetime() if _max > _min else (min_ts + timedelta(minutes=1))
+# ============================ MERGE & SAVE ============================
+if uploads:
+    # new_ev was built above from uploaded files
+    # Merge with history for analysis & summary
+    frames = []
+    if isinstance(history, pd.DataFrame) and not history.empty:
+        frames.append(history)
+    frames.append(new_ev)
+    ev_all = (
+        pd.concat(frames, ignore_index=True)
+          .drop_duplicates(subset=["pk"])
+          .sort_values(colmap["datetime"])
+    )
 
-rng = st.sidebar.slider(
-    "Time range",
-    min_value=min_ts, max_value=max_ts, value=(min_ts, max_ts),
-    format="YYYY-MM-DD HH:mm"
-)
+    # Upload summary (based on ev_all + new_ev vs history)
+    new_pks = set(new_ev["pk"])
+    old_pks = set(history["pk"]) if (isinstance(history, pd.DataFrame) and "pk" in history.columns) else set()
+    num_new = len(new_pks - old_pks)
+    num_dup = len(new_pks & old_pks)
+    earliest = pd.to_datetime(ev_all[colmap["datetime"]].min())
+    latest   = pd.to_datetime(ev_all[colmap["datetime"]].max())
 
-ev_time = ev_all[
-    (ev_all[colmap["datetime"]] >= pd.to_datetime(rng[0])) &
-    (ev_all[colmap["datetime"]] <= pd.to_datetime(rng[1]))
-].copy()
-if ev_time.empty:
-    st.warning("No events in selected time range.")
+    with st.expander("📥 Upload summary", expanded=True):
+        st.write(f"**Rows in this upload:** {len(new_ev):,}")
+        st.write(f"- New rows vs DB: **{num_new:,}**")
+        st.write(f"- Already existed (upserts): **{num_dup:,}**")
+        st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
+
+    # --- SAVE (uploads only): write only the delta ---
+    if not old_pks:
+        to_save = new_ev
+    else:
+        to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
+
+    if to_save.empty:
+        st.sidebar.info("No new rows to save.")
+    else:
+        ok, msg = save_history_sql(to_save, colmap, eng)
+        (st.sidebar.success if ok else st.sidebar.error)(msg)
+
+else:
+    # Database-only mode; just analyze the current DB contents
+    ev_all = history.copy()
+
+# Guard: if for any reason ev_all is still missing/empty
+if not isinstance(ev_all, pd.DataFrame) or ev_all.empty:
+    st.warning("No events available yet. Upload files or verify your DB.")
     st.stop()
+
 
 # =================== ANALYTICS ===================
 data, device_stats, tech_stats, run_stats, hourly, visit = build_delivery_analytics(
