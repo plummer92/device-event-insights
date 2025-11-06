@@ -1186,11 +1186,10 @@ if uploads:
         st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
 
    # Save only new rows (huge speedup; avoids hammering indexes)
-    to_save = new_ev
+to_save = new_ev
 if not history.empty and "pk" in history.columns:
     old_pks = set(history["pk"])
     to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
-
 if to_save.empty:
     st.sidebar.info("No new rows to save.")
 else:
