@@ -1185,8 +1185,18 @@ if uploads:
         st.write(f"- Already existed (upserts): **{num_dup:,}**")
         st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
 
-    ok, msg = save_history_sql(ev_all, colmap, eng)
+   # Save only new rows (huge speedup; avoids hammering indexes)
+    to_save = new_ev
+if not history.empty and "pk" in history.columns:
+    old_pks = set(history["pk"])
+    to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
+
+if to_save.empty:
+    st.sidebar.info("No new rows to save.")
+else:
+    ok, msg = save_history_sql(to_save, colmap, eng)
     (st.sidebar.success if ok else st.sidebar.error)(msg)
+
 else:
     ev_all = history.copy()
 
