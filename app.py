@@ -148,6 +148,29 @@ def _non_empty_frames(frames: List[pd.DataFrame]) -> List[pd.DataFrame]:
                 out.append(df)
     return out
 
+def _fmt_int(x):
+    try:
+        return f"{int(round(float(x))):,}"
+    except Exception:
+        return "0"
+
+def _plain_english_summary(g: pd.DataFrame) -> str:
+    """Short, readable narrative for non-data folks."""
+    if g.empty:
+        return "No load/unload activity in the selected range."
+    loads = g.loc[g["dir"].eq("load"), "orig_qty"].sum()
+    unlds = g.loc[g["dir"].eq("unload"), "orig_qty"].sum()
+    net = loads - unlds
+    # top device by net
+    by_dev = (g.groupby(["device","dir"])["orig_qty"].sum().unstack(fill_value=0))
+    by_dev["net"] = by_dev.get("load",0) - by_dev.get("unload",0)
+    top_dev = by_dev["net"].sort_values(ascending=False).head(1)
+    dev_str = f" Top device: {top_dev.index[0]} (net {_fmt_int(top_dev.iloc[0])})." if not top_dev.empty else ""
+    direction = "up" if net >= 0 else "down"
+    return (f"In this period we loaded {_fmt_int(loads)} and unloaded {_fmt_int(unlds)} "
+            f"(net {direction} {_fmt_int(abs(net))})." + dev_str)
+
+
 # ------------------ CORE ANALYTICS (robust, observed=True) ---------------------
 def build_delivery_analytics(
     ev: pd.DataFrame,
@@ -625,54 +648,150 @@ def build_load_unload_section(df: pd.DataFrame, colmap: Dict[str,str]):
     if df is None or df.empty:
         st.info("No events in current filter.")
         return
+
+    # Base + daily
     try:
-        g = _build_load_unload_base(df, colmap)
-        daily = _agg_daily(g)
+        g = _build_load_unload_base(df, colmap)   # includes ts, device, med, dir, orig_qty, qty_signed, hour, weekday
+        daily = _agg_daily(g)                     # per-day rollups
     except Exception as e:
         st.error(f"Could not build load/unload views: {e}")
         return
 
-    meds = sorted(daily["med"].unique().tolist())
+    # Filters
+    meds_all = sorted(daily["med"].unique().tolist())
+    devs_all = sorted(g["device"].dropna().unique().tolist())
+
+    st.markdown("#### Simple view (for everyone)")
+    ctop1, ctop2, ctop3, ctop4 = st.columns(4)
+    # Totals for KPIs (use orig_qty so it's in units when qty exists; else = events)
+    tot_load  = g.loc[g["dir"].eq("load"),   "orig_qty"].sum()
+    tot_unld  = g.loc[g["dir"].eq("unload"), "orig_qty"].sum()
+    tot_net   = tot_load - tot_unld
+    n_devices = g["device"].nunique()
+
+    ctop1.metric("Loaded (units)",   _fmt_int(tot_load))
+    ctop2.metric("Unloaded (units)", _fmt_int(tot_unld))
+    ctop3.metric("Net",              _fmt_int(tot_net), delta=None)
+    ctop4.metric("Devices active",   _fmt_int(n_devices))
+
+    st.caption(_plain_english_summary(g))
+
+    # Controls for friendly view
     c1, c2, c3 = st.columns([2,2,1])
     with c1:
-        med_pick = st.multiselect("Meds", meds, default=meds[:10] if meds else [])
+        pick_meds = st.multiselect("Focus meds (optional)", meds_all, default=[])
     with c2:
-        dmin, dmax = pd.to_datetime(daily["date"].min()), pd.to_datetime(daily["date"].max())
-        dr = st.date_input("Date range", value=(dmin, dmax), min_value=dmin, max_value=dmax)
+        pick_devs = st.multiselect("Focus devices (optional)", devs_all, default=[])
     with c3:
-        window = st.selectbox("Mover window (days)", [7,14,30], index=1)
+        window = st.selectbox("Compare window (days)", [7,14,30], index=1)
 
-    dview = daily.copy()
-    if med_pick:
-        dview = dview[dview["med"].isin(med_pick)]
-    if isinstance(dr, (list, tuple)) and len(dr) == 2:
-        dview = dview[(pd.to_datetime(dview["date"]) >= pd.to_datetime(dr[0])) &
-                      (pd.to_datetime(dview["date"]) <= pd.to_datetime(dr[1]))]
+    g_view = g.copy()
+    if pick_meds:
+        g_view = g_view[g_view["med"].isin(pick_meds)]
+        daily_view = daily[daily["med"].isin(pick_meds)]
+    else:
+        daily_view = daily.copy()
+    if pick_devs:
+        g_view = g_view[g_view["device"].isin(pick_devs)]
 
-    st.plotly_chart(_plot_overall_timeseries(dview, med_pick), use_container_width=True)
+    # Tabs: By Device | By Med @ Device | Timeline | Advanced
+    t1, t2, t3, t4 = st.tabs(["📦 By Device", "🧪 By Med @ Device", "📈 Timeline", "⚙️ Advanced"])
 
-    st.markdown("### Top Movers (Net change vs prior window)")
-    st.dataframe(_top_movers(dview, window=window).head(25), use_container_width=True)
+    # --- BY DEVICE ---
+    with t1:
+        st.markdown("##### Loads vs Unloads by Device")
+        # qty by device & dir
+        by_dev_qty = (g_view.groupby(["device","dir"])["orig_qty"].sum().reset_index())
+        if by_dev_qty.empty:
+            st.info("No device activity for the current filters.")
+        else:
+            # Stacked bar (top 20 devices by |net|)
+            net_dev = (by_dev_qty.pivot_table(index="device", columns="dir", values="orig_qty", aggfunc="sum", fill_value=0)
+                                  .reset_index())
+            for c in ("load","unload"):
+                if c not in net_dev: net_dev[c] = 0.0
+            net_dev["net"] = net_dev["load"] - net_dev["unload"]
+            top = (net_dev.reindex(net_dev["net"].abs().sort_values(ascending=False).index)
+                          .head(20))
+            fig = px.bar(top, x="device", y=["load","unload"], title="Top devices (loads vs unloads, units)")
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("### Outlier Days (|z| ≥ 2.5 on net)")
-    st.dataframe(_flag_outliers(dview), use_container_width=True)
+            # Friendly table
+            show = top[["device","load","unload","net"]].copy()
+            show = show.sort_values("net", ascending=False)
+            try:
+                st.write(show.style.format({"load":"{:.0f}","unload":"{:.0f}","net":"{:+.0f}"}))
+            except Exception:
+                st.dataframe(show, use_container_width=True)
 
-    st.markdown("### When do pulls spike?")
-    subset = g[g["med"].isin(med_pick)] if med_pick else g
-    st.plotly_chart(_heatmap_by_hour_weekday(subset), use_container_width=True)
+    # --- BY MED @ DEVICE (matrix) ---
+    with t2:
+        st.markdown("##### Which meds moved on which devices")
+        # limit to top devices to keep the matrix readable
+        dev_priority = (g_view.groupby("device")["orig_qty"].sum()
+                              .sort_values(ascending=False).head(12).index.tolist())
+        sub = g_view[g_view["device"].isin(dev_priority)]
+        mat = (sub.groupby(["device","med","dir"])["orig_qty"].sum().reset_index())
+        if mat.empty:
+            st.info("No movement for the selected filters.")
+        else:
+            # Pivot to net units per (device, med)
+            mat_p = (mat.pivot_table(index=["device","med"], columns="dir", values="orig_qty", aggfunc="sum", fill_value=0)
+                        .reset_index())
+            for c in ("load","unload"):
+                if c not in mat_p: mat_p[c] = 0.0
+            mat_p["net"] = mat_p["load"] - mat_p["unload"]
+            # Show as a tidy table (device grouped)
+            st.dataframe(mat_p.sort_values(["device","net"], ascending=[True, False]),
+                         use_container_width=True, height=420)
 
-    st.markdown("### Per-Med drilldown")
-    if meds:
-        med_drill = st.selectbox("Select a med", meds, index=0)
-        st.plotly_chart(_plot_med_timeseries(dview, med_drill), use_container_width=True)
+    # --- TIMELINE (friendly) ---
+    with t3:
+        st.markdown("##### Trend over time")
+        dview = daily_view.copy()
+        if dview.empty:
+            st.info("No daily activity with the current filters.")
+        else:
+            fig = _plot_overall_timeseries(dview, med_filter=pick_meds or None)
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("### Daily table (net, 7/30-day rolls)")
-    tbl = (dview[["date","med","load","unload","net","roll7","roll30"]]
-           .sort_values(["date","med"], ascending=[False, True]))
-    styled = (tbl.style
-              .background_gradient(subset=["net"], cmap="RdYlGn")
-              .format({"load":"{:.0f}","unload":"{:.0f}","net":"{:.0f}","roll7":"{:.0f}","roll30":"{:.0f}"}))
-    st.write(styled)
+            st.markdown("###### Movers (easy reading)")
+            tm = _top_movers(dview, window=window).head(15)
+            if tm.empty:
+                st.info("No movers in this compare window.")
+            else:
+                # human-friendly formatting
+                tm_disp = tm.copy()
+                for c in ("net_cur","net_prev","delta"):
+                    if c in tm_disp.columns:
+                        tm_disp[c] = tm_disp[c].map(_fmt_int)
+                if "pct" in tm_disp.columns:
+                    tm_disp["pct"] = tm["pct"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "")
+                st.dataframe(tm_disp, use_container_width=True)
+
+    # --- ADVANCED (keep your original power tools) ---
+    with t4:
+        st.markdown("##### Outliers & Heatmap (advanced)")
+        st.markdown("Outlier Days (|z| ≥ 2.5 on net)")
+        outs = _flag_outliers(daily_view)
+        st.dataframe(outs, use_container_width=True, height=240)
+        st.markdown("When do pulls spike? (hour × weekday)")
+        st.plotly_chart(_heatmap_by_hour_weekday(g_view), use_container_width=True)
+
+        st.markdown("##### Extremes")
+        # per-med extremes in plain table
+        ext_med = _extremes_by_group(g_view, group_cols=["med"])
+        keep_cols = [c for c in ["med",
+                                 "load_qty_max","load_ts_at_max","load_device_at_max",
+                                 "unload_qty_max","unload_ts_at_max","unload_device_at_max"] if c in ext_med.columns]
+        if keep_cols:
+            st.dataframe(ext_med[keep_cols].sort_values("load_qty_max", ascending=False).head(30),
+                         use_container_width=True, height=260)
+
+        # Per-Med timeseries drilldown
+        if meds_all:
+            med_ts = st.selectbox("Per-Med timeseries", meds_all, index=0, key="med_ts_simple")
+            st.plotly_chart(_plot_med_timeseries(daily_view, med_ts), use_container_width=True)
 
 # ==== Load/Unload Insights END ====
 
