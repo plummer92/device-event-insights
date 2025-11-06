@@ -583,6 +583,7 @@ def _by_device(g: pd.DataFrame) -> pd.DataFrame:
     pv = (base.pivot_table(index="device", columns="dir", values="qty", aggfunc="sum", fill_value=0)
                .reset_index().rename_axis(None, axis=1))
     for c in ("load","unload"):
+
         if c not in pv: pv[c] = 0.0
     pv["net"] = pv["load"] + pv["unload"]
     evt = (base.pivot_table(index="device", columns="dir", values="events", aggfunc="sum", fill_value=0)
@@ -598,16 +599,22 @@ def _med_device_breakdown(g: pd.DataFrame, med: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["device","load","unload","net","load_events","unload_events"])
     return _by_device(sub)
 
-def _extremes_by_group(g: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+def _extremes_by_group(g: pd.DataFrame, group_cols) -> pd.DataFrame:
     """
     For each group (e.g., ["med"] or ["med","device"]), return:
       - load_qty_max / load_ts_at_max / load_device_at_max
       - load_qty_min / load_ts_at_min / load_device_at_min
       - unload_qty_max / unload_ts_at_max / unload_device_at_max
       - unload_qty_min / unload_ts_at_min / unload_device_at_min
-
-    Robust to empty groups, missing qty, mixed dtypes. Avoids idxmax/idxmin.
     """
+
+    # --- normalize group cols ---
+    if isinstance(group_cols, str):
+        group_cols = [group_cols]
+    else:
+        group_cols = list(group_cols)
+
+    # --- empty / missing guards ---
     if g is None or g.empty:
         cols = group_cols + [
             "load_qty_max","load_ts_at_max","load_device_at_max",
@@ -618,15 +625,60 @@ def _extremes_by_group(g: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
 
     df = g.copy()
-
-    # Ensure required columns exist
     for c in group_cols + ["orig_qty","ts","device","dir"]:
         if c not in df.columns:
             df[c] = pd.NA
-
-    # Normalize qty & timestamp dtypes
     df["orig_qty"] = pd.to_numeric(df["orig_qty"], errors="coerce").fillna(1.0)
     df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+
+    def _pick_ext_sign(df_all: pd.DataFrame, sign: str) -> pd.DataFrame:
+        sub = df_all[df_all["dir"].eq(sign)]
+        if sub.empty:
+            cols = group_cols + [
+                f"{sign}_qty_max", f"{sign}_ts_at_max", f"{sign}_device_at_max",
+                f"{sign}_qty_min", f"{sign}_ts_at_min", f"{sign}_device_at_min",
+            ]
+            return pd.DataFrame(columns=cols)
+        # largest qty per group
+        max_rows = (
+            sub.sort_values(["orig_qty","ts"], ascending=[False, True])
+               .groupby(group_cols, as_index=False, sort=False)
+               .head(1)[group_cols + ["orig_qty","ts","device"]]
+               .rename(columns={
+                   "orig_qty": f"{sign}_qty_max",
+                   "ts": f"{sign}_ts_at_max",
+                   "device": f"{sign}_device_at_max"
+               })
+        )
+        # smallest qty per group
+        min_rows = (
+            sub.sort_values(["orig_qty","ts"], ascending=[True, True])
+               .groupby(group_cols, as_index=False, sort=False)
+               .head(1)[group_cols + ["orig_qty","ts","device"]]
+               .rename(columns={
+                   "orig_qty": f"{sign}_qty_min",
+                   "ts": f"{sign}_ts_at_min",
+                   "device": f"{sign}_device_at_min"
+               })
+        )
+        return pd.merge(max_rows, min_rows, on=group_cols, how="outer")
+
+    loads   = _pick_ext_sign(df, "load")
+    unloads = _pick_ext_sign(df, "unload")
+
+    out = pd.merge(loads, unloads, on=group_cols, how="outer")
+
+    desired = group_cols + [
+        "load_qty_max","load_ts_at_max","load_device_at_max",
+        "load_qty_min","load_ts_at_min","load_device_at_min",
+        "unload_qty_max","unload_ts_at_max","unload_device_at_max",
+        "unload_qty_min","unload_ts_at_min","unload_device_at_min",
+    ]
+    for c in desired:
+        if c not in out.columns:
+            out[c] = pd.NA
+    return out[desired]
+
 
     def _pick_ext(df_sub: pd.DataFrame, sign: str) -> pd.DataFrame:
         sub = df_sub[df_sub["dir"].eq(sign)]
