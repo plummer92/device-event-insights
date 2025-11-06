@@ -66,11 +66,15 @@ def parse_datetime_series(s: pd.Series) -> pd.Series:
     return out
 
 def load_upload(up) -> pd.DataFrame:
-    """Robust reader for CSV/XLSX uploads."""
     name = up.name.lower()
     if name.endswith(".xlsx"):
         return pd.read_excel(up)
-    # CSV: try utf-8 then latin-1
+    try:
+        up.seek(0)
+        return pd.read_csv(up, low_memory=False)
+    except UnicodeDecodeError:
+        up.seek(0)
+        return pd.read_csv(up, encoding="latin-1", low_memory=False)
     try:
         up.seek(0)
         return pd.read_csv(up)
@@ -595,10 +599,86 @@ def _med_device_breakdown(g: pd.DataFrame, med: str) -> pd.DataFrame:
     return _by_device(sub)
 
 def _extremes_by_group(g: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
-    if "orig_qty" not in g.columns:
-        g = g.copy(); g["orig_qty"] = 1.0
-    loads   = g[g["dir"] == "load"].copy()
-    unloads = g[g["dir"] == "unload"].copy()
+    """
+    For each group (e.g., ["med"] or ["med","device"]), return:
+      - load_qty_max / load_ts_at_max / load_device_at_max
+      - load_qty_min / load_ts_at_min / load_device_at_min
+      - unload_qty_max / unload_ts_at_max / unload_device_at_max
+      - unload_qty_min / unload_ts_at_min / unload_device_at_min
+
+    Robust to empty groups, missing qty, mixed dtypes. Avoids idxmax/idxmin.
+    """
+    if g is None or g.empty:
+        cols = group_cols + [
+            "load_qty_max","load_ts_at_max","load_device_at_max",
+            "load_qty_min","load_ts_at_min","load_device_at_min",
+            "unload_qty_max","unload_ts_at_max","unload_device_at_max",
+            "unload_qty_min","unload_ts_at_min","unload_device_at_min",
+        ]
+        return pd.DataFrame(columns=cols)
+
+    df = g.copy()
+
+    # Ensure required columns exist
+    for c in group_cols + ["orig_qty","ts","device","dir"]:
+        if c not in df.columns:
+            df[c] = pd.NA
+
+    # Normalize qty & timestamp dtypes
+    df["orig_qty"] = pd.to_numeric(df["orig_qty"], errors="coerce").fillna(1.0)
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+
+    def _pick_ext(df_sub: pd.DataFrame, sign: str) -> pd.DataFrame:
+        sub = df_sub[df_sub["dir"].eq(sign)]
+        if sub.empty:
+            cols = group_cols + [
+                f"{sign}_qty_max", f"{sign}_ts_at_max", f"{sign}_device_at_max",
+                f"{sign}_qty_min", f"{sign}_ts_at_min", f"{sign}_device_at_min",
+            ]
+            return pd.DataFrame(columns=cols)
+
+        # Max rows (largest qty)
+        max_rows = (
+            sub.sort_values(["orig_qty","ts"], ascending=[False, True])
+               .groupby(group_cols, as_index=False, sort=False)
+               .head(1)[group_cols + ["orig_qty","ts","device"]]
+               .rename(columns={
+                   "orig_qty": f"{sign}_qty_max",
+                   "ts": f"{sign}_ts_at_max",
+                   "device": f"{sign}_device_at_max"
+               })
+        )
+        # Min rows (smallest qty)
+        min_rows = (
+            sub.sort_values(["orig_qty","ts"], ascending=[True, True])
+               .groupby(group_cols, as_index=False, sort=False)
+               .head(1)[group_cols + ["orig_qty","ts","device"]]
+               .rename(columns={
+                   "orig_qty": f"{sign}_qty_min",
+                   "ts": f"{sign}_ts_at_min",
+                   "device": f"{sign}_device_at_min"
+               })
+        )
+        return pd.merge(max_rows, min_rows, on=group_cols, how="outer")
+
+    loads   = _pick_ext(df, "load")
+    unloads = _pick_ext(df, "unload")
+
+    # Outer-join the two sides; keep group columns even if one side is empty
+    out = pd.merge(loads, unloads, on=group_cols, how="outer")
+
+    # Consistent column order
+    desired = group_cols + [
+        "load_qty_max","load_ts_at_max","load_device_at_max",
+        "load_qty_min","load_ts_at_min","load_device_at_min",
+        "unload_qty_max","unload_ts_at_max","unload_device_at_max",
+        "unload_qty_min","unload_ts_at_min","unload_device_at_min",
+    ]
+    for c in desired:
+        if c not in out.columns:
+            out[c] = pd.NA
+    return out[desired]
+
 
     def _agg_ext(df, sign: str):
         if df.empty:
