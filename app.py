@@ -1167,21 +1167,33 @@ def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
     return len(rows)
 
 def ensure_indexes(eng, timeout_sec: int = 15):
-    """Create/repair indexes concurrently; skip if busy."""
+    """Create/repair indexes concurrently; uses AUTOCOMMIT because CONCURRENTLY forbids a txn."""
     stmts = [
+        # events table
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_dt     ON events (dt)',
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_device ON events (device)',
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_user   ON events ("user")',
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_type   ON events ("type")',
-        -- pends
-        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pends_ts       ON pyxis_pends (ts)',
-        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pends_dev_med  ON pyxis_pends (device, med_id, ts DESC)'
+        # pends
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pends_ts      ON pyxis_pends (ts)',
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pends_dev_med ON pyxis_pends (device, med_id, ts DESC)',
     ]
-    with eng.begin() as con:
-        con.execute(text(f"SET LOCAL lock_timeout = '{timeout_sec}s'"))
+
+    # Use AUTOCOMMIT so CONCURRENTLY is allowed
+    with eng.connect().execution_options(isolation_level="AUTOCOMMIT") as con:
+        try:
+            con.execute(text(f"SET lock_timeout = '{timeout_sec}s'"))
+            con.execute(text(f"SET statement_timeout = '{max(timeout_sec*2, 30)}s'"))
+        except Exception:
+            # If SET fails, continue anyway; CREATE INDEX may still succeed.
+            pass
+
         for s in stmts:
-            try: con.execute(text(s))
-            except Exception: pass
+            try:
+                con.execute(text(s))
+            except Exception:
+                # Ignore "duplicate" or "relation busy" errors—safe to skip
+                pass
 
 # ------------------------------------------------------------------------------------
 
