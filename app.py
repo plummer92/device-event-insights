@@ -1011,26 +1011,26 @@ def init_db(eng):
         qty    DOUBLE PRECISION,
         medid  TEXT
     );
+
     -- New: pended loads table
     CREATE TABLE IF NOT EXISTS pyxis_pends (
-        ts                  TIMESTAMP WITHOUT TIME ZONE NOT NULL,
-        device              TEXT        NOT NULL,
-        med_id              TEXT        NOT NULL,
-        drawer              TEXT,
-        pocket              TEXT,
-        qty                 INTEGER,
-        affected_element    TEXT,
-        dispensing_name     TEXT,
-        area                TEXT,
-        username            TEXT,
-        userid              TEXT,
-        CONSTRAINT pyxis_pends_pk PRIMARY KEY (
-            ts, device, med_id, COALESCE(drawer,''), COALESCE(pocket,'')
-        )
+        ts               TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+        device           TEXT NOT NULL,
+        med_id           TEXT NOT NULL,
+        drawer           TEXT NOT NULL DEFAULT '',
+        pocket           TEXT NOT NULL DEFAULT '',
+        qty              INTEGER,
+        affected_element TEXT,
+        dispensing_name  TEXT,
+        area             TEXT,
+        username         TEXT,
+        userid           TEXT,
+        CONSTRAINT pyxis_pends_pk PRIMARY KEY (ts, device, med_id, drawer, pocket)
     );
     """
     with eng.begin() as con:
         con.execute(text(ddl))
+
 
 
 def ensure_indexes(eng, timeout_sec: int = 15):
@@ -1138,13 +1138,22 @@ def load_history_sql(colmap: Dict[str, str], eng) -> pd.DataFrame:
         return pd.DataFrame()
 
 def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
-    """UPSERT pended rows into pyxis_pends."""
     if df_pends is None or df_pends.empty:
         return 0
-    rows = df_pends.rename(columns={
+
+    # normalize blanks so NOT NULL is satisfied
+    df = df_pends.copy()
+    for c in ("drawer","pocket"):
+        if c in df.columns:
+            df[c] = df[c].fillna("").astype(str)
+        else:
+            df[c] = ""
+
+    rows = df.rename(columns={
         "DispensingDeviceName":"dispensing_name",
         "Area":"area"
     }).to_dict(orient="records")
+
     sql = text("""
         INSERT INTO pyxis_pends
         (ts, device, med_id, drawer, pocket, qty, affected_element,
@@ -1152,7 +1161,7 @@ def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
         VALUES
         (:ts, :device, :med_id, :drawer, :pocket, :qty, :AffectedElement,
          :dispensing_name, :area, :username, :userid)
-        ON CONFLICT (ts, device, med_id, COALESCE(drawer, ''), COALESCE(pocket, ''))
+        ON CONFLICT (ts, device, med_id, drawer, pocket)
         DO UPDATE SET
           qty = EXCLUDED.qty,
           affected_element = EXCLUDED.affected_element,
@@ -1161,10 +1170,12 @@ def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
           username         = EXCLUDED.username,
           userid           = EXCLUDED.userid;
     """)
+
     with eng.begin() as con:
         con.execute(text("SET LOCAL statement_timeout = '120s'"))
         con.execute(sql, rows)
     return len(rows)
+
 
 def ensure_indexes(eng, timeout_sec: int = 15):
     """Create/repair indexes concurrently; uses AUTOCOMMIT because CONCURRENTLY forbids a txn."""
