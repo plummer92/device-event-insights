@@ -174,7 +174,72 @@ def _plain_english_summary(g: pd.DataFrame) -> str:
     return (f"In this period we loaded {_fmt_int(loads)} and unloaded {_fmt_int(unlds)} "
             f"(net {direction} {_fmt_int(abs(net))})." + dev_str)
 
+# ---- PENDED LOADS (Pyxis DeviceActivityLog-style files) -----------------------
+PEND_ACTIVITY_MATCH = r"Standard\s*Stock"   # ActivityType contains this
+PEND_ACTION_MATCH   = r"Add"                # Action contains this
 
+def _parse_pend_affected(s: str):
+    """
+    Parse strings like:
+      'SJS11E_MAIN Drw 2.1-Pkt E1 (LORAZ2IV1): 1'
+       -> med_id='LORAZ2IV1', drawer='2.1', pocket='E1', qty=1
+    Robust to 'Dr', 'Drw', 'Drawer' and 'Pkt'/'Pocket'.
+    """
+    s = s if isinstance(s, str) else str(s)
+    med_m = re.search(r"\(([^)]+)\)", s)
+    med_id = med_m.group(1).strip() if med_m else None
+    drw_m = re.search(r"(?:Drw|Drawer|Dr)\s*([A-Za-z0-9\.]+)", s, flags=re.I)
+    drawer = drw_m.group(1) if drw_m else None
+    pkt_m = re.search(r"(?:Pkt|Pocket)\s*([A-Za-z0-9\.]+)", s, flags=re.I)
+    pocket = pkt_m.group(1) if pkt_m else None
+    qty_m = re.search(r":\s*(-?\d+)\s*$", s)
+    qty = int(qty_m.group(1)) if qty_m else None
+    return med_id, drawer, pocket, qty
+
+def build_pyxis_pends_from_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given a DeviceActivityLog-style dataframe with columns:
+      ['Device','ActivityType','Action','AffectedElement','TransactionDateTime','UserName','UserID',
+       optional: 'DispensingDeviceName','Area']
+    return tidy pended-load rows with parsed fields.
+    """
+    needed = {"Device","ActivityType","Action","AffectedElement","TransactionDateTime"}
+    if not needed.issubset(set(df.columns)):
+        return pd.DataFrame(columns=[
+            "ts","device","med_id","drawer","pocket","qty",
+            "AffectedElement","DispensingDeviceName","Area","username","userid"
+        ])
+
+    mask = (
+        df["ActivityType"].astype(str).str.contains(PEND_ACTIVITY_MATCH, case=False, na=False)
+        & df["Action"].astype(str).str.contains(PEND_ACTION_MATCH, case=False, na=False)
+    )
+    sub = df.loc[mask].copy()
+    if sub.empty:
+        return pd.DataFrame(columns=[
+            "ts","device","med_id","drawer","pocket","qty",
+            "AffectedElement","DispensingDeviceName","Area","username","userid"
+        ])
+
+    parsed = sub["AffectedElement"].apply(_parse_pend_affected)
+    sub[["med_id","drawer","pocket","qty"]] = pd.DataFrame(parsed.tolist(), index=sub.index)
+
+    sub["ts"]       = pd.to_datetime(sub["TransactionDateTime"], errors="coerce")
+    sub["device"]   = sub["Device"].astype(str).str.strip()
+    sub["username"] = sub.get("UserName", pd.Series(index=sub.index)).astype(str).str.strip()
+    sub["userid"]   = sub.get("UserID", pd.Series(index=sub.index)).astype(str).str.strip()
+
+    # Optional columns present in your CSV
+    if "DispensingDeviceName" not in sub: sub["DispensingDeviceName"] = pd.NA
+    if "Area" not in sub:                  sub["Area"] = pd.NA
+
+    # Canonical order + drop unparseable timestamps/devices/med_id
+    out = sub[[
+        "ts","device","med_id","drawer","pocket","qty",
+        "AffectedElement","DispensingDeviceName","Area","username","userid"
+    ]].dropna(subset=["ts","device","med_id"]).reset_index(drop=True)
+
+    return out
 # ------------------ CORE ANALYTICS (robust, observed=True) ---------------------
 def build_delivery_analytics(
     ev: pd.DataFrame,
@@ -946,9 +1011,27 @@ def init_db(eng):
         qty    DOUBLE PRECISION,
         medid  TEXT
     );
+    -- New: pended loads table
+    CREATE TABLE IF NOT EXISTS pyxis_pends (
+        ts                  TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+        device              TEXT        NOT NULL,
+        med_id              TEXT        NOT NULL,
+        drawer              TEXT,
+        pocket              TEXT,
+        qty                 INTEGER,
+        affected_element    TEXT,
+        dispensing_name     TEXT,
+        area                TEXT,
+        username            TEXT,
+        userid              TEXT,
+        CONSTRAINT pyxis_pends_pk PRIMARY KEY (
+            ts, device, med_id, COALESCE(drawer,''), COALESCE(pocket,'')
+        )
+    );
     """
     with eng.begin() as con:
         con.execute(text(ddl))
+
 
 def ensure_indexes(eng, timeout_sec: int = 15):
     """Create/repair indexes concurrently; skip if busy."""
@@ -1053,6 +1136,52 @@ def load_history_sql(colmap: Dict[str, str], eng) -> pd.DataFrame:
         return out
     except Exception:
         return pd.DataFrame()
+
+def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
+    """UPSERT pended rows into pyxis_pends."""
+    if df_pends is None or df_pends.empty:
+        return 0
+    rows = df_pends.rename(columns={
+        "DispensingDeviceName":"dispensing_name",
+        "Area":"area"
+    }).to_dict(orient="records")
+    sql = text("""
+        INSERT INTO pyxis_pends
+        (ts, device, med_id, drawer, pocket, qty, affected_element,
+         dispensing_name, area, username, userid)
+        VALUES
+        (:ts, :device, :med_id, :drawer, :pocket, :qty, :AffectedElement,
+         :dispensing_name, :area, :username, :userid)
+        ON CONFLICT (ts, device, med_id, COALESCE(drawer, ''), COALESCE(pocket, ''))
+        DO UPDATE SET
+          qty = EXCLUDED.qty,
+          affected_element = EXCLUDED.affected_element,
+          dispensing_name  = EXCLUDED.dispensing_name,
+          area             = EXCLUDED.area,
+          username         = EXCLUDED.username,
+          userid           = EXCLUDED.userid;
+    """)
+    with eng.begin() as con:
+        con.execute(text("SET LOCAL statement_timeout = '120s'"))
+        con.execute(sql, rows)
+    return len(rows)
+
+def ensure_indexes(eng, timeout_sec: int = 15):
+    """Create/repair indexes concurrently; skip if busy."""
+    stmts = [
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_dt     ON events (dt)',
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_device ON events (device)',
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_user   ON events ("user")',
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_type   ON events ("type")',
+        -- pends
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pends_ts       ON pyxis_pends (ts)',
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pends_dev_med  ON pyxis_pends (device, med_id, ts DESC)'
+    ]
+    with eng.begin() as con:
+        con.execute(text(f"SET LOCAL lock_timeout = '{timeout_sec}s'"))
+        for s in stmts:
+            try: con.execute(text(s))
+            except Exception: pass
 
 # ------------------------------------------------------------------------------------
 
@@ -1310,12 +1439,13 @@ run_stats_f    = run_stats[run_stats[colmap["user"]].isin(data_f[colmap["user"]]
 
 st.success(f"Loaded {len(data_f):,} events for analysis.")
 
-# =================== TABS ===================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(
     ["📈 Overview", "🚶 Delivery Analytics", "🧑‍🔧 Tech Comparison",
      "📦 Devices", "⏱ Hourly", "🧪 Drill-down", "🔟 Weekly Top 10",
-     "🚨 Outliers", "❓ Ask the data", "📥 Load/Unload"]
+     "🚨 Outliers", "❓ Ask the data", "📥 Load/Unload", "🧷 Pended Loads"]
 )
+
 
 
 with tab1:
@@ -1435,4 +1565,67 @@ with tab9:
 with tab10:
     st.subheader("Load / Unload Insights")
     build_load_unload_section(ev_time, colmap)
+
+with tab11:
+    st.subheader("Pended Loads (DeviceActivityLog-style)")
+
+    # We try to detect pends from whatever is in ev_time first (if columns exist),
+    # otherwise, allow a separate upload just for the DeviceActivityLog file.
+    can_parse_from_current = {"Device","ActivityType","Action","AffectedElement","TransactionDateTime"}.issubset(ev_time.columns)
+
+    pend_source = st.radio(
+        "Choose data source for pends",
+        ["Use current data (if compatible)", "Upload DeviceActivityLog"],
+        index=0 if can_parse_from_current else 1,
+        help="Pends require columns: Device, ActivityType, Action, AffectedElement, TransactionDateTime."
+    )
+
+    if pend_source == "Use current data (if compatible)":
+        if not can_parse_from_current:
+            st.warning("Current data frame does not have the required columns for pends. Please upload.")
+            df_pends = pd.DataFrame()
+        else:
+            df_pends = build_pyxis_pends_from_df(ev_time)
+    else:
+        up_pends = st.file_uploader(
+            "Upload DeviceActivityLog CSV (Pyxis Admin Extract)",
+            type=["csv"], accept_multiple_files=False, key="pend_csv_upl")
+        df_pends = pd.DataFrame()
+        if up_pends is not None:
+            try:
+                tmp = load_upload(up_pends)  # reuse your robust loader
+            except Exception:
+                up_pends.seek(0)
+                tmp = pd.read_csv(up_pends, encoding="latin-1", low_memory=False)
+            tmp = dedupe_columns(tmp)
+            df_pends = build_pyxis_pends_from_df(tmp)
+
+    if df_pends.empty:
+        st.info("No pended rows detected for the chosen source.")
+    else:
+        st.caption(f"Found {len(df_pends):,} pended rows.")
+        st.dataframe(
+            df_pends.head(200)[["ts","device","med_id","drawer","pocket","qty","username"]],
+            use_container_width=True, height=420
+        )
+
+        c1, c2 = st.columns([1,1])
+        with c1:
+            if st.button("Upsert pends to Postgres", type="primary"):
+                try:
+                    # Ensure tables exist
+                    init_db(eng)
+                    n = upsert_pyxis_pends(eng, df_pends)
+                    st.success(f"Saved pends: {n:,} rows (upserted by PK).")
+                except Exception as e:
+                    st.error(f"Failed to save pended rows: {e}")
+
+        with c2:
+            st.download_button(
+                "Download parsed pends (CSV)",
+                data=df_pends.to_csv(index=False).encode("utf-8"),
+                file_name="pyxis_pends_parsed.csv",
+                mime="text/csv"
+            )
+
 
