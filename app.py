@@ -196,6 +196,73 @@ def _parse_pend_affected(s: str):
     qty = int(qty_m.group(1)) if qty_m else None
     return med_id, drawer, pocket, qty
 
+# ActivityType text fragments as observed in your file
+MIN_ACTIVITY_MATCH = r"Refill\s*Point\s*Min\s*Quantity"
+MAX_ACTIVITY_MATCH = r"(?:Par|Physical)\s*Max\s*Quantity"
+
+def _parse_slot_affected(s: str):
+    """
+    Same parsing as pends: extract med_id, drawer, pocket, and the trailing ': value'
+    """
+    s = s if isinstance(s, str) else str(s)
+    med_m = re.search(r"\(([^)]+)\)", s)
+    med_id = med_m.group(1).strip() if med_m else None
+    drw_m = re.search(r"(?:Drw|Drawer|Dr)\s*([A-Za-z0-9\.]+)", s, flags=re.I)
+    drawer = drw_m.group(1) if drw_m else ""
+    pkt_m = re.search(r"(?:Pkt|Pocket)\s*([A-Za-z0-9\.]+)", s, flags=re.I)
+    pocket = pkt_m.group(1) if pkt_m else ""
+    val_m = re.search(r":\s*(-?\d+\.?\d*)\s*$", s)
+    value = float(val_m.group(1)) if val_m else None
+    return med_id, drawer, pocket, value
+
+def build_slot_config(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    From DeviceActivityLog-like df, build latest known qty_min/qty_max per
+    (device, med_id, drawer, pocket).
+    """
+    need = {"Device","ActivityType","Action","AffectedElement","TransactionDateTime"}
+    if not need.issubset(df.columns):
+        return pd.DataFrame(columns=["device","med_id","drawer","pocket","qty_min","qty_max","ts_updated"])
+
+    base = df.copy()
+    base["ts"] = pd.to_datetime(base["TransactionDateTime"], errors="coerce")
+
+    # MIN rows
+    is_min = base["ActivityType"].astype(str).str.contains(MIN_ACTIVITY_MATCH, case=False, na=False)
+    mins = base.loc[is_min].copy()
+    if not mins.empty:
+        parsed = mins["AffectedElement"].apply(_parse_slot_affected)
+        mins[["med_id","drawer","pocket","value"]] = pd.DataFrame(parsed.tolist(), index=mins.index)
+        mins["device"] = mins["Device"].astype(str).str.strip()
+        mins = (mins.dropna(subset=["ts","device","med_id"])
+                    .sort_values("ts")
+                    .groupby(["device","med_id","drawer","pocket"], as_index=False)
+                    .last()[["device","med_id","drawer","pocket","value","ts"]]
+                    .rename(columns={"value":"qty_min","ts":"ts_updated_min"}))
+    else:
+        mins = pd.DataFrame(columns=["device","med_id","drawer","pocket","qty_min","ts_updated_min"])
+
+    # MAX rows
+    is_max = base["ActivityType"].astype(str).str.contains(MAX_ACTIVITY_MATCH, case=False, na=False)
+    maxs = base.loc[is_max].copy()
+    if not maxs.empty:
+        parsed = maxs["AffectedElement"].apply(_parse_slot_affected)
+        maxs[["med_id","drawer","pocket","value"]] = pd.DataFrame(parsed.tolist(), index=maxs.index)
+        maxs["device"] = maxs["Device"].astype(str).str.strip()
+        maxs = (maxs.dropna(subset=["ts","device","med_id"])
+                    .sort_values("ts")
+                    .groupby(["device","med_id","drawer","pocket"], as_index=False)
+                    .last()[["device","med_id","drawer","pocket","value","ts"]]
+                    .rename(columns={"value":"qty_max","ts":"ts_updated_max"}))
+    else:
+        maxs = pd.DataFrame(columns=["device","med_id","drawer","pocket","qty_max","ts_updated_max"])
+
+    # Merge latest min & max
+    cfg = mins.merge(maxs, on=["device","med_id","drawer","pocket"], how="outer")
+    cfg["ts_updated"] = cfg[["ts_updated_min","ts_updated_max"]].max(axis=1)
+    return cfg[["device","med_id","drawer","pocket","qty_min","qty_max","ts_updated"]]
+
+
 def build_pyxis_pends_from_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Given a DeviceActivityLog-style dataframe with columns:
@@ -1012,7 +1079,6 @@ def init_db(eng):
         medid  TEXT
     );
 
-    -- New: pended loads table
     CREATE TABLE IF NOT EXISTS pyxis_pends (
         ts               TIMESTAMP WITHOUT TIME ZONE NOT NULL,
         device           TEXT NOT NULL,
@@ -1020,6 +1086,8 @@ def init_db(eng):
         drawer           TEXT NOT NULL DEFAULT '',
         pocket           TEXT NOT NULL DEFAULT '',
         qty              INTEGER,
+        qty_min          DOUBLE PRECISION,
+        qty_max          DOUBLE PRECISION,
         affected_element TEXT,
         dispensing_name  TEXT,
         area             TEXT,
@@ -1027,11 +1095,13 @@ def init_db(eng):
         userid           TEXT,
         CONSTRAINT pyxis_pends_pk PRIMARY KEY (ts, device, med_id, drawer, pocket)
     );
+
+    -- Backfill columns if table already existed without them
+    ALTER TABLE pyxis_pends ADD COLUMN IF NOT EXISTS qty_min DOUBLE PRECISION;
+    ALTER TABLE pyxis_pends ADD COLUMN IF NOT EXISTS qty_max DOUBLE PRECISION;
     """
     with eng.begin() as con:
         con.execute(text(ddl))
-
-
 
 def ensure_indexes(eng, timeout_sec: int = 15):
     """Create/repair indexes concurrently; skip if busy."""
@@ -1140,6 +1210,49 @@ def load_history_sql(colmap: Dict[str, str], eng) -> pd.DataFrame:
 def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
     if df_pends is None or df_pends.empty:
         return 0
+
+    df = df_pends.copy()
+    for c in ("drawer", "pocket"):
+        df[c] = df.get(c, "").fillna("").astype(str)
+
+    # Normalize columns
+    for c in ("min_qty", "max_qty", "qty"):
+        if c not in df.columns:
+            df[c] = np.nan
+    df["min_qty"] = pd.to_numeric(df["min_qty"], errors="coerce")
+    df["max_qty"] = pd.to_numeric(df["max_qty"], errors="coerce")
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
+
+    rows = df.rename(columns={
+        "DispensingDeviceName": "dispensing_name",
+        "Area": "area"
+    }).to_dict(orient="records")
+
+    sql = text("""
+        INSERT INTO pyxis_pends
+        (ts, device, med_id, drawer, pocket, qty, min_qty, max_qty,
+         affected_element, dispensing_name, area, username, userid)
+        VALUES
+        (:ts, :device, :med_id, :drawer, :pocket, :qty, :min_qty, :max_qty,
+         :AffectedElement, :dispensing_name, :area, :username, :userid)
+        ON CONFLICT (ts, device, med_id, drawer, pocket)
+        DO UPDATE SET
+          qty = EXCLUDED.qty,
+          min_qty = COALESCE(EXCLUDED.min_qty, pyxis_pends.min_qty),
+          max_qty = COALESCE(EXCLUDED.max_qty, pyxis_pends.max_qty),
+          affected_element = EXCLUDED.affected_element,
+          dispensing_name  = EXCLUDED.dispensing_name,
+          area             = EXCLUDED.area,
+          username         = EXCLUDED.username,
+          userid           = EXCLUDED.userid;
+    """)
+
+    with eng.begin() as con:
+        con.execute(text("SET LOCAL statement_timeout = '120s'"))
+        con.execute(sql, rows)
+
+    return len(rows)
+
 
     # normalize blanks so NOT NULL is satisfied
     df = df_pends.copy()
