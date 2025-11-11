@@ -1967,6 +1967,58 @@ with tab11:
     # -----------------------------
     cfg = build_slot_config(src_df) if src_df is not None else pd.DataFrame()
 
+# --- DIAGNOSTICS: why did some rows miss min/max? ---
+def _cfg_keys(cfg):
+    slot = set(zip(cfg.get("device_base", pd.Series(dtype=str)),
+                   cfg.get("med_id", pd.Series(dtype=str)),
+                   cfg.get("drawer", pd.Series(dtype=str)),
+                   cfg.get("pocket", pd.Series(dtype=str))))
+    dr   = set(zip(cfg.get("device_base", pd.Series(dtype=str)),
+                   cfg.get("med_id", pd.Series(dtype=str)),
+                   cfg.get("drawer", pd.Series(dtype=str)).map(_drawer_root)))
+    dm   = set(zip(cfg.get("device_base", pd.Series(dtype=str)),
+                   cfg.get("med_id", pd.Series(dtype=str))))
+    return slot, dr, dm
+
+def _why_missing(df_pends, cfg):
+    if df_pends.empty:
+        return pd.DataFrame()
+    slot, dr, dm = _cfg_keys(cfg)
+    rows = []
+    for _, r in df_pends.iterrows():
+        db  = str(r.get("device_base",""))
+        mid = str(r.get("med_id",""))
+        drw = _norm_slot_str(r.get("drawer",""))
+        pkt = _norm_slot_str(r.get("pocket",""))
+        root = _drawer_root(drw)
+        have_slot = (db, mid, drw, pkt) in slot
+        have_dr   = (db, mid, root) in dr
+        have_dm   = (db, mid) in dm
+        rows.append({
+            "ts": r.get("ts"),
+            "device": r.get("device"),
+            "device_base": db,
+            "med_id": mid,
+            "drawer": drw,
+            "pocket": pkt,
+            "drawer_root": root,
+            "slot_match": have_slot,
+            "drawer_root_match": have_dr,
+            "device_med_match": have_dm
+        })
+    out = pd.DataFrame(rows)
+    miss = out.loc[~out["slot_match"] & ~out["drawer_root_match"] & ~out["device_med_match"]]
+    return out, miss
+
+if not cfg.empty:
+    diag_all, diag_miss = _why_missing(df_pends, cfg)
+    with st.expander("🔎 Min/Max match diagnostics", expanded=False):
+        st.caption("What key level would have matched for each pend row?")
+        st.dataframe(diag_all.head(200), use_container_width=True, height=300)
+        if not diag_miss.empty:
+            st.warning(f"{len(diag_miss)} rows had no match at any level. Showing a few:")
+            st.dataframe(diag_miss.head(50), use_container_width=True, height=240)
+
     # -----------------------------
     # Cascade merge: slot → drawer_root → device+med
     # -----------------------------
