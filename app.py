@@ -329,8 +329,27 @@ def build_slot_config(df: pd.DataFrame) -> pd.DataFrame:
         maxs["med_id"]      = maxs["med_id"].map(_norm_med)
         maxs["drawer"]      = maxs["drawer"].map(_norm_slot_str)
         maxs["pocket"]      = maxs["pocket"].map(_norm_slot_str)
-        maxs["
+        maxs["drawer_root"] = maxs["drawer"].map(_drawer_root)
+        maxs = (maxs.dropna(subset=["ts","device_base","med_id"])
+                    .sort_values("ts")
+                    .groupby(["device_base","med_id","drawer","pocket"], as_index=False)
+                    .last()[["device_base","med_id","drawer","pocket","value","ts"]]
+                    .rename(columns={"value":"qty_max","ts":"ts_updated_max"}))
+    else:
+        maxs = pd.DataFrame(columns=["device_base","med_id","drawer","pocket","qty_max","ts_updated_max"])
 
+    # Merge + finalize
+    cfg = mins.merge(maxs, on=["device_base","med_id","drawer","pocket"], how="outer")
+    cfg["ts_updated"] = cfg[["ts_updated_min","ts_updated_max"]].max(axis=1)
+    cfg["device"]       = cfg["device_base"]
+    cfg["drawer_root"]  = cfg["drawer"].map(_drawer_root)
+
+    # Nullable Int64 (keeps NA)
+    for c in ("qty_min","qty_max"):
+        if c in cfg.columns:
+            cfg[c] = pd.to_numeric(cfg[c], errors="coerce").round().astype("Int64")
+
+    return cfg[["device_base","device","med_id","drawer","drawer_root","pocket","qty_min","qty_max","ts_updated"]]
 
 
     # --- parse "AffectedElement": SJS11W_TWR Dr 3-Pkt 1 (ENOXA100IV): 2
@@ -1438,20 +1457,16 @@ def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
     for c in ("drawer", "pocket"):
         df[c] = df.get(c, "").fillna("").astype(str)
 
-    # Ensure numeric
+     # Ensure numeric
     for c in ("min_qty", "max_qty", "qty"):
         if c not in df.columns:
             df[c] = np.nan
-    df["min_qty"] = pd.to_numeric(df["min_qty"], errors="coerce")
-    df["max_qty"] = pd.to_numeric(df["max_qty"], errors="coerce")
-    df["qty"]     = pd.to_numeric(df["qty"], errors="coerce")
 
     # Normalize numeric columns strictly to ints or None
     for c in ("qty", "min_qty", "max_qty"):
-        if c not in df.columns:
-            df[c] = np.nan
-    df[c] = pd.to_numeric(df[c], errors="coerce")
-    df[c] = df[c].apply(_safe_int)
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+        df[c] = df[c].apply(_safe_int)
+
 
     rows = (
         df.rename(columns={"DispensingDeviceName": "dispensing_name", "Area": "area"})
