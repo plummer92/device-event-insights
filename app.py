@@ -1972,12 +1972,16 @@ with tab11:
     # -----------------------------
     if not cfg.empty:
         # 1) Strict slot match
+        cfg_mm = cfg.rename(columns={"qty_min":"min_qty","qty_max":"max_qty"}) \
+           .drop(columns=["drawer_root"], errors="ignore")   # <— add this
+
         m = df_pends.merge(
-            cfg.rename(columns={"qty_min":"min_qty","qty_max":"max_qty"}),
-            on=["device_base","med_id","drawer","pocket"],
-            how="left",
-            validate="m:1"
+        cfg_mm,
+        on=["device_base","med_id","drawer","pocket"],
+        how="left",
+        validate="m:1"
         )
+
 
         # 2) Fill misses by (device_base, med_id, drawer_root)
         miss = m[["min_qty","max_qty"]].isna().all(axis=1)
