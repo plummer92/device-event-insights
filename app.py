@@ -23,6 +23,8 @@ import plotly.express as px
 import streamlit as st
 from sqlalchemy import create_engine, text
 import matplotlib.pyplot as plt  # needed for pandas Styler gradients
+from pandas.api.types import DatetimeTZDtype
+
 
 
 # ----------------------------- CONFIG ---------------------------------
@@ -61,7 +63,7 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
 def parse_datetime_series(s: pd.Series) -> pd.Series:
     """Parse to pandas datetime (UTC-naive)."""
     out = pd.to_datetime(s, errors="coerce", utc=True)
-    if pd.api.types.is_datetime64tz_dtype(out):
+    if isinstance(out.dtype, DatetimeTZDtype):
         out = out.dt.tz_convert("UTC").dt.tz_localize(None)
     return out
 
@@ -739,14 +741,11 @@ def _extremes_by_group(g: pd.DataFrame, group_cols) -> pd.DataFrame:
       - unload_qty_max / unload_ts_at_max / unload_device_at_max
       - unload_qty_min / unload_ts_at_min / unload_device_at_min
     """
-
-    # --- normalize group cols ---
     if isinstance(group_cols, str):
         group_cols = [group_cols]
     else:
         group_cols = list(group_cols)
 
-    # --- empty / missing guards ---
     if g is None or g.empty:
         cols = group_cols + [
             "load_qty_max","load_ts_at_max","load_device_at_max",
@@ -762,6 +761,53 @@ def _extremes_by_group(g: pd.DataFrame, group_cols) -> pd.DataFrame:
             df[c] = pd.NA
     df["orig_qty"] = pd.to_numeric(df["orig_qty"], errors="coerce").fillna(1.0)
     df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+
+    def _pick(df_all: pd.DataFrame, sign: str) -> pd.DataFrame:
+        sub = df_all[df_all["dir"].eq(sign)]
+        if sub.empty:
+            cols = group_cols + [
+                f"{sign}_qty_max", f"{sign}_ts_at_max", f"{sign}_device_at_max",
+                f"{sign}_qty_min", f"{sign}_ts_at_min", f"{sign}_device_at_min",
+            ]
+            return pd.DataFrame(columns=cols)
+
+        max_rows = (
+            sub.sort_values(["orig_qty","ts"], ascending=[False, True])
+               .groupby(group_cols, as_index=False, sort=False)
+               .head(1)[group_cols + ["orig_qty","ts","device"]]
+               .rename(columns={
+                   "orig_qty": f"{sign}_qty_max",
+                   "ts": f"{sign}_ts_at_max",
+                   "device": f"{sign}_device_at_max"
+               })
+        )
+        min_rows = (
+            sub.sort_values(["orig_qty","ts"], ascending=[True, True])
+               .groupby(group_cols, as_index=False, sort=False)
+               .head(1)[group_cols + ["orig_qty","ts","device"]]
+               .rename(columns={
+                   "orig_qty": f"{sign}_qty_min",
+                   "ts": f"{sign}_ts_at_min",
+                   "device": f"{sign}_device_at_min"
+               })
+        )
+        return pd.merge(max_rows, min_rows, on=group_cols, how="outer")
+
+    loads   = _pick(df, "load")
+    unloads = _pick(df, "unload")
+    out = pd.merge(loads, unloads, on=group_cols, how="outer")
+
+    desired = group_cols + [
+        "load_qty_max","load_ts_at_max","load_device_at_max",
+        "load_qty_min","load_ts_at_min","load_device_at_min",
+        "unload_qty_max","unload_ts_at_max","unload_device_at_max",
+        "unload_qty_min","unload_ts_at_min","unload_device_at_min",
+    ]
+    for c in desired:
+        if c not in out.columns:
+            out[c] = pd.NA
+    return out[desired]
+
 
     def _pick_ext_sign(df_all: pd.DataFrame, sign: str) -> pd.DataFrame:
         sub = df_all[df_all["dir"].eq(sign)]
@@ -1086,8 +1132,8 @@ def init_db(eng):
         drawer           TEXT NOT NULL DEFAULT '',
         pocket           TEXT NOT NULL DEFAULT '',
         qty              INTEGER,
-        qty_min          DOUBLE PRECISION,
-        qty_max          DOUBLE PRECISION,
+        min_qty          INTEGER,
+        max_qty          INTEGER,
         affected_element TEXT,
         dispensing_name  TEXT,
         area             TEXT,
@@ -1096,28 +1142,28 @@ def init_db(eng):
         CONSTRAINT pyxis_pends_pk PRIMARY KEY (ts, device, med_id, drawer, pocket)
     );
 
-    -- Backfill columns if table already existed without them
-    ALTER TABLE pyxis_pends ADD COLUMN IF NOT EXISTS qty_min DOUBLE PRECISION;
-    ALTER TABLE pyxis_pends ADD COLUMN IF NOT EXISTS qty_max DOUBLE PRECISION;
+    -- Refill thresholds/capacity, MED-FIRST with optional overrides
+    CREATE TABLE IF NOT EXISTS pyxis_thresholds (
+        med_id   TEXT NOT NULL,
+        device   TEXT NOT NULL DEFAULT '*',  -- '*' = applies to all devices
+        drawer   TEXT NOT NULL DEFAULT '',   -- ''  = any drawer
+        pocket   TEXT NOT NULL DEFAULT '',   -- ''  = any pocket
+        min_qty  INTEGER,
+        max_qty  INTEGER,
+        CONSTRAINT pyxis_thresholds_pk PRIMARY KEY (med_id, device, drawer, pocket)
+    );
     """
     with eng.begin() as con:
         con.execute(text(ddl))
 
-def ensure_indexes(eng, timeout_sec: int = 15):
-    """Create/repair indexes concurrently; skip if busy."""
-    stmts = [
-        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_dt     ON events (dt)',
-        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_device ON events (device)',
-        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_user   ON events ("user")',
-        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_type   ON events ("type")',
-    ]
+def ensure_pends_minmax_columns(eng):
+    """Backfill columns if table existed before we added min/max."""
+    alter = """
+    ALTER TABLE pyxis_pends ADD COLUMN IF NOT EXISTS min_qty INTEGER;
+    ALTER TABLE pyxis_pends ADD COLUMN IF NOT EXISTS max_qty INTEGER;
+    """
     with eng.begin() as con:
-        con.execute(text(f"SET LOCAL lock_timeout = '{timeout_sec}s'"))
-        for s in stmts:
-            try:
-                con.execute(text(s))
-            except Exception:
-                pass  # non-fatal
+        con.execute(text(alter))
 
 def refresh_materialized_views(eng):
     # No MVs yet; placeholder
@@ -1211,22 +1257,27 @@ def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
     if df_pends is None or df_pends.empty:
         return 0
 
+    # make sure columns exist (safe to call always)
+    ensure_pends_minmax_columns(eng)
+
     df = df_pends.copy()
+
+    # Normalize NOT NULL fields
     for c in ("drawer", "pocket"):
         df[c] = df.get(c, "").fillna("").astype(str)
 
-    # Normalize columns
+    # Ensure numeric
     for c in ("min_qty", "max_qty", "qty"):
         if c not in df.columns:
             df[c] = np.nan
     df["min_qty"] = pd.to_numeric(df["min_qty"], errors="coerce")
     df["max_qty"] = pd.to_numeric(df["max_qty"], errors="coerce")
-    df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
+    df["qty"]     = pd.to_numeric(df["qty"], errors="coerce")
 
-    rows = df.rename(columns={
-        "DispensingDeviceName": "dispensing_name",
-        "Area": "area"
-    }).to_dict(orient="records")
+    rows = (
+        df.rename(columns={"DispensingDeviceName": "dispensing_name", "Area": "area"})
+          .to_dict(orient="records")
+    )
 
     sql = text("""
         INSERT INTO pyxis_pends
@@ -1253,47 +1304,10 @@ def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
 
     return len(rows)
 
-
-    # normalize blanks so NOT NULL is satisfied
-    df = df_pends.copy()
-    for c in ("drawer","pocket"):
-        if c in df.columns:
-            df[c] = df[c].fillna("").astype(str)
-        else:
-            df[c] = ""
-
-    rows = df.rename(columns={
-        "DispensingDeviceName":"dispensing_name",
-        "Area":"area"
-    }).to_dict(orient="records")
-
-    sql = text("""
-        INSERT INTO pyxis_pends
-        (ts, device, med_id, drawer, pocket, qty, affected_element,
-         dispensing_name, area, username, userid)
-        VALUES
-        (:ts, :device, :med_id, :drawer, :pocket, :qty, :AffectedElement,
-         :dispensing_name, :area, :username, :userid)
-        ON CONFLICT (ts, device, med_id, drawer, pocket)
-        DO UPDATE SET
-          qty = EXCLUDED.qty,
-          affected_element = EXCLUDED.affected_element,
-          dispensing_name  = EXCLUDED.dispensing_name,
-          area             = EXCLUDED.area,
-          username         = EXCLUDED.username,
-          userid           = EXCLUDED.userid;
-    """)
-
-    with eng.begin() as con:
-        con.execute(text("SET LOCAL statement_timeout = '120s'"))
-        con.execute(sql, rows)
-    return len(rows)
-
-
 def ensure_indexes(eng, timeout_sec: int = 15):
     """Create/repair indexes concurrently; uses AUTOCOMMIT because CONCURRENTLY forbids a txn."""
     stmts = [
-        # events table
+        # events
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_dt     ON events (dt)',
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_device ON events (device)',
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_user   ON events ("user")',
@@ -1301,24 +1315,23 @@ def ensure_indexes(eng, timeout_sec: int = 15):
         # pends
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pends_ts      ON pyxis_pends (ts)',
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pends_dev_med ON pyxis_pends (device, med_id, ts DESC)',
+        # thresholds
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_thresh_med    ON pyxis_thresholds (med_id)',
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_thresh_full   ON pyxis_thresholds (med_id, device, drawer, pocket)'
     ]
 
-    # Use AUTOCOMMIT so CONCURRENTLY is allowed
     with eng.connect().execution_options(isolation_level="AUTOCOMMIT") as con:
         try:
             con.execute(text(f"SET lock_timeout = '{timeout_sec}s'"))
             con.execute(text(f"SET statement_timeout = '{max(timeout_sec*2, 30)}s'"))
         except Exception:
-            # If SET fails, continue anyway; CREATE INDEX may still succeed.
             pass
 
         for s in stmts:
             try:
                 con.execute(text(s))
             except Exception:
-                # Ignore "duplicate" or "relation busy" errors—safe to skip
                 pass
-
 # ------------------------------------------------------------------------------------
 
 # ----------------------------- UI ------------------------------------
@@ -1705,9 +1718,9 @@ with tab10:
 with tab11:
     st.subheader("Pended Loads (DeviceActivityLog-style)")
 
-    # We try to detect pends from whatever is in ev_time first (if columns exist),
-    # otherwise, allow a separate upload just for the DeviceActivityLog file.
-    can_parse_from_current = {"Device","ActivityType","Action","AffectedElement","TransactionDateTime"}.issubset(ev_time.columns)
+    # Detect if current filtered data can be parsed as DeviceActivityLog
+    required_cols = {"Device","ActivityType","Action","AffectedElement","TransactionDateTime"}
+    can_parse_from_current = required_cols.issubset(ev_time.columns)
 
     pend_source = st.radio(
         "Choose data source for pends",
@@ -1716,46 +1729,64 @@ with tab11:
         help="Pends require columns: Device, ActivityType, Action, AffectedElement, TransactionDateTime."
     )
 
+    # We'll keep the source frame in src_df so we can also build min/max from it
+    df_pends = pd.DataFrame()
+    src_df = None
+
     if pend_source == "Use current data (if compatible)":
         if not can_parse_from_current:
             st.warning("Current data frame does not have the required columns for pends. Please upload.")
-            df_pends = pd.DataFrame()
         else:
+            src_df = ev_time
             df_pends = build_pyxis_pends_from_df(ev_time)
     else:
         up_pends = st.file_uploader(
             "Upload DeviceActivityLog CSV (Pyxis Admin Extract)",
-            type=["csv"], accept_multiple_files=False, key="pend_csv_upl")
-        df_pends = pd.DataFrame()
+            type=["csv"], accept_multiple_files=False, key="pend_csv_upl"
+        )
         if up_pends is not None:
             try:
-                tmp = load_upload(up_pends)  # reuse your robust loader
+                tmp = load_upload(up_pends)  # robust loader handles CSV/encoding
             except Exception:
                 up_pends.seek(0)
                 tmp = pd.read_csv(up_pends, encoding="latin-1", low_memory=False)
             tmp = dedupe_columns(tmp)
+            src_df = tmp
             df_pends = build_pyxis_pends_from_df(tmp)
 
     if df_pends.empty:
         st.info("No pended rows detected for the chosen source.")
     else:
-        st.caption(f"Found {len(df_pends):,} pended rows.")
-        st.dataframe(
-            df_pends.head(200)[["ts","device","med_id","drawer","pocket","qty","username"]],
-            use_container_width=True, height=420
-        )
+        # Attach latest min/max from the same source file (or ev_time)
+        try:
+            if src_df is not None:
+                cfg = build_slot_config(src_df)  # returns device, med_id, drawer, pocket, qty_min, qty_max, ts_updated
+                if not cfg.empty:
+                    df_pends = df_pends.merge(
+                        cfg.rename(columns={"qty_min": "min_qty", "qty_max": "max_qty"}),
+                        on=["device", "med_id", "drawer", "pocket"],
+                        how="left",
+                        validate="m:1"
+                    )
+        except Exception as e:
+            st.warning(f"Could not attach min/max: {e}")
 
-        c1, c2 = st.columns([1,1])
+        st.caption(f"Found {len(df_pends):,} pended rows.")
+        show_cols = ["ts","device","med_id","drawer","pocket","qty","min_qty","max_qty","username"]
+        show_cols = [c for c in show_cols if c in df_pends.columns]
+        st.dataframe(df_pends.head(200)[show_cols], use_container_width=True, height=420)
+
+        c1, c2 = st.columns(2)
         with c1:
             if st.button("Upsert pends to Postgres", type="primary"):
                 try:
-                    # Ensure tables exist
                     init_db(eng)
+                    # Make sure pyxis_pends has min/max columns (safe if already present)
+                    ensure_pends_minmax_columns(eng)
                     n = upsert_pyxis_pends(eng, df_pends)
                     st.success(f"Saved pends: {n:,} rows (upserted by PK).")
                 except Exception as e:
                     st.error(f"Failed to save pended rows: {e}")
-
         with c2:
             st.download_button(
                 "Download parsed pends (CSV)",
