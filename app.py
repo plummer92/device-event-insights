@@ -176,6 +176,18 @@ def _plain_english_summary(g: pd.DataFrame) -> str:
     return (f"In this period we loaded {_fmt_int(loads)} and unloaded {_fmt_int(unlds)} "
             f"(net {direction} {_fmt_int(abs(net))})." + dev_str)
 
+def _safe_int(x, lo=-2147483648, hi=2147483647):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return None
+    try:
+        v = int(round(float(x)))
+        if v < lo or v > hi:
+            return None
+        return v
+    except Exception:
+        return None
+
+
 # ---- PENDED LOADS (Pyxis DeviceActivityLog-style files) -----------------------
 PEND_ACTIVITY_MATCH = r"Standard\s*Stock"   # ActivityType contains this
 PEND_ACTION_MATCH   = r"Add"                # Action contains this
@@ -1274,6 +1286,12 @@ def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
     df["max_qty"] = pd.to_numeric(df["max_qty"], errors="coerce")
     df["qty"]     = pd.to_numeric(df["qty"], errors="coerce")
 
+    # Normalize numeric columns strictly to ints or None
+    for col in ("qty", "min_qty", "max_qty"):
+        if col not in df.columns:
+            df[col] = np.nan
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+    df[col] = df[col].apply(_safe_int)
     rows = (
         df.rename(columns={"DispensingDeviceName": "dispensing_name", "Area": "area"})
           .to_dict(orient="records")
@@ -1754,14 +1772,32 @@ with tab11:
             src_df = tmp
             df_pends = build_pyxis_pends_from_df(tmp)
 
-    if df_pends.empty:
+        if df_pends.empty:
         st.info("No pended rows detected for the chosen source.")
     else:
-        # Attach latest min/max from the same source file (or ev_time)
+        # ------------------------------------------------------------
+        #  STEP 2 — Attach min/max thresholds (normalized merge)
+        # ------------------------------------------------------------
+        def _norm_key_cols(df):
+            """Normalize key columns for consistent merging."""
+            for c in ("device", "med_id", "drawer", "pocket"):
+                if c in df.columns:
+                    df[c] = (
+                        df[c].astype(str)
+                              .str.strip()
+                              .str.upper()
+                              .str.replace(r"\s+", "", regex=True)
+                    )
+            return df
+
         try:
             if src_df is not None:
-                cfg = build_slot_config(src_df)  # returns device, med_id, drawer, pocket, qty_min, qty_max, ts_updated
+                cfg = build_slot_config(src_df)
                 if not cfg.empty:
+                    # Normalize before merge
+                    df_pends = _norm_key_cols(df_pends)
+                    cfg = _norm_key_cols(cfg)
+
                     df_pends = df_pends.merge(
                         cfg.rename(columns={"qty_min": "min_qty", "qty_max": "max_qty"}),
                         on=["device", "med_id", "drawer", "pocket"],
@@ -1771,7 +1807,19 @@ with tab11:
         except Exception as e:
             st.warning(f"Could not attach min/max: {e}")
 
-        st.caption(f"Found {len(df_pends):,} pended rows.")
+        # Coverage summary (see how many merged)
+        if "min_qty" in df_pends.columns and "max_qty" in df_pends.columns:
+            hits = df_pends["min_qty"].notna().sum() + df_pends["max_qty"].notna().sum()
+            total = len(df_pends)
+            pct = df_pends[["min_qty", "max_qty"]].notna().any(axis=1).mean() * 100
+            st.caption(f"Min/Max attached on ~{hits} values across {total:,} rows ({pct:.1f}% coverage).")
+
+        # Show sample of merged results
+        show_cols = ["ts","device","med_id","drawer","pocket","qty","min_qty","max_qty","username"]
+        show_cols = [c for c in show_cols if c in df_pends.columns]
+        st.dataframe(df_pends.head(200)[show_cols], use_container_width=True, height=420)
+
+            
         show_cols = ["ts","device","med_id","drawer","pocket","qty","min_qty","max_qty","username"]
         show_cols = [c for c in show_cols if c in df_pends.columns]
         st.dataframe(df_pends.head(200)[show_cols], use_container_width=True, height=420)
