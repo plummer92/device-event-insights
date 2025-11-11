@@ -219,29 +219,40 @@ def _parse_pend_affected(s: str):
     qty = int(qty_m.group(1)) if qty_m else None
     return med_id, drawer, pocket, qty
 
-# ActivityType text fragments as observed in your file
+# ActivityType text fragments (works with your screenshot)
 MIN_ACTIVITY_MATCH = r"Refill\s*Point\s*Min\s*Quantity"
 MAX_ACTIVITY_MATCH = r"(?:Par|Physical)\s*Max\s*Quantity"
 
 def _parse_slot_affected(s: str):
     """
-    Same parsing as pends: extract med_id, drawer, pocket, and the trailing ': value'
+    Parse 'SJS11W_TWR Dr 3-Pkt 1 (ENOXA100IV): 2'
+      -> med_id='ENOXA100IV', drawer='3', pocket='1', value=2 (int)
+    Handles 'Dr'/'Drw'/'Drawer' and 'Pkt'/'Pocket', ignores spaces.
     """
     s = s if isinstance(s, str) else str(s)
+
+    # med_id inside parentheses
     med_m = re.search(r"\(([^)]+)\)", s)
     med_id = med_m.group(1).strip() if med_m else None
+
+    # drawer & pocket
     drw_m = re.search(r"(?:Drw|Drawer|Dr)\s*([A-Za-z0-9\.]+)", s, flags=re.I)
-    drawer = drw_m.group(1) if drw_m else ""
+    drawer = drw_m.group(1).strip() if drw_m else ""
+
     pkt_m = re.search(r"(?:Pkt|Pocket)\s*([A-Za-z0-9\.]+)", s, flags=re.I)
-    pocket = pkt_m.group(1) if pkt_m else ""
-    val_m = re.search(r":\s*(-?\d+\.?\d*)\s*$", s)
-    value = float(val_m.group(1)) if val_m else None
+    pocket = pkt_m.group(1).strip() if pkt_m else ""
+
+    # trailing ': number' => min/max value
+    val_m = re.search(r":\s*(-?\d+(?:\.\d+)?)\s*$", s)
+    value = int(float(val_m.group(1))) if val_m else None
+
     return med_id, drawer, pocket, value
+
 
 def build_slot_config(df: pd.DataFrame) -> pd.DataFrame:
     """
-    From DeviceActivityLog-like df, build latest known qty_min/qty_max per
-    (device, med_id, drawer, pocket).
+    From DeviceActivityLog-like df, build latest qty_min/qty_max per
+    (device, med_id, drawer, pocket). Values come from the number after ':'.
     """
     need = {"Device","ActivityType","Action","AffectedElement","TransactionDateTime"}
     if not need.issubset(df.columns):
@@ -249,40 +260,57 @@ def build_slot_config(df: pd.DataFrame) -> pd.DataFrame:
 
     base = df.copy()
     base["ts"] = pd.to_datetime(base["TransactionDateTime"], errors="coerce")
+    base["Device"] = base["Device"].astype(str).str.strip()
 
-    # MIN rows
+    # helpers
+    def _norm_keys(x):
+        return (str(x).strip().upper().replace(" ", ""))
+
+    # --- MIN rows ---
     is_min = base["ActivityType"].astype(str).str.contains(MIN_ACTIVITY_MATCH, case=False, na=False)
-    mins = base.loc[is_min].copy()
+    mins = base.loc[is_min, ["Device","AffectedElement","ts"]].copy()
     if not mins.empty:
         parsed = mins["AffectedElement"].apply(_parse_slot_affected)
         mins[["med_id","drawer","pocket","value"]] = pd.DataFrame(parsed.tolist(), index=mins.index)
-        mins["device"] = mins["Device"].astype(str).str.strip()
-        mins = (mins.dropna(subset=["ts","device","med_id"])
-                    .sort_values("ts")
+        mins = mins.dropna(subset=["ts","med_id"])
+        mins["device"] = mins["Device"].astype(str)
+        # normalize keys
+        for c in ("device","med_id","drawer","pocket"):
+            mins[c] = mins[c].apply(_norm_keys)
+        # take latest by ts
+        mins = (mins.sort_values("ts")
                     .groupby(["device","med_id","drawer","pocket"], as_index=False)
                     .last()[["device","med_id","drawer","pocket","value","ts"]]
                     .rename(columns={"value":"qty_min","ts":"ts_updated_min"}))
     else:
         mins = pd.DataFrame(columns=["device","med_id","drawer","pocket","qty_min","ts_updated_min"])
 
-    # MAX rows
+    # --- MAX rows ---
     is_max = base["ActivityType"].astype(str).str.contains(MAX_ACTIVITY_MATCH, case=False, na=False)
-    maxs = base.loc[is_max].copy()
+    maxs = base.loc[is_max, ["Device","AffectedElement","ts"]].copy()
     if not maxs.empty:
         parsed = maxs["AffectedElement"].apply(_parse_slot_affected)
         maxs[["med_id","drawer","pocket","value"]] = pd.DataFrame(parsed.tolist(), index=maxs.index)
-        maxs["device"] = maxs["Device"].astype(str).str.strip()
-        maxs = (maxs.dropna(subset=["ts","device","med_id"])
-                    .sort_values("ts")
+        maxs = maxs.dropna(subset=["ts","med_id"])
+        maxs["device"] = maxs["Device"].astype(str)
+        for c in ("device","med_id","drawer","pocket"):
+            maxs[c] = maxs[c].apply(_norm_keys)
+        maxs = (maxs.sort_values("ts")
                     .groupby(["device","med_id","drawer","pocket"], as_index=False)
                     .last()[["device","med_id","drawer","pocket","value","ts"]]
                     .rename(columns={"value":"qty_max","ts":"ts_updated_max"}))
     else:
         maxs = pd.DataFrame(columns=["device","med_id","drawer","pocket","qty_max","ts_updated_max"])
 
-    # Merge latest min & max
+    # merge + dtype
     cfg = mins.merge(maxs, on=["device","med_id","drawer","pocket"], how="outer")
     cfg["ts_updated"] = cfg[["ts_updated_min","ts_updated_max"]].max(axis=1)
+
+    # use nullable Int64 (keeps NA cleanly)
+    for c in ("qty_min","qty_max"):
+        if c in cfg.columns:
+            cfg[c] = pd.to_numeric(cfg[c], errors="coerce").round().astype("Int64")
+
     return cfg[["device","med_id","drawer","pocket","qty_min","qty_max","ts_updated"]]
 
 
@@ -1128,6 +1156,18 @@ def build_load_unload_section(df: pd.DataFrame, colmap: Dict[str,str]):
 
 
 # ------------------------- PERSISTENCE (POSTGRES via Supabase) ----------------------
+
+
+def _safe_int(x, lo=-2147483648, hi=2147483647):
+    """Coerce numeric values into safe Postgres integer range or None."""
+    if pd.isna(x):
+        return None
+    try:
+        v = int(float(x))
+        return max(lo, min(hi, v))
+    except Exception:
+        return None
+
 @st.cache_resource
 def get_engine(db_url: str, salt: str):
     """Create a cached SQLAlchemy engine. Changing db_url or salt busts the cache."""
@@ -1287,11 +1327,12 @@ def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
     df["qty"]     = pd.to_numeric(df["qty"], errors="coerce")
 
     # Normalize numeric columns strictly to ints or None
-    for col in ("qty", "min_qty", "max_qty"):
-        if col not in df.columns:
-            df[col] = np.nan
-    df[col] = pd.to_numeric(df[col], errors="coerce")
-    df[col] = df[col].apply(_safe_int)
+    for c in ("qty", "min_qty", "max_qty"):
+        if c not in df.columns:
+            df[c] = np.nan
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+    df[c] = df[c].apply(_safe_int)
+
     rows = (
         df.rename(columns={"DispensingDeviceName": "dispensing_name", "Area": "area"})
           .to_dict(orient="records")
