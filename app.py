@@ -1805,7 +1805,7 @@ with tab11:
         )
         if up_pends is not None:
             try:
-                tmp = load_upload(up_pends)  # robust loader handles CSV/encoding
+                tmp = load_upload(up_pends)
             except Exception:
                 up_pends.seek(0)
                 tmp = pd.read_csv(up_pends, encoding="latin-1", low_memory=False)
@@ -1813,64 +1813,93 @@ with tab11:
             src_df = tmp
             df_pends = build_pyxis_pends_from_df(tmp)
 
-    # If nothing parsed, bail nicely
+    # Bail if no rows
     if df_pends.empty:
         st.info("No pended rows detected for the chosen source.")
     else:
         # ------------------------------------------------------------
-        # STEP 2 — Attach min/max thresholds (normalized merge)
+        # Normalize helpers
         # ------------------------------------------------------------
-        def _norm_key_cols(df_in: pd.DataFrame) -> pd.DataFrame:
-            """Normalize key columns for consistent merging."""
-            df_out = df_in.copy()
-            for c in ("device", "med_id", "drawer", "pocket"):
-                if c in df_out.columns:
-                    df_out[c] = (
-                        df_out[c].astype(str)
-                                 .str.strip()
-                                 .str.upper()
-                                 .str.replace(r"\s+", "", regex=True)
-                    )
-            return df_out
+        def _device_base(s: str) -> str:
+            s = str(s) if s is not None else ""
+            return s.split("_", 1)[0].strip().upper()
 
+        def _norm_slot_str(s):
+            if pd.isna(s):
+                return ""
+            return str(s).strip().upper().replace(" ", "")
+
+        # Normalize keys for merge
+        df_pends["device_base"] = df_pends["device"].map(_device_base)
+        df_pends["drawer"] = df_pends["drawer"].map(_norm_slot_str)
+        df_pends["pocket"] = df_pends["pocket"].map(_norm_slot_str)
+
+        # ------------------------------------------------------------
+        # Attach latest min/max thresholds (cascade merge)
+        # ------------------------------------------------------------
         try:
-            if src_df is not None:
-                cfg = build_slot_config(src_df)  # returns device, med_id, drawer, pocket, qty_min, qty_max, ts_updated
-                if not cfg.empty:
-                    df_pends = _norm_key_cols(df_pends)
-                    cfg_norm = _norm_key_cols(cfg)
+            cfg = build_slot_config(src_df) if src_df is not None else pd.DataFrame()
 
-                    df_pends = df_pends.merge(
-                        cfg_norm.rename(columns={"qty_min": "min_qty", "qty_max": "max_qty"}),
-                        on=["device", "med_id", "drawer", "pocket"],
-                        how="left",
-                        validate="m:1"
+            if not cfg.empty:
+                # Normalize config side
+                cfg["device_base"] = cfg["device"].map(_device_base)
+                cfg["drawer"] = cfg["drawer"].map(_norm_slot_str)
+                cfg["pocket"] = cfg["pocket"].map(_norm_slot_str)
+
+                # --- 1️⃣ strict merge on full key
+                m1 = df_pends.merge(
+                    cfg.rename(columns={"qty_min": "min_qty", "qty_max": "max_qty"}),
+                    on=["device_base", "med_id", "drawer", "pocket"],
+                    how="left",
+                    validate="m:1"
+                )
+
+                # --- 2️⃣ fallback merge on device_base + med_id
+                miss = m1["min_qty"].isna() & m1["max_qty"].isna()
+                if miss.any():
+                    coarse = (
+                        cfg.rename(columns={"qty_min": "min_qty", "qty_max": "max_qty"})
+                        .drop_duplicates(subset=["device_base", "med_id"])
+                        [["device_base", "med_id", "min_qty", "max_qty"]]
                     )
+                    m2 = (
+                        m1.loc[miss].drop(columns=["min_qty", "max_qty"])
+                        .merge(coarse, on=["device_base", "med_id"], how="left", validate="m:1")
+                    )
+                    m1.loc[miss, ["min_qty", "max_qty"]] = m2[["min_qty", "max_qty"]].values
+
+                df_pends = m1
+
         except Exception as e:
             st.warning(f"Could not attach min/max: {e}")
 
-        # Coverage summary
+        # ------------------------------------------------------------
+        # Display results
+        # ------------------------------------------------------------
         if "min_qty" in df_pends.columns and "max_qty" in df_pends.columns:
             pct = df_pends[["min_qty", "max_qty"]].notna().any(axis=1).mean() * 100
             st.caption(f"Min/Max attached for {pct:.1f}% of pended rows.")
 
-        # Show sample of merged results
-        show_cols = ["ts", "device", "med_id", "drawer", "pocket", "qty", "min_qty", "max_qty", "username"]
+        show_cols = [
+            "ts", "device", "med_id", "drawer", "pocket",
+            "min_qty", "max_qty", "username"   # ✅ include username
+        ]
         show_cols = [c for c in show_cols if c in df_pends.columns]
         st.dataframe(df_pends.head(200)[show_cols], use_container_width=True, height=420)
 
+        # ------------------------------------------------------------
+        # Actions: upsert + CSV download
+        # ------------------------------------------------------------
         c1, c2 = st.columns(2)
         with c1:
             if st.button("Upsert pends to Postgres", type="primary"):
                 try:
-                    # Ensure tables exist (and add min/max columns if they were missing initially)
                     init_db(eng)
-                    ensure_pends_minmax_columns(eng)  # <- make sure this helper exists in your DB section
+                    ensure_pends_minmax_columns(eng)
                     n = upsert_pyxis_pends(eng, df_pends)
                     st.success(f"Saved pends: {n:,} rows (upserted by PK).")
                 except Exception as e:
                     st.error(f"Failed to save pended rows: {e}")
-
         with c2:
             st.download_button(
                 "Download parsed pends (CSV)",
