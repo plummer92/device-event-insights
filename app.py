@@ -187,6 +187,15 @@ def _safe_int(x, lo=-2147483648, hi=2147483647):
     except Exception:
         return None
 
+def ensure_pends_minmax_columns(eng):
+    alter = """
+    ALTER TABLE pyxis_pends ADD COLUMN IF NOT EXISTS min_qty INTEGER;
+    ALTER TABLE pyxis_pends ADD COLUMN IF NOT EXISTS max_qty INTEGER;
+    """
+    with eng.begin() as con:
+        con.execute(text(alter))
+
+
 
 # ---- PENDED LOADS (Pyxis DeviceActivityLog-style files) -----------------------
 PEND_ACTIVITY_MATCH = r"Standard\s*Stock"   # ActivityType contains this
@@ -1167,15 +1176,6 @@ def init_db(eng):
     """
     with eng.begin() as con:
         con.execute(text(ddl))
-
-def ensure_pends_minmax_columns(eng):
-    """Backfill columns if table existed before we added min/max."""
-    alter = """
-    ALTER TABLE pyxis_pends ADD COLUMN IF NOT EXISTS min_qty INTEGER;
-    ALTER TABLE pyxis_pends ADD COLUMN IF NOT EXISTS max_qty INTEGER;
-    """
-    with eng.begin() as con:
-        con.execute(text(alter))
 
 def refresh_materialized_views(eng):
     # No MVs yet; placeholder
