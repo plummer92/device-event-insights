@@ -1773,12 +1773,12 @@ with tab11:
             df_pends = build_pyxis_pends_from_df(tmp)
 
         if df_pends.empty:
-        st.info("No pended rows detected for the chosen source.")
-    else:
+            st.info("No pended rows detected for the chosen source.")
+        else:
         # ------------------------------------------------------------
         #  STEP 2 — Attach min/max thresholds (normalized merge)
         # ------------------------------------------------------------
-        def _norm_key_cols(df):
+            def _norm_key_cols(df):
             """Normalize key columns for consistent merging."""
             for c in ("device", "med_id", "drawer", "pocket"):
                 if c in df.columns:
