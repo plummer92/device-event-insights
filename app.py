@@ -283,76 +283,54 @@ def _parse_slot_affected(s: str):
     pocket = m.group("pocket").strip().upper()
     value = float(m.group("val"))
     return med_id, drawer, pocket, value
+
+
 def build_slot_config(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build latest known qty_min/qty_max per (device_base, med_id, drawer, pocket)
-    from DeviceActivityLog-like data. Expects columns:
-      Device, ActivityType, Action, AffectedElement, TransactionDateTime
-    Returns normalized keys + a drawer_root (e.g., '2.1' -> '2') to improve matching.
+    Build latest qty_min/qty_max per (device_base, med_id, drawer, pocket)
+    and also provide drawer_root for fallback merging.
     """
-    need = {"Device", "ActivityType", "Action", "AffectedElement", "TransactionDateTime"}
-    cols_out = ["device_base","device","med_id","drawer","drawer_root","pocket","qty_min","qty_max","ts_updated"]
-
+    need = {"Device","ActivityType","Action","AffectedElement","TransactionDateTime"}
     if not need.issubset(df.columns):
-        return pd.DataFrame(columns=cols_out)
+        return pd.DataFrame(columns=[
+            "device_base","device","med_id","drawer","drawer_root","pocket",
+            "qty_min","qty_max","ts_updated"
+        ])
 
     base = df.copy()
-    base["ts"] = pd.to_datetime(base["TransactionDateTime"], errors="coerce")
-    base["device"] = base["Device"].astype(str).str.strip()
+    base["ts"]          = pd.to_datetime(base["TransactionDateTime"], errors="coerce")
+    base["device"]      = base["Device"].astype(str).str.strip()
     base["device_base"] = base["device"].map(_device_base)
 
-    # ---- MIN rows
+    # ---- MIN rows ----
     is_min = base["ActivityType"].astype(str).str.contains(r"Refill\s*Point\s*Min\s*Quantity", case=False, na=False)
-    mins = base.loc[is_min].copy()
+    mins = base.loc[is_min, ["ts","device_base","AffectedElement"]].copy()
     if not mins.empty:
-        parsed = mins["AffectedElement"].apply(_parse_slot_affected)
+        parsed = mins["AffectedElement"].apply(_parse_slot_affected)  # -> (med_id, drawer, pocket, value)
         mins[["med_id","drawer","pocket","value"]] = pd.DataFrame(parsed.tolist(), index=mins.index)
-        mins["med_id"] = mins["med_id"].map(_norm_med)
-        mins["drawer"] = mins["drawer"].map(_norm_slot_str)
-        mins["pocket"] = mins["pocket"].map(_norm_slot_str)
-        mins = (
-            mins.dropna(subset=["ts","device_base","med_id"])
-                .sort_values("ts")
-                .groupby(["device_base","med_id","drawer","pocket"], as_index=False)
-                .last()[["device_base","med_id","drawer","pocket","value","ts"]]
-                .rename(columns={"value":"qty_min","ts":"ts_updated_min"})
-        )
+        mins["med_id"]      = mins["med_id"].map(_norm_med)
+        mins["drawer"]      = mins["drawer"].map(_norm_slot_str)
+        mins["pocket"]      = mins["pocket"].map(_norm_slot_str)
+        mins["drawer_root"] = mins["drawer"].map(_drawer_root)
+        mins = (mins.dropna(subset=["ts","device_base","med_id"])
+                    .sort_values("ts")
+                    .groupby(["device_base","med_id","drawer","pocket"], as_index=False)
+                    .last()[["device_base","med_id","drawer","pocket","value","ts"]]
+                    .rename(columns={"value":"qty_min","ts":"ts_updated_min"}))
     else:
         mins = pd.DataFrame(columns=["device_base","med_id","drawer","pocket","qty_min","ts_updated_min"])
 
-    # ---- MAX rows
+    # ---- MAX rows ----
     is_max = base["ActivityType"].astype(str).str.contains(r"(?:Par|Physical)\s*Max\s*Quantity", case=False, na=False)
-    maxs = base.loc[is_max].copy()
+    maxs = base.loc[is_max, ["ts","device_base","AffectedElement"]].copy()
     if not maxs.empty:
         parsed = maxs["AffectedElement"].apply(_parse_slot_affected)
         maxs[["med_id","drawer","pocket","value"]] = pd.DataFrame(parsed.tolist(), index=maxs.index)
-        maxs["med_id"] = maxs["med_id"].map(_norm_med)
-        maxs["drawer"] = maxs["drawer"].map(_norm_slot_str)
-        maxs["pocket"] = maxs["pocket"].map(_norm_slot_str)
-        maxs = (
-            maxs.dropna(subset=["ts","device_base","med_id"])
-                .sort_values("ts")
-                .groupby(["device_base","med_id","drawer","pocket"], as_index=False)
-                .last()[["device_base","med_id","drawer","pocket","value","ts"]]
-                .rename(columns={"value":"qty_max","ts":"ts_updated_max"})
-        )
-    else:
-        maxs = pd.DataFrame(columns=["device_base","med_id","drawer","pocket","qty_max","ts_updated_max"])
+        maxs["med_id"]      = maxs["med_id"].map(_norm_med)
+        maxs["drawer"]      = maxs["drawer"].map(_norm_slot_str)
+        maxs["pocket"]      = maxs["pocket"].map(_norm_slot_str)
+        maxs["
 
-    # ---- Combine and normalize output
-    cfg = mins.merge(maxs, on=["device_base","med_id","drawer","pocket"], how="outer")
-    cfg["ts_updated"] = cfg[["ts_updated_min","ts_updated_max"]].max(axis=1)
-
-    # final normalization for join keys + drawer_root and display device
-    if not cfg.empty:
-        cfg["device_base"] = cfg["device_base"].map(str)
-        cfg["device"]      = cfg["device_base"]        # simple mirror for display
-        cfg["med_id"]      = cfg["med_id"].map(_norm_med)
-        cfg["drawer"]      = cfg["drawer"].map(_norm_slot_str)
-        cfg["pocket"]      = cfg["pocket"].map(_norm_slot_str)
-        cfg["drawer_root"] = cfg["drawer"].map(_drawer_root)
-
-    return cfg.reindex(columns=cols_out)
 
 
     # --- parse "AffectedElement": SJS11W_TWR Dr 3-Pkt 1 (ENOXA100IV): 2
