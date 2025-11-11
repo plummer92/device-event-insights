@@ -1737,7 +1737,7 @@ with tab11:
     st.subheader("Pended Loads (DeviceActivityLog-style)")
 
     # Detect if current filtered data can be parsed as DeviceActivityLog
-    required_cols = {"Device","ActivityType","Action","AffectedElement","TransactionDateTime"}
+    required_cols = {"Device", "ActivityType", "Action", "AffectedElement", "TransactionDateTime"}
     can_parse_from_current = required_cols.issubset(ev_time.columns)
 
     pend_source = st.radio(
@@ -1749,7 +1749,7 @@ with tab11:
 
     # We'll keep the source frame in src_df so we can also build min/max from it
     df_pends = pd.DataFrame()
-    src_df = None
+    src_df: pd.DataFrame | None = None
 
     if pend_source == "Use current data (if compatible)":
         if not can_parse_from_current:
@@ -1772,34 +1772,35 @@ with tab11:
             src_df = tmp
             df_pends = build_pyxis_pends_from_df(tmp)
 
-        if df_pends.empty:
-            st.info("No pended rows detected for the chosen source.")
-        else:
+    # If nothing parsed, bail nicely
+    if df_pends.empty:
+        st.info("No pended rows detected for the chosen source.")
+    else:
         # ------------------------------------------------------------
-        #  STEP 2 — Attach min/max thresholds (normalized merge)
+        # STEP 2 — Attach min/max thresholds (normalized merge)
         # ------------------------------------------------------------
-            def _norm_key_cols(df):
+        def _norm_key_cols(df_in: pd.DataFrame) -> pd.DataFrame:
             """Normalize key columns for consistent merging."""
+            df_out = df_in.copy()
             for c in ("device", "med_id", "drawer", "pocket"):
-                if c in df.columns:
-                    df[c] = (
-                        df[c].astype(str)
-                              .str.strip()
-                              .str.upper()
-                              .str.replace(r"\s+", "", regex=True)
+                if c in df_out.columns:
+                    df_out[c] = (
+                        df_out[c].astype(str)
+                                 .str.strip()
+                                 .str.upper()
+                                 .str.replace(r"\s+", "", regex=True)
                     )
-            return df
+            return df_out
 
         try:
             if src_df is not None:
-                cfg = build_slot_config(src_df)
+                cfg = build_slot_config(src_df)  # returns device, med_id, drawer, pocket, qty_min, qty_max, ts_updated
                 if not cfg.empty:
-                    # Normalize before merge
                     df_pends = _norm_key_cols(df_pends)
-                    cfg = _norm_key_cols(cfg)
+                    cfg_norm = _norm_key_cols(cfg)
 
                     df_pends = df_pends.merge(
-                        cfg.rename(columns={"qty_min": "min_qty", "qty_max": "max_qty"}),
+                        cfg_norm.rename(columns={"qty_min": "min_qty", "qty_max": "max_qty"}),
                         on=["device", "med_id", "drawer", "pocket"],
                         how="left",
                         validate="m:1"
@@ -1807,20 +1808,13 @@ with tab11:
         except Exception as e:
             st.warning(f"Could not attach min/max: {e}")
 
-        # Coverage summary (see how many merged)
+        # Coverage summary
         if "min_qty" in df_pends.columns and "max_qty" in df_pends.columns:
-            hits = df_pends["min_qty"].notna().sum() + df_pends["max_qty"].notna().sum()
-            total = len(df_pends)
             pct = df_pends[["min_qty", "max_qty"]].notna().any(axis=1).mean() * 100
-            st.caption(f"Min/Max attached on ~{hits} values across {total:,} rows ({pct:.1f}% coverage).")
+            st.caption(f"Min/Max attached for {pct:.1f}% of pended rows.")
 
         # Show sample of merged results
-        show_cols = ["ts","device","med_id","drawer","pocket","qty","min_qty","max_qty","username"]
-        show_cols = [c for c in show_cols if c in df_pends.columns]
-        st.dataframe(df_pends.head(200)[show_cols], use_container_width=True, height=420)
-
-            
-        show_cols = ["ts","device","med_id","drawer","pocket","qty","min_qty","max_qty","username"]
+        show_cols = ["ts", "device", "med_id", "drawer", "pocket", "qty", "min_qty", "max_qty", "username"]
         show_cols = [c for c in show_cols if c in df_pends.columns]
         st.dataframe(df_pends.head(200)[show_cols], use_container_width=True, height=420)
 
@@ -1828,13 +1822,14 @@ with tab11:
         with c1:
             if st.button("Upsert pends to Postgres", type="primary"):
                 try:
+                    # Ensure tables exist (and add min/max columns if they were missing initially)
                     init_db(eng)
-                    # Make sure pyxis_pends has min/max columns (safe if already present)
-                    ensure_pends_minmax_columns(eng)
+                    ensure_pends_minmax_columns(eng)  # <- make sure this helper exists in your DB section
                     n = upsert_pyxis_pends(eng, df_pends)
                     st.success(f"Saved pends: {n:,} rows (upserted by PK).")
                 except Exception as e:
                     st.error(f"Failed to save pended rows: {e}")
+
         with c2:
             st.download_button(
                 "Download parsed pends (CSV)",
