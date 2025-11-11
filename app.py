@@ -61,15 +61,21 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _device_base(s: str) -> str:
-    """SJS11W_TWR → SJS11W (strip anything after first underscore)."""
-    s = str(s) if s is not None else ""
-    return s.split("_", 1)[0].strip().upper()
+    s = "" if s is None else str(s).strip().upper()
+    return s.split("_", 1)[0]  # SJS7ES_MAIN → SJS7ES
 
 def _norm_slot_str(s):
-    """Normalize drawer/pocket strings (' 3.2 ' → '3.2', 'e1' → 'E1')."""
-    if pd.isna(s):
-        return ""
+    if pd.isna(s): return ""
     return str(s).strip().upper().replace(" ", "")
+
+def _drawer_root(s: str) -> str:
+    if pd.isna(s): return ""
+    s = str(s).strip().upper().replace(" ", "")
+    return s.split(".", 1)[0]  # '2.1' → '2'
+
+def _norm_med(s: str) -> str:
+    if pd.isna(s): return ""
+    return str(s).strip().upper()
 
 def parse_datetime_series(s: pd.Series) -> pd.Series:
     """Parse to pandas datetime (UTC-naive)."""
@@ -236,43 +242,118 @@ MAX_ACTIVITY_MATCH = r"(?:Par|Physical)\s*Max\s*Quantity"
 
 def _parse_slot_affected(s: str):
     """
-    Parse 'SJS11W_TWR Dr 3-Pkt 1 (ENOXA100IV): 2'
-      -> med_id='ENOXA100IV', drawer='3', pocket='1', value=2 (int)
-    Handles 'Dr'/'Drw'/'Drawer' and 'Pkt'/'Pocket', ignores spaces.
+    Parse strings like:
+      'SJS7ES_MAIN Drw 2.1-Pkt B1 (FLUCO200TAB): 3'
+       -> med_id='FLUCO200TAB', drawer='2.1', pocket='B1', value=3.0
+
+    Works with Dr/Drw/Drawer, Pkt/Pocket, hyphen or space between segments,
+    decimals in drawer, and optional spaces around the colon.
     """
-    s = s if isinstance(s, str) else str(s)
+    s = "" if s is None else str(s).strip()
 
-    # med_id inside parentheses
-    med_m = re.search(r"\(([^)]+)\)", s)
-    med_id = med_m.group(1).strip() if med_m else None
+    # robust regex for the whole line
+    rx = re.compile(
+        r"""
+        ^(?P<device>[^\s]+)            # e.g. SJS7ES_MAIN (kept if you ever need it)
+        .*?                            # anything until drawer
+        (?:Drw|Drawer|Dr)\s*(?P<drawer>[A-Za-z0-9\.]+)   # 2.1 or 3
+        [\-\s]*                        # hyphen/space separator
+        (?:Pkt|Pocket)\s*(?P<pocket>[A-Za-z0-9\.]+)     # B1 / 1 / E1
+        \s*\(\s*(?P<med>[A-Za-z0-9._\-]+)\s*\)\s*       # (FLUCO200TAB)
+        :\s*(?P<val>-?\d+(?:\.\d+)?)\s*                 # : 3 / : 6 / : 0
+        $""",
+        re.IGNORECASE | re.VERBOSE,
+    )
 
-    # drawer & pocket
-    drw_m = re.search(r"(?:Drw|Drawer|Dr)\s*([A-Za-z0-9\.]+)", s, flags=re.I)
-    drawer = drw_m.group(1).strip() if drw_m else ""
+    m = rx.search(s)
+    if not m:
+        # fall back to your lighter extraction so we never hard-fail
+        med_m = re.search(r"\(([^)]+)\)", s)
+        med_id = (med_m.group(1).strip().upper() if med_m else "")
+        drw_m = re.search(r"(?:Drw|Drawer|Dr)\s*([A-Za-z0-9\.]+)", s, flags=re.I)
+        drawer = (drw_m.group(1).strip().upper() if drw_m else "")
+        pkt_m = re.search(r"(?:Pkt|Pocket)\s*([A-Za-z0-9\.]+)", s, flags=re.I)
+        pocket = (pkt_m.group(1).strip().upper() if pkt_m else "")
+        val_m = re.search(r":\s*(-?\d+\.?\d*)\s*$", s)
+        value = float(val_m.group(1)) if val_m else None
+        return med_id, drawer, pocket, value
 
-    pkt_m = re.search(r"(?:Pkt|Pocket)\s*([A-Za-z0-9\.]+)", s, flags=re.I)
-    pocket = pkt_m.group(1).strip() if pkt_m else ""
-
-    # trailing ': number' => min/max value
-    val_m = re.search(r":\s*(-?\d+(?:\.\d+)?)\s*$", s)
-    value = int(float(val_m.group(1))) if val_m else None
-
+    med_id = m.group("med").strip().upper()
+    drawer = m.group("drawer").strip().upper()
+    pocket = m.group("pocket").strip().upper()
+    value = float(m.group("val"))
     return med_id, drawer, pocket, value
-
-
 def build_slot_config(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build latest qty_min/qty_max per (device_base, med_id, drawer, pocket)
-    from DeviceActivityLog-like data (MIN/MAX rows in ActivityType).
+    Build latest known qty_min/qty_max per (device_base, med_id, drawer, pocket)
+    from DeviceActivityLog-like data. Expects columns:
+      Device, ActivityType, Action, AffectedElement, TransactionDateTime
+    Returns normalized keys + a drawer_root (e.g., '2.1' -> '2') to improve matching.
     """
-    need = {"Device","ActivityType","Action","AffectedElement","TransactionDateTime"}
+    need = {"Device", "ActivityType", "Action", "AffectedElement", "TransactionDateTime"}
+    cols_out = ["device_base","device","med_id","drawer","drawer_root","pocket","qty_min","qty_max","ts_updated"]
+
     if not need.issubset(df.columns):
-        return pd.DataFrame(columns=["device_base","device","med_id","drawer","pocket","qty_min","qty_max","ts_updated"])
+        return pd.DataFrame(columns=cols_out)
 
     base = df.copy()
     base["ts"] = pd.to_datetime(base["TransactionDateTime"], errors="coerce")
     base["device"] = base["Device"].astype(str).str.strip()
     base["device_base"] = base["device"].map(_device_base)
+
+    # ---- MIN rows
+    is_min = base["ActivityType"].astype(str).str.contains(r"Refill\s*Point\s*Min\s*Quantity", case=False, na=False)
+    mins = base.loc[is_min].copy()
+    if not mins.empty:
+        parsed = mins["AffectedElement"].apply(_parse_slot_affected)
+        mins[["med_id","drawer","pocket","value"]] = pd.DataFrame(parsed.tolist(), index=mins.index)
+        mins["med_id"] = mins["med_id"].map(_norm_med)
+        mins["drawer"] = mins["drawer"].map(_norm_slot_str)
+        mins["pocket"] = mins["pocket"].map(_norm_slot_str)
+        mins = (
+            mins.dropna(subset=["ts","device_base","med_id"])
+                .sort_values("ts")
+                .groupby(["device_base","med_id","drawer","pocket"], as_index=False)
+                .last()[["device_base","med_id","drawer","pocket","value","ts"]]
+                .rename(columns={"value":"qty_min","ts":"ts_updated_min"})
+        )
+    else:
+        mins = pd.DataFrame(columns=["device_base","med_id","drawer","pocket","qty_min","ts_updated_min"])
+
+    # ---- MAX rows
+    is_max = base["ActivityType"].astype(str).str.contains(r"(?:Par|Physical)\s*Max\s*Quantity", case=False, na=False)
+    maxs = base.loc[is_max].copy()
+    if not maxs.empty:
+        parsed = maxs["AffectedElement"].apply(_parse_slot_affected)
+        maxs[["med_id","drawer","pocket","value"]] = pd.DataFrame(parsed.tolist(), index=maxs.index)
+        maxs["med_id"] = maxs["med_id"].map(_norm_med)
+        maxs["drawer"] = maxs["drawer"].map(_norm_slot_str)
+        maxs["pocket"] = maxs["pocket"].map(_norm_slot_str)
+        maxs = (
+            maxs.dropna(subset=["ts","device_base","med_id"])
+                .sort_values("ts")
+                .groupby(["device_base","med_id","drawer","pocket"], as_index=False)
+                .last()[["device_base","med_id","drawer","pocket","value","ts"]]
+                .rename(columns={"value":"qty_max","ts":"ts_updated_max"})
+        )
+    else:
+        maxs = pd.DataFrame(columns=["device_base","med_id","drawer","pocket","qty_max","ts_updated_max"])
+
+    # ---- Combine and normalize output
+    cfg = mins.merge(maxs, on=["device_base","med_id","drawer","pocket"], how="outer")
+    cfg["ts_updated"] = cfg[["ts_updated_min","ts_updated_max"]].max(axis=1)
+
+    # final normalization for join keys + drawer_root and display device
+    if not cfg.empty:
+        cfg["device_base"] = cfg["device_base"].map(str)
+        cfg["device"]      = cfg["device_base"]        # simple mirror for display
+        cfg["med_id"]      = cfg["med_id"].map(_norm_med)
+        cfg["drawer"]      = cfg["drawer"].map(_norm_slot_str)
+        cfg["pocket"]      = cfg["pocket"].map(_norm_slot_str)
+        cfg["drawer_root"] = cfg["drawer"].map(_drawer_root)
+
+    return cfg.reindex(columns=cols_out)
+
 
     # --- parse "AffectedElement": SJS11W_TWR Dr 3-Pkt 1 (ENOXA100IV): 2
     def _parse_slot(s: str):
@@ -1838,6 +1919,7 @@ with tab10:
 with tab11:
     st.subheader("Pended Loads (DeviceActivityLog-style)")
 
+    # Columns required to parse DeviceActivityLog-style pends
     required_cols = {"Device","ActivityType","Action","AffectedElement","TransactionDateTime"}
     can_parse_from_current = required_cols.issubset(ev_time.columns)
 
@@ -1848,14 +1930,15 @@ with tab11:
         help="Pends require columns: Device, ActivityType, Action, AffectedElement, TransactionDateTime."
     )
 
+    # We'll keep the source frame in src_df so we can also build min/max from it
     df_pends = pd.DataFrame()
-    src_df: pd.DataFrame | None = None
+    src_df   = None
 
     if pend_source == "Use current data (if compatible)":
         if not can_parse_from_current:
             st.warning("Current data frame does not have the required columns for pends. Please upload.")
         else:
-            src_df = ev_time
+            src_df   = ev_time
             df_pends = build_pyxis_pends_from_df(ev_time)
     else:
         up_pends = st.file_uploader(
@@ -1864,72 +1947,106 @@ with tab11:
         )
         if up_pends is not None:
             try:
-                tmp = load_upload(up_pends)
+                tmp = load_upload(up_pends)  # robust CSV/encoding loader
             except Exception:
                 up_pends.seek(0)
                 tmp = pd.read_csv(up_pends, encoding="latin-1", low_memory=False)
-            tmp = dedupe_columns(tmp)
-            src_df = tmp
+            tmp     = dedupe_columns(tmp)
+            src_df  = tmp
             df_pends = build_pyxis_pends_from_df(tmp)
 
+    # If no pends found, stop here
     if df_pends.empty:
         st.info("No pended rows detected for the chosen source.")
-    else:
-        # ---- normalize pends keys
-        df_pends["device_base"] = df_pends["device"].map(_device_base)
-        df_pends["drawer"] = df_pends["drawer"].map(_norm_slot_str)
-        df_pends["pocket"] = df_pends["pocket"].map(_norm_slot_str)
+        st.stop()
 
-        # ---- build cfg and cascade merge
-        cfg = build_slot_config(src_df) if src_df is not None else pd.DataFrame()
-        if not cfg.empty:
-            cfg["device_base"] = cfg["device_base"].map(str)
-            cfg["drawer"] = cfg["drawer"].map(_norm_slot_str)
-            cfg["pocket"] = cfg["pocket"].map(_norm_slot_str)
+    # -----------------------------
+    # Normalize keys on the pends side
+    # -----------------------------
+    df_pends["device_base"] = df_pends["device"].map(_device_base)
+    df_pends["med_id"]      = df_pends["med_id"].map(_norm_med)
+    df_pends["drawer"]      = df_pends["drawer"].map(_norm_slot_str)
+    df_pends["pocket"]      = df_pends["pocket"].map(_norm_slot_str)
+    df_pends["drawer_root"] = df_pends["drawer"].map(_drawer_root)
 
-            # strict
-            m1 = df_pends.merge(
-                cfg.rename(columns={"qty_min":"min_qty","qty_max":"max_qty"}),
-                on=["device_base","med_id","drawer","pocket"],
-                how="left",
-                validate="m:1"
+    # -----------------------------
+    # Build MIN/MAX config from the same source
+    # -----------------------------
+    cfg = build_slot_config(src_df) if src_df is not None else pd.DataFrame()
+
+    # -----------------------------
+    # Cascade merge: slot → drawer_root → device+med
+    # -----------------------------
+    if not cfg.empty:
+        # 1) Strict slot match
+        m = df_pends.merge(
+            cfg.rename(columns={"qty_min":"min_qty","qty_max":"max_qty"}),
+            on=["device_base","med_id","drawer","pocket"],
+            how="left",
+            validate="m:1"
+        )
+
+        # 2) Fill misses by (device_base, med_id, drawer_root)
+        miss = m[["min_qty","max_qty"]].isna().all(axis=1)
+        if miss.any():
+            coarse_dr = (
+                cfg.rename(columns={"qty_min":"min_qty","qty_max":"max_qty"})
+                   .drop_duplicates(subset=["device_base","med_id","drawer_root"])
+                   [["device_base","med_id","drawer_root","min_qty","max_qty"]]
             )
-            # fallback device+med
-            miss = m1["min_qty"].isna() & m1["max_qty"].isna()
-            if miss.any():
-                coarse = (cfg.rename(columns={"qty_min":"min_qty","qty_max":"max_qty"})
-                            .drop_duplicates(subset=["device_base","med_id"])
-                            [["device_base","med_id","min_qty","max_qty"]])
-                m2 = (m1.loc[miss].drop(columns=["min_qty","max_qty"])
-                          .merge(coarse, on=["device_base","med_id"], how="left", validate="m:1"))
-                m1.loc[miss, ["min_qty","max_qty"]] = m2[["min_qty","max_qty"]].values
-
-            df_pends = m1
-
-        # coverage note
-        if "min_qty" in df_pends.columns and "max_qty" in df_pends.columns:
-            pct = df_pends[["min_qty","max_qty"]].notna().any(axis=1).mean() * 100
-            st.caption(f"Min/Max attached for {pct:.1f}% of pended rows.")
-
-        # show only what you care about (hide qty)
-        show_cols = [c for c in ["ts","device","med_id","drawer","pocket","min_qty","max_qty","username"] if c in df_pends.columns]
-        st.dataframe(df_pends.head(200)[show_cols], use_container_width=True, height=420)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Upsert pends to Postgres", type="primary"):
-                try:
-                    init_db(eng)
-                    ensure_pends_minmax_columns(eng)  # safe if already added
-                    n = upsert_pyxis_pends(eng, df_pends)
-                    st.success(f"Saved pends: {n:,} rows (upserted by PK).")
-                except Exception as e:
-                    st.error(f"Failed to save pended rows: {e}")
-        with c2:
-            st.download_button(
-                "Download parsed pends (CSV)",
-                data=df_pends.to_csv(index=False).encode("utf-8"),
-                file_name="pyxis_pends_parsed.csv",
-                mime="text/csv"
+            fill_dr = (
+                m.loc[miss, ["device_base","med_id","drawer_root"]]
+                  .merge(coarse_dr, on=["device_base","med_id","drawer_root"], how="left", validate="m:1")
             )
+            m.loc[miss, ["min_qty","max_qty"]] = fill_dr[["min_qty","max_qty"]].values
 
+        # 3) Fill remaining by (device_base, med_id)
+        miss = m[["min_qty","max_qty"]].isna().all(axis=1)
+        if miss.any():
+            coarse_dm = (
+                cfg.rename(columns={"qty_min":"min_qty","qty_max":"max_qty"})
+                   .drop_duplicates(subset=["device_base","med_id"])
+                   [["device_base","med_id","min_qty","max_qty"]]
+            )
+            fill_dm = (
+                m.loc[miss, ["device_base","med_id"]]
+                  .merge(coarse_dm, on=["device_base","med_id"], how="left", validate="m:1")
+            )
+            m.loc[miss, ["min_qty","max_qty"]] = fill_dm[["min_qty","max_qty"]].values
+
+        df_pends = m
+
+    # -----------------------------
+    # Coverage summary
+    # -----------------------------
+    if {"min_qty","max_qty"}.issubset(df_pends.columns):
+        coverage = df_pends[["min_qty","max_qty"]].notna().any(axis=1).mean() * 100.0
+        st.caption(f"Min/Max attached for **{coverage:.1f}%** of pended rows.")
+
+    # -----------------------------
+    # Show only what you care about (hide qty; include username)
+    # -----------------------------
+    show_cols = [c for c in ["ts","device","med_id","drawer","pocket","min_qty","max_qty","username"] if c in df_pends.columns]
+    st.dataframe(df_pends.head(200)[show_cols], use_container_width=True, height=420)
+
+    # -----------------------------
+    # Persist to Postgres
+    # -----------------------------
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Upsert pends to Postgres", type="primary"):
+            try:
+                init_db(eng)
+                # Make sure pyxis_pends has the min/max columns (safe if already exists)
+                ensure_pends_minmax_columns(eng)
+                n = upsert_pyxis_pends(eng, df_pends)
+                st.success(f"Saved pends: {n:,} rows (upserted by PK).")
+            except Exception as e:
+                st.error(f"Failed to save pended rows: {e}")
+    with c2:
+        st.download_button(
+            "Download parsed pends (CSV)",
+            data=df_pends[show_cols].to_csv(index=False).encode("utf-8"),
+            file_name="pyxis_pends_parsed.csv",
+            mime="text/csv"
+        )
