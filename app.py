@@ -60,6 +60,102 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
     return df
 
+# ---------- SIMPLE EXTRACTOR FOR DEVICE ACTIVITY LOG ----------
+
+A_MIN  = r"Inventory\s*Refill\s*Point\s*Min\s*Quantity"
+A_MAX  = r"Inventory\s*Par\s*Max\s*Quantity"
+A_STD  = r"Inventory\s*Standard\s*Stock"
+
+_RX_AFFECTED = re.compile(
+    r"""
+    ^(?P<device_prefix>[^\s]+)        # e.g., SJS11E_TWR (kept only if you want)
+    .*?
+    (?:Drw|Drawer|Dr)\s*(?P<drawer>[A-Za-z0-9\.]+)   # 1 or 2.1 or D3
+    [\-\s]*
+    (?:Pkt|Pocket)\s*(?P<pocket>[A-Za-z0-9\.]+)      # 5 or B1 etc.
+    \s*\(\s*(?P<med>[A-Za-z0-9._\-]+)\s*\)\s*
+    :\s*(?P<val>-?\d+(?:\.\d+)?)\s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+def _parse_affected(s: str):
+    s = "" if s is None else str(s).strip()
+    m = _RX_AFFECTED.search(s)
+    if not m:
+        # soft fallback so bad rows don’t crash
+        med_m = re.search(r"\(([^)]+)\)", s)
+        val_m = re.search(r":\s*(-?\d+(?:\.\d+)?)", s)
+        drw_m = re.search(r"(?:Drw|Drawer|Dr)\s*([A-Za-z0-9\.]+)", s, flags=re.I)
+        pkt_m = re.search(r"(?:Pkt|Pocket)\s*([A-Za-z0-9\.]+)", s, flags=re.I)
+        return (
+            (drw_m.group(1).upper() if drw_m else ""),
+            (pkt_m.group(1).upper() if pkt_m else ""),
+            (med_m.group(1).upper() if med_m else ""),
+            (float(val_m.group(1)) if val_m else None),
+        )
+    return (
+        m.group("drawer").strip().upper(),
+        m.group("pocket").strip().upper(),
+        m.group("med").strip().upper(),
+        float(m.group("val")),
+    )
+
+def build_simple_activity_view(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns the tidy view you asked for:
+    ['ts','device','drawer','pocket','med_id','qty','username','activity_type',
+     'is_min','is_max','is_standard_stock','min_qty','max_qty']
+    - For 'Inventory Refill Point Min Quantity'/'Par Max Quantity' rows, 'qty'
+      is the threshold value and also copied to min_qty/max_qty respectively.
+    """
+    need = {"Device","AffectedElement","TransactionDateTime","UserName","ActivityType"}
+    if not need.issubset(df.columns):
+        missing = need - set(df.columns)
+        return pd.DataFrame(columns=[
+            "ts","device","drawer","pocket","med_id","qty","username","activity_type",
+            "is_min","is_max","is_standard_stock","min_qty","max_qty"
+        ])
+
+    out = df[list(need)].copy()
+
+    # rename & dtypes
+    out = out.rename(columns={
+        "Device":"device",
+        "AffectedElement":"affected",
+        "TransactionDateTime":"ts",
+        "UserName":"username",
+        "ActivityType":"activity_type",
+    })
+    out["ts"] = pd.to_datetime(out["ts"], errors="coerce")
+    out["username"] = out["username"].astype(str).str.strip()
+    out["device"] = out["device"].astype(str).str.strip()
+    out["activity_type"] = out["activity_type"].astype(str).str.strip()
+
+    # parse affected element into drawer/pocket/med_id/qty
+    parsed = out["affected"].apply(_parse_affected)
+    out[["drawer","pocket","med_id","qty"]] = pd.DataFrame(parsed.tolist(), index=out.index)
+    out.drop(columns=["affected"], inplace=True)
+
+    # flags + min/max copy
+    out["is_min"]  = out["activity_type"].str.contains(A_MIN, case=False, na=False)
+    out["is_max"]  = out["activity_type"].str.contains(A_MAX, case=False, na=False)
+    out["is_standard_stock"] = out["activity_type"].str.contains(A_STD, case=False, na=False)
+
+    out["min_qty"] = np.where(out["is_min"], out["qty"], np.nan)
+    out["max_qty"] = np.where(out["is_max"], out["qty"], np.nan)
+
+    # cosmetics
+    out["drawer"] = out["drawer"].fillna("").astype(str).str.upper()
+    out["pocket"] = out["pocket"].fillna("").astype(str).str.upper()
+    out["med_id"] = out["med_id"].fillna("").astype(str).str.upper()
+
+    # order columns
+    cols = ["ts","device","drawer","pocket","med_id","qty","username","activity_type",
+            "is_min","is_max","is_standard_stock","min_qty","max_qty"]
+    return out[cols].sort_values("ts")
+
+
 def _device_base(s: str) -> str:
     s = "" if s is None else str(s).strip().upper()
     return s.split("_", 1)[0]  # SJS7ES_MAIN → SJS7ES
@@ -1910,192 +2006,26 @@ with tab10:
     build_load_unload_section(ev_time, colmap)
 
 with tab11:
-    st.subheader("Pended Loads (DeviceActivityLog-style)")
+    st.subheader("Pended / Threshold Activity (simple view)")
 
-    # Columns required to parse DeviceActivityLog-style pends
-    required_cols = {"Device","ActivityType","Action","AffectedElement","TransactionDateTime"}
-    can_parse_from_current = required_cols.issubset(ev_time.columns)
-
-    pend_source = st.radio(
-        "Choose data source for pends",
-        ["Use current data (if compatible)", "Upload DeviceActivityLog"],
-        index=0 if can_parse_from_current else 1,
-        help="Pends require columns: Device, ActivityType, Action, AffectedElement, TransactionDateTime."
-    )
-
-    # We'll keep the source frame in src_df so we can also build min/max from it
-    df_pends = pd.DataFrame()
-    src_df   = None
-
-    if pend_source == "Use current data (if compatible)":
-        if not can_parse_from_current:
-            st.warning("Current data frame does not have the required columns for pends. Please upload.")
-        else:
-            src_df   = ev_time
-            df_pends = build_pyxis_pends_from_df(ev_time)
-    else:
-        up_pends = st.file_uploader(
-            "Upload DeviceActivityLog CSV (Pyxis Admin Extract)",
-            type=["csv"], accept_multiple_files=False, key="pend_csv_upl"
-        )
-        if up_pends is not None:
-            try:
-                tmp = load_upload(up_pends)  # robust CSV/encoding loader
-            except Exception:
-                up_pends.seek(0)
-                tmp = pd.read_csv(up_pends, encoding="latin-1", low_memory=False)
-            tmp     = dedupe_columns(tmp)
-            src_df  = tmp
-            df_pends = build_pyxis_pends_from_df(tmp)
-
-    # If no pends found, stop here
-    if df_pends.empty:
-        st.info("No pended rows detected for the chosen source.")
+    up = st.file_uploader("Upload DeviceActivityLog CSV", type=["csv","xlsx"])
+    if not up:
+        st.info("Upload your DeviceActivityLog and I’ll show the parsed view.")
         st.stop()
 
-    # -----------------------------
-    # Normalize keys on the pends side
-    # -----------------------------
-    df_pends["device_base"] = df_pends["device"].map(_device_base)
-    df_pends["med_id"]      = df_pends["med_id"].map(_norm_med)
-    df_pends["drawer"]      = df_pends["drawer"].map(_norm_slot_str)
-    df_pends["pocket"]      = df_pends["pocket"].map(_norm_slot_str)
-    df_pends["drawer_root"] = df_pends["drawer"].map(_drawer_root)
+    raw = pd.read_excel(up) if up.name.lower().endswith(".xlsx") else pd.read_csv(up, low_memory=False)
+    raw = dedupe_columns(raw)
 
-    # -----------------------------
-    # Build MIN/MAX config from the same source
-    # -----------------------------
-    cfg = build_slot_config(src_df) if src_df is not None else pd.DataFrame()
+    view = build_simple_activity_view(raw)
+    if view.empty:
+        st.warning("No parsable rows found (check column names).")
+    else:
+        # exactly what you asked for, visible at a glance
+        st.dataframe(view.head(300), use_container_width=True, height=480)
 
-# --- DIAGNOSTICS: why did some rows miss min/max? ---
-def _cfg_keys(cfg):
-    slot = set(zip(cfg.get("device_base", pd.Series(dtype=str)),
-                   cfg.get("med_id", pd.Series(dtype=str)),
-                   cfg.get("drawer", pd.Series(dtype=str)),
-                   cfg.get("pocket", pd.Series(dtype=str))))
-    dr   = set(zip(cfg.get("device_base", pd.Series(dtype=str)),
-                   cfg.get("med_id", pd.Series(dtype=str)),
-                   cfg.get("drawer", pd.Series(dtype=str)).map(_drawer_root)))
-    dm   = set(zip(cfg.get("device_base", pd.Series(dtype=str)),
-                   cfg.get("med_id", pd.Series(dtype=str))))
-    return slot, dr, dm
-
-def _why_missing(df_pends, cfg):
-    if df_pends.empty:
-        return pd.DataFrame()
-    slot, dr, dm = _cfg_keys(cfg)
-    rows = []
-    for _, r in df_pends.iterrows():
-        db  = str(r.get("device_base",""))
-        mid = str(r.get("med_id",""))
-        drw = _norm_slot_str(r.get("drawer",""))
-        pkt = _norm_slot_str(r.get("pocket",""))
-        root = _drawer_root(drw)
-        have_slot = (db, mid, drw, pkt) in slot
-        have_dr   = (db, mid, root) in dr
-        have_dm   = (db, mid) in dm
-        rows.append({
-            "ts": r.get("ts"),
-            "device": r.get("device"),
-            "device_base": db,
-            "med_id": mid,
-            "drawer": drw,
-            "pocket": pkt,
-            "drawer_root": root,
-            "slot_match": have_slot,
-            "drawer_root_match": have_dr,
-            "device_med_match": have_dm
-        })
-    out = pd.DataFrame(rows)
-    miss = out.loc[~out["slot_match"] & ~out["drawer_root_match"] & ~out["device_med_match"]]
-    return out, miss
-
-if not cfg.empty:
-    diag_all, diag_miss = _why_missing(df_pends, cfg)
-    with st.expander("🔎 Min/Max match diagnostics", expanded=False):
-        st.caption("What key level would have matched for each pend row?")
-        st.dataframe(diag_all.head(200), use_container_width=True, height=300)
-        if not diag_miss.empty:
-            st.warning(f"{len(diag_miss)} rows had no match at any level. Showing a few:")
-            st.dataframe(diag_miss.head(50), use_container_width=True, height=240)
-
-    # -----------------------------
-    # Cascade merge: slot → drawer_root → device+med
-    # -----------------------------
-    if not cfg.empty:
-        # 1) Strict slot match
-        cfg_mm = cfg.rename(columns={"qty_min":"min_qty","qty_max":"max_qty"}) \
-           .drop(columns=["drawer_root"], errors="ignore")   # <— add this
-
-        m = df_pends.merge(
-        cfg_mm,
-        on=["device_base","med_id","drawer","pocket"],
-        how="left",
-        validate="m:1"
-        )
-
-
-        # 2) Fill misses by (device_base, med_id, drawer_root)
-        miss = m[["min_qty","max_qty"]].isna().all(axis=1)
-        if miss.any():
-            coarse_dr = (
-                cfg.rename(columns={"qty_min":"min_qty","qty_max":"max_qty"})
-                   .drop_duplicates(subset=["device_base","med_id","drawer_root"])
-                   [["device_base","med_id","drawer_root","min_qty","max_qty"]]
-            )
-            fill_dr = (
-                m.loc[miss, ["device_base","med_id","drawer_root"]]
-                  .merge(coarse_dr, on=["device_base","med_id","drawer_root"], how="left", validate="m:1")
-            )
-            m.loc[miss, ["min_qty","max_qty"]] = fill_dr[["min_qty","max_qty"]].values
-
-        # 3) Fill remaining by (device_base, med_id)
-        miss = m[["min_qty","max_qty"]].isna().all(axis=1)
-        if miss.any():
-            coarse_dm = (
-                cfg.rename(columns={"qty_min":"min_qty","qty_max":"max_qty"})
-                   .drop_duplicates(subset=["device_base","med_id"])
-                   [["device_base","med_id","min_qty","max_qty"]]
-            )
-            fill_dm = (
-                m.loc[miss, ["device_base","med_id"]]
-                  .merge(coarse_dm, on=["device_base","med_id"], how="left", validate="m:1")
-            )
-            m.loc[miss, ["min_qty","max_qty"]] = fill_dm[["min_qty","max_qty"]].values
-
-        df_pends = m
-
-    # -----------------------------
-    # Coverage summary
-    # -----------------------------
-    if {"min_qty","max_qty"}.issubset(df_pends.columns):
-        coverage = df_pends[["min_qty","max_qty"]].notna().any(axis=1).mean() * 100.0
-        st.caption(f"Min/Max attached for **{coverage:.1f}%** of pended rows.")
-
-    # -----------------------------
-    # Show only what you care about (hide qty; include username)
-    # -----------------------------
-    show_cols = [c for c in ["ts","device","med_id","drawer","pocket","min_qty","max_qty","username"] if c in df_pends.columns]
-    st.dataframe(df_pends.head(200)[show_cols], use_container_width=True, height=420)
-
-    # -----------------------------
-    # Persist to Postgres
-    # -----------------------------
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Upsert pends to Postgres", type="primary"):
-            try:
-                init_db(eng)
-                # Make sure pyxis_pends has the min/max columns (safe if already exists)
-                ensure_pends_minmax_columns(eng)
-                n = upsert_pyxis_pends(eng, df_pends)
-                st.success(f"Saved pends: {n:,} rows (upserted by PK).")
-            except Exception as e:
-                st.error(f"Failed to save pended rows: {e}")
-    with c2:
         st.download_button(
-            "Download parsed pends (CSV)",
-            data=df_pends[show_cols].to_csv(index=False).encode("utf-8"),
-            file_name="pyxis_pends_parsed.csv",
+            "Download parsed sheet (CSV)",
+            data=view.to_csv(index=False).encode("utf-8"),
+            file_name="device_activity_parsed.csv",
             mime="text/csv"
         )
