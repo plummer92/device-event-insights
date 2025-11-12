@@ -1469,6 +1469,22 @@ def init_db(eng):
         medid  TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS pyxis_activity_simple (
+        ts                TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+        device            TEXT NOT NULL,
+        drawer            TEXT NOT NULL,
+        pocket            TEXT NOT NULL,
+        med_id            TEXT NOT NULL,
+        username          TEXT,
+        min_qty           INTEGER,
+        max_qty           INTEGER,
+        is_min            BOOLEAN,
+        is_max            BOOLEAN,
+        is_standard_stock BOOLEAN,
+        PRIMARY KEY (ts, device, drawer, pocket, med_id)
+    );
+
+
     CREATE TABLE IF NOT EXISTS pyxis_pends (
         ts               TIMESTAMP WITHOUT TIME ZONE NOT NULL,
         device           TEXT NOT NULL,
