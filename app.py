@@ -105,8 +105,8 @@ def build_simple_activity_view(df: pd.DataFrame) -> pd.DataFrame:
     need = {"Device","AffectedElement","TransactionDateTime","UserName","ActivityType"}
     if not need.issubset(df.columns):
         return pd.DataFrame(columns=[
-            "ts","device","drawer","pocket","med_id","qty","username","activity_type",
-            "is_min","is_max","is_standard_stock","min_qty","max_qty"
+            "ts","device","drawer","pocket","med_id","username",
+            "min_qty","max_qty","is_min","is_max","is_standard_stock"
         ])
 
     out = df[list(need)].copy().rename(columns={
@@ -120,16 +120,17 @@ def build_simple_activity_view(df: pd.DataFrame) -> pd.DataFrame:
     out["username"] = out["username"].astype(str).str.strip()
     out["device"] = out["device"].astype(str).str.strip()
 
-    # --- drop ActivityType nulls / literal "nan"
-    mask_valid_act = out["activity_type"].notna() & (out["activity_type"].astype(str).str.lower().ne("nan"))
-    out = out.loc[mask_valid_act].copy()
+    # drop ActivityType NaN or literal "nan"
+    mask_valid = out["activity_type"].notna() & (out["activity_type"].astype(str).str.lower().ne("nan"))
+    out = out.loc[mask_valid].copy()
     out["activity_type"] = out["activity_type"].astype(str).str.strip()
 
-    # parse affected → drawer/pocket/med_id/qty
+    # parse AffectedElement (drawer, pocket, med_id, qty)
     parsed = out["affected"].apply(_parse_affected)
     out[["drawer","pocket","med_id","qty"]] = pd.DataFrame(parsed.tolist(), index=out.index)
     out.drop(columns=["affected"], inplace=True)
 
+    # identify min/max/standard stock types
     A_MIN  = r"Inventory\s*Refill\s*Point\s*Min\s*Quantity"
     A_MAX  = r"Inventory\s*Par\s*Max\s*Quantity"
     A_STD  = r"Inventory\s*Standard\s*Stock"
@@ -141,9 +142,34 @@ def build_simple_activity_view(df: pd.DataFrame) -> pd.DataFrame:
     out["min_qty"] = np.where(out["is_min"], out["qty"], np.nan)
     out["max_qty"] = np.where(out["is_max"], out["qty"], np.nan)
 
-    # normalize strings
+    # normalize
     for c in ("drawer","pocket","med_id"):
         out[c] = out[c].fillna("").astype(str).str.upper().str.strip()
+
+    # combine same timestamp+slot+med into one row
+    keys = ["ts","device","drawer","pocket","med_id"]
+    def _first(s):
+        s = s.dropna()
+        return s.iloc[0] if not s.empty else None
+
+    combined = (
+        out.groupby(keys, as_index=False)
+           .agg(
+               username=("username", _first),
+               min_qty=("min_qty", "max"),
+               max_qty=("max_qty", "max"),
+               is_min=("is_min", "any"),
+               is_max=("is_max", "any"),
+               is_standard_stock=("is_standard_stock", "any"),
+           )
+           .sort_values("ts")
+    )
+
+    # Final cleaned order (activity_type & qty dropped)
+    cols = ["ts","device","drawer","pocket","med_id","min_qty","max_qty","username",
+            "is_min","is_max","is_standard_stock"]
+    return combined[cols]
+
 
     # ---------- NEW: combine same timestamp+slot+med into one row ----------
     # Keys: same exact time, device, drawer, pocket, med
