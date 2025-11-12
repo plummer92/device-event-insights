@@ -102,25 +102,14 @@ def _parse_affected(s: str):
     )
 
 def build_simple_activity_view(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Returns the tidy view you asked for:
-    ['ts','device','drawer','pocket','med_id','qty','username','activity_type',
-     'is_min','is_max','is_standard_stock','min_qty','max_qty']
-    - For 'Inventory Refill Point Min Quantity'/'Par Max Quantity' rows, 'qty'
-      is the threshold value and also copied to min_qty/max_qty respectively.
-    """
     need = {"Device","AffectedElement","TransactionDateTime","UserName","ActivityType"}
     if not need.issubset(df.columns):
-        missing = need - set(df.columns)
         return pd.DataFrame(columns=[
             "ts","device","drawer","pocket","med_id","qty","username","activity_type",
             "is_min","is_max","is_standard_stock","min_qty","max_qty"
         ])
 
-    out = df[list(need)].copy()
-
-    # rename & dtypes
-    out = out.rename(columns={
+    out = df[list(need)].copy().rename(columns={
         "Device":"device",
         "AffectedElement":"affected",
         "TransactionDateTime":"ts",
@@ -130,14 +119,21 @@ def build_simple_activity_view(df: pd.DataFrame) -> pd.DataFrame:
     out["ts"] = pd.to_datetime(out["ts"], errors="coerce")
     out["username"] = out["username"].astype(str).str.strip()
     out["device"] = out["device"].astype(str).str.strip()
+
+    # --- drop ActivityType nulls / literal "nan"
+    mask_valid_act = out["activity_type"].notna() & (out["activity_type"].astype(str).str.lower().ne("nan"))
+    out = out.loc[mask_valid_act].copy()
     out["activity_type"] = out["activity_type"].astype(str).str.strip()
 
-    # parse affected element into drawer/pocket/med_id/qty
+    # parse affected → drawer/pocket/med_id/qty
     parsed = out["affected"].apply(_parse_affected)
     out[["drawer","pocket","med_id","qty"]] = pd.DataFrame(parsed.tolist(), index=out.index)
     out.drop(columns=["affected"], inplace=True)
 
-    # flags + min/max copy
+    A_MIN  = r"Inventory\s*Refill\s*Point\s*Min\s*Quantity"
+    A_MAX  = r"Inventory\s*Par\s*Max\s*Quantity"
+    A_STD  = r"Inventory\s*Standard\s*Stock"
+
     out["is_min"]  = out["activity_type"].str.contains(A_MIN, case=False, na=False)
     out["is_max"]  = out["activity_type"].str.contains(A_MAX, case=False, na=False)
     out["is_standard_stock"] = out["activity_type"].str.contains(A_STD, case=False, na=False)
@@ -145,15 +141,41 @@ def build_simple_activity_view(df: pd.DataFrame) -> pd.DataFrame:
     out["min_qty"] = np.where(out["is_min"], out["qty"], np.nan)
     out["max_qty"] = np.where(out["is_max"], out["qty"], np.nan)
 
-    # cosmetics
-    out["drawer"] = out["drawer"].fillna("").astype(str).str.upper()
-    out["pocket"] = out["pocket"].fillna("").astype(str).str.upper()
-    out["med_id"] = out["med_id"].fillna("").astype(str).str.upper()
+    # normalize strings
+    for c in ("drawer","pocket","med_id"):
+        out[c] = out[c].fillna("").astype(str).str.upper().str.strip()
 
-    # order columns
-    cols = ["ts","device","drawer","pocket","med_id","qty","username","activity_type",
-            "is_min","is_max","is_standard_stock","min_qty","max_qty"]
-    return out[cols].sort_values("ts")
+    # ---------- NEW: combine same timestamp+slot+med into one row ----------
+    # Keys: same exact time, device, drawer, pocket, med
+    keys = ["ts","device","drawer","pocket","med_id"]
+    def _first(s):
+        s = s.dropna()
+        return s.iloc[0] if not s.empty else None
+
+    combined = (
+        out.groupby(keys, as_index=False)
+           .agg(
+               username=("username", _first),
+               # keep either min or max qty when present, prefer the non-null (max over NaN works)
+               min_qty=("min_qty", "max"),
+               max_qty=("max_qty", "max"),
+               # if you still want to see the raw qty on single rows, keep the first:
+               qty=("qty", _first),
+               # roll up flags (any True → True)
+               is_min=("is_min", "any"),
+               is_max=("is_max", "any"),
+               is_standard_stock=("is_standard_stock", "any"),
+               # optional: keep a sample activity_type for reference
+               activity_type=("activity_type", _first),
+           )
+           .sort_values("ts")
+    )
+
+    # Final column order
+    cols = ["ts","device","drawer","pocket","med_id","min_qty","max_qty",
+            "qty","username","is_min","is_max","is_standard_stock","activity_type"]
+    return combined[cols]
+
 
 
 def _device_base(s: str) -> str:
