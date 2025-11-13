@@ -1508,156 +1508,234 @@ def build_load_unload_section(df: pd.DataFrame, colmap: Dict[str,str]):
 
 # ==== Load/Unload Insights END ====
 
-def build_refill_efficiency_section(ev_time: pd.DataFrame, data_f: pd.DataFrame, colmap: Dict[str, str]):
+def build_refill_efficiency_section(ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str, str]):
     """
-    Focused view just on refill transactions:
-      - Refill share of all events
-      - Per-tech refill workload + walk/dwell medians
-      - Per-device refill workload
-      - Weekly refill trend
-      - Refill heatmap (weekday × hour)
+    Refill-focused view + abuse watchlist.
+
+    - Only uses events where TransactionType contains 'refill'
+    - Per-tech + per-(device, med) stats
+    - Flags hyper-frequent, tiny refills as a 'watchlist'
     """
-    ts_col   = colmap["datetime"]
-    type_col = colmap["type"]
-    user_col = colmap["user"]
-    dev_col  = colmap["device"]
-
-    if data_f is None or data_f.empty:
-        st.info("No events in current filter.")
+    if ev is None or ev.empty:
+        st.info("No events available in this range.")
         return
 
-    if type_col not in data_f.columns:
-        st.info("No transaction type column available for refill analysis.")
+    ts_col  = colmap["datetime"]
+    dev_col = colmap["device"]
+    usr_col = colmap["user"]
+    typ_col = colmap["type"]
+
+    qty_col = colmap.get("qty")
+    med_col = None
+    if colmap.get("medid") and colmap["medid"] in ev.columns:
+        med_col = colmap["medid"]
+    elif colmap.get("desc") and colmap["desc"] in ev.columns:
+        med_col = colmap["desc"]
+
+    needed = [ts_col, dev_col, usr_col, typ_col]
+    if med_col:
+        needed.append(med_col)
+    if qty_col and qty_col in ev.columns:
+        needed.append(qty_col)
+
+    df = ev[needed].copy()
+    df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+    df = df.dropna(subset=[ts_col])
+    if df.empty:
+        st.info("No usable timestamps in this range.")
         return
 
-    # Identify refill events by TransactionType text
-    df = data_f.copy()
-    mask = df[type_col].astype(str).str.contains("refill", case=False, na=False)
-    ref = df[mask].copy()
-
-    if ref.empty:
-        st.info("No transactions with 'refill' in the type field in the current range/filters.")
+    # Refill-only
+    mask = df[typ_col].astype(str).str.contains("refill", case=False, na=False)
+    df = df[mask].copy()
+    if df.empty:
+        st.info("No transactions with 'refill' in the type field in this time range.")
         return
 
-    total_events_all = len(df)
-    total_refills    = len(ref)
-    refill_pct       = (total_refills / total_events_all * 100.0) if total_events_all else 0.0
+    # Normalize quantities
+    has_real_qty = bool(qty_col and qty_col in df.columns)
+    if has_real_qty:
+        df[qty_col] = pd.to_numeric(df[qty_col], errors="coerce")
+        df["qty_units"] = df[qty_col].fillna(1.0)
+    else:
+        df["qty_units"] = 1.0
 
-    n_refill_techs   = ref[user_col].nunique() if user_col in ref.columns else 0
-    n_refill_devices = ref[dev_col].nunique() if dev_col in ref.columns else 0
+    df = df.sort_values(ts_col)
 
-    st.markdown("#### Refill workload snapshot")
+    # Overall span (for per-day rates)
+    start_ts = df[ts_col].min()
+    end_ts   = df[ts_col].max()
+    days = max((end_ts - start_ts).days, 1)
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Refill events", f"{total_refills:,}")
-    m2.metric("Refill share of all events", f"{refill_pct:.1f}%")
-    m3.metric("Techs who performed refills", f"{n_refill_techs:,}")
-    m4.metric("Devices with refills", f"{n_refill_devices:,}")
+    total_refills = int(len(df))
+    total_units   = float(df["qty_units"].sum())
+    unique_techs  = df[usr_col].nunique()
+    unique_devs   = df[dev_col].nunique()
 
-    # ---- Per-tech refill efficiency ----
-    st.markdown("### Per-tech refill efficiency")
-
-    # Total events per tech (for share)
-    tot_by_user = (
-        df.groupby(user_col, observed=True)
-          .size()
-          .rename("total_events")
-          .reset_index()
-    )
-
-    tech = (
-        ref.groupby(user_col, observed=True)
-           .agg(
-               refill_events=(type_col, "count"),
-               median_walk_gap_s=("__walk_gap_s", "median"),
-               median_dwell_s=("__dwell_s", "median"),
-           )
-           .reset_index()
-    )
-
-    tech = tech.merge(tot_by_user, on=user_col, how="left")
-    tech["refill_pct_of_user"] = np.where(
-        tech["total_events"] > 0,
-        tech["refill_events"] / tech["total_events"] * 100.0,
-        np.nan,
-    )
-    tech["median_walk_gap_hms"] = tech["median_walk_gap_s"].map(fmt_hms)
-    tech["median_dwell_hms"]    = tech["median_dwell_s"].map(fmt_hms)
-
-    # Order by refill_events desc
-    tech = tech.sort_values("refill_events", ascending=False)
-
-    c_t1, c_t2 = st.columns([2, 1])
-
-    with c_t1:
-        st.dataframe(
-            tech[[user_col, "refill_events", "refill_pct_of_user",
-                  "median_walk_gap_hms", "median_dwell_hms"]],
-            use_container_width=True,
-            height=380,
-        )
-
-    with c_t2:
-        fig = px.bar(
-            tech.head(15),
-            x=user_col,
-            y="refill_events",
-            title="Top techs by refill count (current filters)",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Refill events", f"{total_refills:,}")
+    c2.metric("Refill units (approx.)", _fmt_int(total_units))
+    c3.metric("Techs refilling", f"{unique_techs:,}")
+    c4.metric("Devices touched", f"{unique_devs:,}")
 
     st.caption(
-        "Tip: high refill count + long median walk gaps usually means that tech is walking too far for refills."
+        f"Window: {start_ts:%Y-%m-%d %H:%M} → {end_ts:%Y-%m-%d %H:%M} "
+        f"({days} day{'s' if days != 1 else ''})"
     )
 
-    # ---- Per-device refill workload ----
-    st.markdown("### Devices that drive refills")
+    # ------------ Per-tech summary ------------
+    st.markdown("### Per-tech refill summary")
+    tech_df = (
+        df.groupby(usr_col, observed=True)
+          .agg(
+              refills=(typ_col, "size"),
+              devices=(dev_col, "nunique"),
+              units=("qty_units", "sum"),
+          )
+          .reset_index()
+          .sort_values("refills", ascending=False)
+    )
+    tech_df["refills_per_day"] = tech_df["refills"] / float(days)
+    try:
+        st.dataframe(
+            tech_df.style.format(
+                {
+                    "refills": "{:,.0f}",
+                    "devices": "{:,.0f}",
+                    "units": "{:,.0f}",
+                    "refills_per_day": "{:,.2f}",
+                }
+            ),
+            use_container_width=True,
+            height=300,
+        )
+    except Exception:
+        st.dataframe(tech_df, use_container_width=True, height=300)
 
-    dev = (
-        ref.groupby(dev_col, observed=True)
-           .agg(refill_events=(type_col, "count"))
-           .reset_index()
-           .sort_values("refill_events", ascending=False)
+    # ------------ Per-(device, med) detail + abuse watchlist ------------
+    st.markdown("### Refill patterns by device / med")
+
+    # Grouping key: device + optional med
+    group_cols = [dev_col]
+    label_cols = [dev_col]
+    if med_col:
+        group_cols.append(med_col)
+        label_cols.append(med_col)
+
+    # Compute intra-refill gaps (hours) within each (device, [med]) group
+    df["gap_h"] = (
+        df.groupby(group_cols)[ts_col]
+          .diff()
+          .dt.total_seconds()
+          .div(3600.0)
     )
 
-    c_d1, c_d2 = st.columns([2, 1])
+    combo = (
+        df.groupby(group_cols, observed=True)
+          .agg(
+              n_refills=(typ_col, "size"),
+              total_units=("qty_units", "sum"),
+              avg_units=("qty_units", "mean"),
+              median_gap_h=("gap_h", lambda s: float(np.nanmedian(s)) if s.notna().any() else np.nan),
+          )
+          .reset_index()
+    )
+    combo["refills_per_day"] = combo["n_refills"] / float(days)
 
-    with c_d1:
-        st.dataframe(dev, use_container_width=True, height=320)
+    # Nicer column names
+    rename_map = {
+        dev_col: "device",
+    }
+    if med_col:
+        rename_map[med_col] = "med"
+    combo = combo.rename(columns=rename_map)
 
-    with c_d2:
-        fig_dev = px.bar(
-            dev.head(15),
-            x=dev_col,
-            y="refill_events",
-            title="Top devices by refill count",
-        )
-        st.plotly_chart(fig_dev, use_container_width=True)
+    st.dataframe(
+        combo.sort_values("n_refills", ascending=False),
+        use_container_width=True,
+        height=320,
+    )
 
-    # ---- Trend + heatmap ----
-    st.markdown("### When do refills spike?")
+    # ------------ Refill Abuse Watchlist ------------
+    st.markdown("### Refill Abuse Watchlist 🧨")
 
-    c_tr1, c_tr2 = st.columns(2)
+    MIN_REFILLS = 5          # at least this many refills in the window
+    MAX_MEDIAN_GAP_H = 8.0   # median gap between refills ≤ 8 hours
+    MAX_AVG_UNITS = 3.0      # 'tiny top-ups' if we have real qty
 
-    # Weekly trend using existing helper (based on ev_time, not just filtered-for-UI)
-    ref_week = refill_trend(ev_time, colmap, freq="W-SUN")
-    if not ref_week.empty:
-        fig_rw = px.bar(
-            ref_week,
-            x="period",
-            y="refill_events",
-            title="Weekly refill count (full dataset within selected time range)",
-        )
-        c_tr1.plotly_chart(fig_rw, use_container_width=True)
+    if has_real_qty:
+        watch = combo[
+            (combo["n_refills"] >= MIN_REFILLS)
+            & (combo["median_gap_h"].notna())
+            & (combo["median_gap_h"] <= MAX_MEDIAN_GAP_H)
+            & (combo["avg_units"] <= MAX_AVG_UNITS)
+        ].copy()
     else:
-        c_tr1.info("No weekly refill data available for this range.")
+        # No real quantity; just use frequency + tight gaps
+        watch = combo[
+            (combo["n_refills"] >= MIN_REFILLS)
+            & (combo["median_gap_h"].notna())
+            & (combo["median_gap_h"] <= MAX_MEDIAN_GAP_H)
+        ].copy()
 
-    # Heatmap based on current filters (data_f subset)
-    if ts_col in ref.columns:
-        fig_hm = _refill_heatmap(ref, ts_col)
-        c_tr2.plotly_chart(fig_hm, use_container_width=True)
+    if watch.empty:
+        st.info(
+            "No (device, med) pairs look like obvious 'dribble refills' in this window "
+            f"(≥{MIN_REFILLS} refills with median gap ≤{MAX_MEDIAN_GAP_H:.0f}h)."
+        )
     else:
-        c_tr2.info("Timestamp column not available for refill heatmap.")
+        watch = watch.sort_values(["n_refills", "median_gap_h"], ascending=[False, True])
+
+        explain = (
+            f"Flagged if **n_refills ≥ {MIN_REFILLS}** and **median gap ≤ {MAX_MEDIAN_GAP_H:.0f} hours**"
+        )
+        if has_real_qty:
+            explain += f" and **avg_units ≤ {MAX_AVG_UNITS}**."
+
+        st.caption(explain)
+
+        show_cols = ["device"]
+        if "med" in watch.columns:
+            show_cols.append("med")
+        show_cols += ["n_refills", "refills_per_day", "avg_units", "median_gap_h", "total_units"]
+
+        try:
+            st.dataframe(
+                watch[show_cols].style.format(
+                    {
+                        "n_refills": "{:,.0f}",
+                        "refills_per_day": "{:,.2f}",
+                        "avg_units": "{:,.1f}",
+                        "median_gap_h": "{:,.1f}",
+                        "total_units": "{:,.0f}",
+                    }
+                ),
+                use_container_width=True,
+                height=320,
+            )
+        except Exception:
+            st.dataframe(watch[show_cols], use_container_width=True, height=320)
+
+    # ------------ Time-of-day view (refills only) ------------
+    st.markdown("### When do refills happen? (time of day)")
+    df["hour"] = df[ts_col].dt.hour
+    by_hour = (
+        df.groupby("hour", observed=True)
+          .agg(
+              refills=(typ_col, "size"),
+              units=("qty_units", "sum"),
+          )
+          .reset_index()
+          .sort_values("hour")
+    )
+    fig = px.bar(
+        by_hour,
+        x="hour",
+        y="refills",
+        title="Refills by hour of day",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
 
 
 
