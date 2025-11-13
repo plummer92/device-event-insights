@@ -2224,36 +2224,40 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.t
      "🚨 Outliers", "❓ Ask the data", "📥 Load/Unload", "💊 Refill Efficiency", "🧷 Pended Loads"]
 )
 
+# =================== TABS ===================
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs(
+    [
+        "📈 Overview",
+        "🚶 Delivery Analytics",
+        "🧑‍🔧 Tech Comparison",
+        "📦 Devices",
+        "⏱ Hourly",
+        "🧪 Drill-down",
+        "🔟 Weekly Top 10",
+        "🚨 Outliers",
+        "❓ Ask the data",
+        "📥 Load/Unload",
+        "💊 Refill Efficiency",
+        "🧷 Pended Loads",
+    ]
+)
 
-
-
+# ---------- TAB 1: OVERVIEW ----------
 with tab1:
     st.subheader("Overview")
-
-    # ---- Top-level metrics ----
-    total_events   = len(ev_time)
-    total_devices  = ev_time[colmap["device"]].nunique()
-    total_users    = ev_time[colmap["user"]].nunique()
-    total_types    = ev_time[colmap["type"]].nunique()
-
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Events",  f"{total_events:,}")
-    c2.metric("Devices", f"{total_devices:,}")
-    c3.metric("Users",   f"{total_users:,}")
-    c4.metric("Types",   f"{total_types:,}")
+    c1.metric("Events",  f"{len(ev_time):,}")
+    c2.metric("Devices", f"{ev_time[colmap['device']].nunique():,}")
+    c3.metric("Users",   f"{ev_time[colmap['user']].nunique():,}")
+    c4.metric("Types",   f"{ev_time[colmap['type']].nunique():,}")
 
-    # ---- Weekly volume (all transactions) ----
+    # Weekly events bar
     week_df = weekly_summary(ev_time, colmap)
     if not week_df.empty:
-        fig_week = px.bar(
-            week_df,
-            x="week",
-            y="events",
-            title="Weekly events (all transaction types)",
-        )
-        st.plotly_chart(fig_week, use_container_width=True)
+        fig = px.bar(week_df, x="week", y="events", title="Weekly events")
+        st.plotly_chart(fig, use_container_width=True)
 
-    # ---- Refill transaction comparison (weekly & monthly) ----
+    # Refill transaction comparison (weekly & monthly)
     ref_week = refill_trend(ev_time, colmap, freq="W-SUN")
     ref_month = refill_trend(ev_time, colmap, freq="M")
 
@@ -2263,7 +2267,7 @@ with tab1:
         else:
             c_rw, c_rm = st.columns(2)
 
-            # ---------- Weekly refill comparison ----------
+            # ---- Weekly comparison ----
             if not ref_week.empty:
                 fig_rw = px.bar(
                     ref_week,
@@ -2273,25 +2277,23 @@ with tab1:
                 )
                 c_rw.plotly_chart(fig_rw, use_container_width=True)
 
-                # Compare last week vs prior week (if we have at least 2 buckets)
+                # Last week vs prior week
                 if len(ref_week) >= 2:
                     last = ref_week.iloc[-1]
                     prev = ref_week.iloc[-2]
-
                     last_val = int(last["refill_events"])
                     prev_val = int(prev["refill_events"])
                     delta = last_val - prev_val
                     pct = (delta / prev_val * 100.0) if prev_val != 0 else None
-
                     delta_label = f"{delta:+,}" + (f" ({pct:+.1f}%)" if pct is not None else "")
 
                     c_rw.metric(
-                        "Last week vs prior week (refills)",
+                        "Last week vs prior week",
                         f"{last_val:,} refills",
                         delta=delta_label,
                     )
 
-            # ---------- Monthly refill comparison ----------
+            # ---- Monthly comparison ----
             if not ref_month.empty:
                 fig_rm = px.bar(
                     ref_month,
@@ -2301,13 +2303,12 @@ with tab1:
                 )
                 c_rm.plotly_chart(fig_rm, use_container_width=True)
 
-            # ---------- Weekly refill table (for export / detail) ----------
+            # Raw weekly table (easy export)
             if not ref_week.empty:
                 st.markdown("**Weekly refill table**")
                 st.dataframe(ref_week, use_container_width=True)
 
-
-
+# ---------- TAB 2: DELIVERY ANALYTICS ----------
 with tab2:
     st.subheader("Delivery Analytics (per-tech sequences)")
     c1, c2 = st.columns(2)
@@ -2316,7 +2317,10 @@ with tab2:
     if not hg.empty:
         fig = px.histogram(hg, nbins=40, title="Walking/Travel gaps (seconds)")
         c1.plotly_chart(fig, use_container_width=True)
-        c1.caption("X-axis = seconds between finishing a device and starting the next (≥ min & ≤ max; device changed).")
+        c1.caption(
+            "X-axis = seconds between finishing a device and starting the next "
+            "(≥ min & ≤ max; device changed)."
+        )
 
     dw = data_f.loc[~data_f["__device_change"], "__gap_s"].dropna()
     if not dw.empty:
@@ -2325,23 +2329,40 @@ with tab2:
 
     st.markdown("**Tip:** Use the *Drill-down* tab to inspect rows behind any long gaps.")
 
+# ---------- TAB 3: TECH COMPARISON ----------
 with tab3:
     st.subheader("Tech comparison")
     st.dataframe(tech_stats_f, use_container_width=True)
     if not tech_stats.empty:
-        # If you want a bar of median walk, recompute from data_f:
-        med_walk = data_f.groupby(colmap["user"], observed=True)["__walk_gap_s"].median().reset_index()
-        med_walk = med_walk.rename(columns={"__walk_gap_s":"median_walk_gap_s"}).fillna(0)
-        fig = px.bar(med_walk, x=colmap["user"], y="median_walk_gap_s", title="Median walk gap by tech (s)")
+        # Bar of median walk, recomputed from data_f:
+        med_walk = (
+            data_f.groupby(colmap["user"], observed=True)["__walk_gap_s"]
+            .median()
+            .reset_index()
+        )
+        med_walk = med_walk.rename(columns={"__walk_gap_s": "median_walk_gap_s"}).fillna(0)
+        fig = px.bar(
+            med_walk,
+            x=colmap["user"],
+            y="median_walk_gap_s",
+            title="Median walk gap by tech (s)",
+        )
         st.plotly_chart(fig, use_container_width=True)
 
+# ---------- TAB 4: DEVICES ----------
 with tab4:
     st.subheader("Devices")
     st.dataframe(device_stats_f, use_container_width=True)
     if not device_stats_f.empty:
-        fig = px.bar(device_stats_f.head(25), x=colmap["device"], y="events", title="Top devices by event volume")
+        fig = px.bar(
+            device_stats_f.head(25),
+            x=colmap["device"],
+            y="events",
+            title="Top devices by event volume",
+        )
         st.plotly_chart(fig, use_container_width=True)
 
+# ---------- TAB 5: HOURLY ----------
 with tab5:
     st.subheader("Hourly cadence")
     st.dataframe(hourly_f, use_container_width=True)
@@ -2349,15 +2370,25 @@ with tab5:
         fig = px.line(hourly_f, x="hour", y="events", markers=True, title="Events by hour")
         st.plotly_chart(fig, use_container_width=True)
 
+# ---------- TAB 6: DRILL-DOWN ----------
 with tab6:
     st.subheader("Drill-down (exportable)")
     show_cols = [
-        colmap["datetime"], colmap["user"], colmap["device"], colmap["type"],
-        "gap_hms", "walk_gap_hms", "dwell_hms", "visit_hms",
-        "__gap_s", "__walk_gap_s", "__dwell_s", "visit_duration_s",
+        colmap["datetime"],
+        colmap["user"],
+        colmap["device"],
+        colmap["type"],
+        "gap_hms",
+        "walk_gap_hms",
+        "dwell_hms",
+        "visit_hms",
+        "__gap_s",
+        "__walk_gap_s",
+        "__dwell_s",
+        "visit_duration_s",
         "__device_change",
     ]
-    for opt in ["desc","qty","medid"]:
+    for opt in ["desc", "qty", "medid"]:
         c = colmap.get(opt)
         if c and c in data_f.columns:
             show_cols.insert(4, c)  # keep details near the left
@@ -2370,7 +2401,7 @@ with tab6:
         "Download current drill-down as CSV",
         data=table.to_csv(index=False).encode("utf-8"),
         file_name="drilldown.csv",
-        mime="text/csv"
+        mime="text/csv",
     )
 
     st.markdown("### Per-visit summary (continuous time at a device)")
@@ -2380,9 +2411,10 @@ with tab6:
     st.dataframe(
         visit_show[[usr, dev, "start", "end", "visit_hms", "visit_duration_s"]],
         use_container_width=True,
-        height=360
+        height=360,
     )
 
+# ---------- TAB 7: WEEKLY TOP 10 ----------
 with tab7:
     st.subheader("Weekly Top 10 (signals)")
     digest = anomalies_top10(ev_all, data_f, colmap)
@@ -2391,97 +2423,86 @@ with tab7:
     else:
         st.dataframe(digest, use_container_width=True)
 
+# ---------- TAB 8: OUTLIERS ----------
 with tab8:
     st.subheader("Outliers")
-    ow = outliers_iqr(data_f.dropna(subset=["__walk_gap_s"]), colmap["user"], "__walk_gap_s", "Walk gap")
-    od = outliers_iqr(data_f.dropna(subset=["__dwell_s"]),    colmap["device"], "__dwell_s",    "Dwell")
+    ow = outliers_iqr(
+        data_f.dropna(subset=["__walk_gap_s"]),
+        colmap["user"],
+        "__walk_gap_s",
+        "Walk gap",
+    )
+    od = outliers_iqr(
+        data_f.dropna(subset=["__dwell_s"]),
+        colmap["device"],
+        "__dwell_s",
+        "Dwell",
+    )
     c1, c2 = st.columns(2)
     c1.write("By user (walk gap):")
     c1.dataframe(ow, use_container_width=True, height=320)
     c2.write("By device (dwell):")
     c2.dataframe(od, use_container_width=True, height=320)
 
+# ---------- TAB 9: ASK THE DATA ----------
 with tab9:
     st.subheader("Ask the data ❓")
-    q = st.text_input("Try e.g. 'top devices', 'longest dwell devices', 'median walk gap for Melissa', 'busiest hour'")
+    q = st.text_input(
+        "Try e.g. 'top devices', 'longest dwell devices', 'median walk gap for Melissa', 'busiest hour'"
+    )
     if q:
         ans, tbl = qa_answer(q, ev_time, data_f, colmap)
         st.write(ans)
         if not tbl.empty:
             st.dataframe(tbl, use_container_width=True)
+
+# ---------- TAB 10: LOAD / UNLOAD ----------
 with tab10:
     st.subheader("Load / Unload Insights")
     build_load_unload_section(ev_time, colmap)
 
+# ---------- TAB 11: REFILL EFFICIENCY ----------
 with tab11:
-    st.subheader("Pended / Threshold Activity (simple view)")
+    st.subheader("Refill Efficiency")
+    build_refill_efficiency_section(ev_time, data_f, colmap)
 
-    up = st.file_uploader("Upload DeviceActivityLog CSV", type=["csv","xlsx"])
-    if not up:
-        st.info("Upload your DeviceActivityLog and I’ll show the parsed view.")
-        st.stop()
-
-    raw = pd.read_excel(up) if up.name.lower().endswith(".xlsx") else pd.read_csv(up, low_memory=False)
-    raw = dedupe_columns(raw)
-
-    view = build_simple_activity_view(raw)
-    if view.empty:
-        st.warning("No parsable rows found (check column names).")
-    else:
-        st.dataframe(view.head(300), use_container_width=True, height=480)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("💾 Save parsed snapshot to Postgres", type="primary", key="save_simple"):
-                try:
-                    init_db(eng)  # ensures table exists
-                    n = upsert_activity_simple(eng, view)
-                    st.success(f"Saved {n:,} rows into pyxis_activity_simple (UPSERT).")
-                except Exception as e:
-                    st.error(f"Save failed: {e}")
-
-        with c2:
-            st.download_button(
-                "Download parsed sheet (CSV)",
-                data=view.to_csv(index=False).encode("utf-8"),
-                file_name="device_activity_parsed.csv",
-                mime="text/csv"
-            )
-
+# ---------- TAB 12: PENDED / THRESHOLD ACTIVITY ----------
 with tab12:
     st.subheader("Pended / Threshold Activity (simple view)")
 
-    up = st.file_uploader("Upload DeviceActivityLog CSV", type=["csv","xlsx"])
+    up = st.file_uploader("Upload DeviceActivityLog CSV", type=["csv", "xlsx"])
     if not up:
         st.info("Upload your DeviceActivityLog and I’ll show the parsed view.")
-        st.stop()
-
-    raw = pd.read_excel(up) if up.name.lower().endswith(".xlsx") else pd.read_csv(up, low_memory=False)
-    raw = dedupe_columns(raw)
-
-    view = build_simple_activity_view(raw)
-    if view.empty:
-        st.warning("No parsable rows found (check column names).")
     else:
-        st.dataframe(view.head(300), use_container_width=True, height=480)
+        raw = (
+            pd.read_excel(up)
+            if up.name.lower().endswith(".xlsx")
+            else pd.read_csv(up, low_memory=False)
+        )
+        raw = dedupe_columns(raw)
 
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("💾 Save parsed snapshot to Postgres", type="primary", key="save_simple"):
-                try:
-                    init_db(eng)  # ensures table exists
-                    n = upsert_activity_simple(eng, view)
-                    st.success(f"Saved {n:,} rows into pyxis_activity_simple (UPSERT).")
-                except Exception as e:
-                    st.error(f"Save failed: {e}")
+        view = build_simple_activity_view(raw)
+        if view.empty:
+            st.warning("No parsable rows found (check column names).")
+        else:
+            st.dataframe(view.head(300), use_container_width=True, height=480)
 
-        with c2:
-            st.download_button(
-                "Download parsed sheet (CSV)",
-                data=view.to_csv(index=False).encode("utf-8"),
-                file_name="device_activity_parsed.csv",
-                mime="text/csv"
-            )
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button(
+                    "💾 Save parsed snapshot to Postgres", type="primary", key="save_simple"
+                ):
+                    try:
+                        init_db(eng)  # ensures table exists
+                        n = upsert_activity_simple(eng, view)
+                        st.success(f"Saved {n:,} rows into pyxis_activity_simple (UPSERT).")
+                    except Exception as e:
+                        st.error(f"Save failed: {e}")
 
-
-
+            with c2:
+                st.download_button(
+                    "Download parsed sheet (CSV)",
+                    data=view.to_csv(index=False).encode("utf-8"),
+                    file_name="device_activity_parsed.csv",
+                    mime="text/csv",
+                )
