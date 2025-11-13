@@ -273,6 +273,50 @@ def weekly_summary(ev: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
     )
     return out
 
+
+def refill_trend(ev: pd.DataFrame, colmap: Dict[str, str], freq: str = "W-SUN") -> pd.DataFrame:
+    """
+    Build a refill-only time series so you can compare weeks/months.
+
+    freq:
+      - 'W-SUN' for weekly buckets
+      - 'M'     for calendar months
+    """
+    ts_col = colmap["datetime"]
+    typ_col = colmap["type"]
+
+    if ts_col not in ev.columns or typ_col not in ev.columns:
+        return pd.DataFrame(columns=["period", "refill_events"])
+
+    df = ev[[ts_col, typ_col]].copy()
+    df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+    df = df.dropna(subset=[ts_col])
+
+    # Only rows where TransactionType contains 'refill' (case-insensitive)
+    mask = df[typ_col].astype(str).str.contains("refill", case=False, na=False)
+    df = df[mask]
+    if df.empty:
+        return pd.DataFrame(columns=["period", "refill_events"])
+
+    # Period column depending on requested frequency
+    if freq.upper().startswith("W"):
+        df["period"] = df[ts_col].dt.to_period(freq).apply(lambda p: p.start_time.date())
+    elif freq.upper().startswith("M"):
+        # calendar months, as yyyy-mm-01 style date
+        df["period"] = df[ts_col].dt.to_period("M").dt.to_timestamp().dt.date
+    else:
+        df["period"] = df[ts_col].dt.date
+
+    out = (
+        df.groupby("period", observed=True)
+          .size()
+          .rename("refill_events")
+          .reset_index()
+          .sort_values("period")
+    )
+    return out
+
+
 def _non_empty_frames(frames: List[pd.DataFrame]) -> List[pd.DataFrame]:
     out = []
     for df in frames:
@@ -857,13 +901,24 @@ def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[
         t = ev.groupby(dev, observed=True).size().rename("events").reset_index().sort_values("events", ascending=False).head(10)
         return f"Top devices by event volume (showing {len(t)}):", t
 
-    if "longest" in q and "dwell" in q:
-        if data.empty:
+        if "longest" in q and "dwell" in q:
+            if data.empty:
+                return "No dwell data in current filter.", pd.DataFrame()
+
+        # Only rows where we stayed on the same device
+        sub = data.loc[~data["__device_change"], [dev, "__gap_s"]].copy()
+        sub["__gap_s"] = pd.to_numeric(sub["__gap_s"], errors="coerce")
+
+        if sub["__gap_s"].dropna().empty:
             return "No dwell data in current filter.", pd.DataFrame()
+
         t = (
-            data.loc[~data["__device_change"], ["__gap_s"]]
-                .groupby(data[dev], observed=True).median().rename(columns={"__gap_s":"median_dwell_s"})
-                .sort_values("median_dwell_s", descending=True if hasattr(pd, "NA") else False).head(10).reset_index()
+            sub.groupby(dev, observed=True)["__gap_s"]
+               .median()
+               .rename("median_dwell_s")
+               .reset_index()
+               .sort_values("median_dwell_s", ascending=False)
+               .head(10)
         )
         t["median_dwell_hms"] = t["median_dwell_s"].map(fmt_hms)
         return "Devices with longest median dwell:", t
@@ -1981,6 +2036,108 @@ with tab1:
     if not week_df.empty:
         fig = px.bar(week_df, x="week", y="events", title="Weekly events")
         st.plotly_chart(fig, use_container_width=True)
+
+    # Refill transaction comparison (weekly & monthly)
+    ref_week = refill_trend(ev_time, colmap, freq="W-SUN")
+    ref_month = refill_trend(ev_time, colmap, freq="M")
+
+    with st.expander("Refill volume vs other weeks/months", expanded=False):
+        if ref_week.empty and ref_month.empty:
+            st.info("No transactions with 'refill' in the type field in this time range.")
+        else:
+            c_rw, c_rm = st.columns(2)
+
+            # ---- Weekly comparison ----
+            if not ref_week.empty:
+                fig_rw = px.bar(
+                    ref_week,
+                    x="period",
+                    y="refill_events",
+                    title="Weekly refill count"
+                )
+                c_rw.plotly_chart(fig_rw, use_container_width=True)
+
+                # Last week vs prior week
+                if len(ref_week) >= 2:
+                    last = ref_week.iloc[-1]
+                    prev = ref_week.iloc[-2]
+                    last_val = int(last["refill_events"])
+                    prev_val = int(prev["refill_events"])
+                    delta = last_val - prev_val
+                    pct = (delta / prev_val * 100.0) if prev_val != 0 else None
+                    delta_label = f"{delta:+,}" + (f" ({pct:+.1f}%)" if pct is not None else "")
+
+                    c_rw.metric(
+                        "Last week vs prior week",
+                        f"{last_val:,} refills",
+                        delta=delta_label,
+                    )
+
+            # ---- Monthly comparison ----
+            if not ref_month.empty:
+                fig_rm = px.bar(
+                    ref_month,
+                    x="period",
+                    y="refill_events",
+                    title="Monthly refill count"
+                )
+                c_rm.plotly_chart(fig_rm, use_container_width=True)
+
+            # Raw weekly table (easy export)
+            if not ref_week.empty:
+                st.markdown("**Weekly refill table**")
+                st.dataframe(ref_week, use_container_width=True)
+    # Refill transaction comparison (weekly & monthly)
+    ref_week = refill_trend(ev_time, colmap, freq="W-SUN")
+    ref_month = refill_trend(ev_time, colmap, freq="M")
+
+    with st.expander("Refill volume vs other weeks/months", expanded=False):
+        if ref_week.empty and ref_month.empty:
+            st.info("No transactions with 'refill' in the type field in this time range.")
+        else:
+            c_rw, c_rm = st.columns(2)
+
+            # ---- Weekly comparison ----
+            if not ref_week.empty:
+                fig_rw = px.bar(
+                    ref_week,
+                    x="period",
+                    y="refill_events",
+                    title="Weekly refill count"
+                )
+                c_rw.plotly_chart(fig_rw, use_container_width=True)
+
+                # Last week vs prior week
+                if len(ref_week) >= 2:
+                    last = ref_week.iloc[-1]
+                    prev = ref_week.iloc[-2]
+                    last_val = int(last["refill_events"])
+                    prev_val = int(prev["refill_events"])
+                    delta = last_val - prev_val
+                    pct = (delta / prev_val * 100.0) if prev_val != 0 else None
+                    delta_label = f"{delta:+,}" + (f" ({pct:+.1f}%)" if pct is not None else "")
+
+                    c_rw.metric(
+                        "Last week vs prior week",
+                        f"{last_val:,} refills",
+                        delta=delta_label,
+                    )
+
+            # ---- Monthly comparison ----
+            if not ref_month.empty:
+                fig_rm = px.bar(
+                    ref_month,
+                    x="period",
+                    y="refill_events",
+                    title="Monthly refill count"
+                )
+                c_rm.plotly_chart(fig_rm, use_container_width=True)
+
+            # Raw weekly table (easy export)
+            if not ref_week.empty:
+                st.markdown("**Weekly refill table**")
+                st.dataframe(ref_week, use_container_width=True)
+
 
 with tab2:
     st.subheader("Delivery Analytics (per-tech sequences)")
