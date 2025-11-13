@@ -1685,7 +1685,7 @@ def ensure_indexes(eng, timeout_sec: int = 15):
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pends_dev_med ON pyxis_pends (device, med_id, ts DESC)',
         # thresholds
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_thresh_med    ON pyxis_thresholds (med_id)',
-        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_thresh_full   ON pyxis_thresholds (med_id, device, drawer, pocket)'
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_thresh_full   ON pyxis_thresholds (med_id, device, drawer, pocket)',
         # activity_simple
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pas_ts       ON pyxis_activity_simple (ts)',
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pas_device   ON pyxis_activity_simple (device)',
@@ -2100,25 +2100,25 @@ with tab11:
 
     view = build_simple_activity_view(raw)
     if view.empty:
-    st.warning("No parsable rows found (check column names).")
+        st.warning("No parsable rows found (check column names).")
     else:
-    st.dataframe(view.head(300), use_container_width=True, height=480)
+        st.dataframe(view.head(300), use_container_width=True, height=480)
 
-    c1, c2 = st.columns(2)
+        c1, c2 = st.columns(2)
         with c1:
             if st.button("💾 Save parsed snapshot to Postgres", type="primary", key="save_simple"):
                 try:
-                init_db(eng)  # ensures table exists
-                n = upsert_activity_simple(eng, view)
-                st.success(f"Saved {n:,} rows into pyxis_activity_simple (UPSERT).")
+                    init_db(eng)  # ensures table exists
+                    n = upsert_activity_simple(eng, view)
+                    st.success(f"Saved {n:,} rows into pyxis_activity_simple (UPSERT).")
                 except Exception as e:
-                st.error(f"Save failed: {e}")
+                    st.error(f"Save failed: {e}")
 
         with c2:
-        st.download_button(
-            "Download parsed sheet (CSV)",
-            data=view.to_csv(index=False).encode("utf-8"),
-            file_name="device_activity_parsed.csv",
-            mime="text/csv"
-        )
+            st.download_button(
+                "Download parsed sheet (CSV)",
+                data=view.to_csv(index=False).encode("utf-8"),
+                file_name="device_activity_parsed.csv",
+                mime="text/csv"
+            )
 
