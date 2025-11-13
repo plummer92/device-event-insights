@@ -2050,18 +2050,31 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(
 
 with tab1:
     st.subheader("Overview")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Events",  f"{len(ev_time):,}")
-    c2.metric("Devices", f"{ev_time[colmap['device']].nunique():,}")
-    c3.metric("Users",   f"{ev_time[colmap['user']].nunique():,}")
-    c4.metric("Types",   f"{ev_time[colmap['type']].nunique():,}")
 
+    # ---- Top-level metrics ----
+    total_events   = len(ev_time)
+    total_devices  = ev_time[colmap["device"]].nunique()
+    total_users    = ev_time[colmap["user"]].nunique()
+    total_types    = ev_time[colmap["type"]].nunique()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Events",  f"{total_events:,}")
+    c2.metric("Devices", f"{total_devices:,}")
+    c3.metric("Users",   f"{total_users:,}")
+    c4.metric("Types",   f"{total_types:,}")
+
+    # ---- Weekly volume (all transactions) ----
     week_df = weekly_summary(ev_time, colmap)
     if not week_df.empty:
-        fig = px.bar(week_df, x="week", y="events", title="Weekly events")
-        st.plotly_chart(fig, use_container_width=True)
+        fig_week = px.bar(
+            week_df,
+            x="week",
+            y="events",
+            title="Weekly events (all transaction types)",
+        )
+        st.plotly_chart(fig_week, use_container_width=True)
 
-       # Refill transaction comparison (weekly & monthly)
+    # ---- Refill transaction comparison (weekly & monthly) ----
     ref_week = refill_trend(ev_time, colmap, freq="W-SUN")
     ref_month = refill_trend(ev_time, colmap, freq="M")
 
@@ -2071,7 +2084,7 @@ with tab1:
         else:
             c_rw, c_rm = st.columns(2)
 
-            # ---- Weekly comparison ----
+            # ---------- Weekly refill comparison ----------
             if not ref_week.empty:
                 fig_rw = px.bar(
                     ref_week,
@@ -2081,30 +2094,25 @@ with tab1:
                 )
                 c_rw.plotly_chart(fig_rw, use_container_width=True)
 
-                # Last week vs prior week (count + % of all events)
+                # Compare last week vs prior week (if we have at least 2 buckets)
                 if len(ref_week) >= 2:
                     last = ref_week.iloc[-1]
                     prev = ref_week.iloc[-2]
 
-                    last_ref = int(last["refill_events"])
-                    prev_ref = int(prev["refill_events"])
-                    delta = last_ref - prev_ref
-                    pct_vs_prev = (delta / prev_ref * 100.0) if prev_ref != 0 else None
+                    last_val = int(last["refill_events"])
+                    prev_val = int(prev["refill_events"])
+                    delta = last_val - prev_val
+                    pct = (delta / prev_val * 100.0) if prev_val != 0 else None
 
-                    # % of all events that were refills last week
-                    last_share = float(last.get("refill_share", 0.0))
-                    share_label = f"{last_share:.1%} of all events"
-
-                    delta_label = f"{delta:+,}" + (f" ({pct_vs_prev:+.1f}%)" if pct_vs_prev is not None else "")
+                    delta_label = f"{delta:+,}" + (f" ({pct:+.1f}%)" if pct is not None else "")
 
                     c_rw.metric(
                         "Last week vs prior week (refills)",
-                        f"{last_ref:,} refills",
+                        f"{last_val:,} refills",
                         delta=delta_label,
                     )
-                    c_rw.caption(f"Last full week: {share_label}")
 
-            # ---- Monthly comparison ----
+            # ---------- Monthly refill comparison ----------
             if not ref_month.empty:
                 fig_rm = px.bar(
                     ref_month,
@@ -2114,100 +2122,11 @@ with tab1:
                 )
                 c_rm.plotly_chart(fig_rm, use_container_width=True)
 
-            # Raw weekly table (easy export)
-            if not ref_week.empty:
-                ref_disp = ref_week.copy()
-                ref_disp["refill_share"] = ref_disp["refill_share"].map(lambda x: f"{x:.1%}")
-                st.markdown("**Weekly refill table**")
-                st.dataframe(ref_disp, use_container_width=True)
-
-
-            # ---- Weekly comparison ----
-            if not ref_week.empty:
-                fig_rw = px.bar(
-                    ref_week,
-                    x="period",
-                    y="refill_events",
-                    title="Weekly refill count"
-                )
-                c_rw.plotly_chart(fig_rw, use_container_width=True)
-
-                # Last week vs prior week
-                if len(ref_week) >= 2:
-                    last = ref_week.iloc[-1]
-                    prev = ref_week.iloc[-2]
-                    last_val = int(last["refill_events"])
-                    prev_val = int(prev["refill_events"])
-                    delta = last_val - prev_val
-                    pct = (delta / prev_val * 100.0) if prev_val != 0 else None
-                    delta_label = f"{delta:+,}" + (f" ({pct:+.1f}%)" if pct is not None else "")
-
-                    c_rw.metric(
-                        "Last week vs prior week",
-                        f"{last_val:,} refills",
-                        delta=delta_label,
-                    )
-
-            # ---- Monthly comparison ----
-            if not ref_month.empty:
-                fig_rm = px.bar(
-                    ref_month,
-                    x="period",
-                    y="refill_events",
-                    title="Monthly refill count"
-                )
-                c_rm.plotly_chart(fig_rm, use_container_width=True)
-
-            # Raw weekly table (easy export)
+            # ---------- Weekly refill table (for export / detail) ----------
             if not ref_week.empty:
                 st.markdown("**Weekly refill table**")
                 st.dataframe(ref_week, use_container_width=True)
-  
-         if ref_week.empty and ref_month.empty:
-            st.info("No transactions with 'refill' in the type field in this time range.")
-        else:
-            c_rw, c_rm = st.columns(2)
 
-            # ---- Weekly comparison ----
-            if not ref_week.empty:
-                fig_rw = px.bar(
-                    ref_week,
-                    x="period",
-                    y="refill_events",
-                    title="Weekly refill count"
-                )
-                c_rw.plotly_chart(fig_rw, use_container_width=True)
-
-                # Last week vs prior week
-                if len(ref_week) >= 2:
-                    last = ref_week.iloc[-1]
-                    prev = ref_week.iloc[-2]
-                    last_val = int(last["refill_events"])
-                    prev_val = int(prev["refill_events"])
-                    delta = last_val - prev_val
-                    pct = (delta / prev_val * 100.0) if prev_val != 0 else None
-                    delta_label = f"{delta:+,}" + (f" ({pct:+.1f}%)" if pct is not None else "")
-
-                    c_rw.metric(
-                        "Last week vs prior week",
-                        f"{last_val:,} refills",
-                        delta=delta_label,
-                    )
-
-            # ---- Monthly comparison ----
-            if not ref_month.empty:
-                fig_rm = px.bar(
-                    ref_month,
-                    x="period",
-                    y="refill_events",
-                    title="Monthly refill count"
-                )
-                c_rm.plotly_chart(fig_rm, use_container_width=True)
-
-            # Raw weekly table (easy export)
-            if not ref_week.empty:
-                st.markdown("**Weekly refill table**")
-                st.dataframe(ref_week, use_container_width=True)
 
 
 with tab2:
