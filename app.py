@@ -2297,7 +2297,7 @@ st.success(f"Loaded {len(data_f):,} events for analysis.")
 
 
 # =================== TABS ===================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13 = st.tabs(
     [
         "📈 Overview",
         "🚶 Delivery Analytics",
@@ -2311,8 +2311,10 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.t
         "📥 Load/Unload",
         "💊 Refill Efficiency",
         "🧷 Pended Loads",
+        "🧩 Slot Config (DB)",
     ]
 )
+
 
 # ---------- TAB 1: OVERVIEW ----------
 with tab1:
@@ -2539,6 +2541,7 @@ with tab11:
     build_refill_efficiency_section(ev_time, data_f, colmap)
 
 # ---------- TAB 12: PENDED / THRESHOLD ACTIVITY ----------
+# ---------- TAB 12: PENDED / THRESHOLD ACTIVITY ----------
 with tab12:
     st.subheader("Pended / Threshold Activity (simple view)")
 
@@ -2578,3 +2581,133 @@ with tab12:
                     file_name="device_activity_parsed.csv",
                     mime="text/csv",
                 )
+
+# ---------- TAB 13: SLOT CONFIG (DB VIEW) ----------
+with tab13:
+    st.subheader("Slot Configuration from Database")
+
+    # 1) Current config (latest row per slot)
+    st.markdown("### 📌 Current Min/Max by Slot")
+
+    try:
+        init_db(eng)  # safe to call again
+
+        sql_current = """
+        WITH latest AS (
+          SELECT *,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY device, drawer, pocket, med_id
+                   ORDER BY ts DESC
+                 ) AS rn
+          FROM pyxis_activity_simple
+        )
+        SELECT
+            ts,
+            device,
+            drawer,
+            pocket,
+            med_id,
+            min_qty,
+            max_qty,
+            is_standard_stock,
+            username
+        FROM latest
+        WHERE rn = 1
+        ORDER BY device, drawer, pocket, med_id;
+        """
+
+        cfg = pd.read_sql(sql_current, eng)
+
+        if cfg.empty:
+            st.info("No rows found in pyxis_activity_simple yet. Upload some configs in the Pended Loads tab first.")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                dev_filter = st.multiselect(
+                    "Filter by device (optional)",
+                    sorted(cfg["device"].dropna().unique().tolist())
+                )
+            with c2:
+                med_filter = st.multiselect(
+                    "Filter by Med ID (optional)",
+                    sorted(cfg["med_id"].dropna().unique().tolist())
+                )
+
+            view_cfg = cfg.copy()
+            if dev_filter:
+                view_cfg = view_cfg[view_cfg["device"].isin(dev_filter)]
+            if med_filter:
+                view_cfg = view_cfg[view_cfg["med_id"].isin(med_filter)]
+
+            st.dataframe(
+                view_cfg,
+                use_container_width=True,
+                height=420,
+            )
+
+            st.download_button(
+                "Download current slot config as CSV",
+                data=view_cfg.to_csv(index=False).encode("utf-8"),
+                file_name="pyxis_slot_config_current.csv",
+                mime="text/csv",
+            )
+
+    except Exception as e:
+        st.error(f"Error loading slot config from database: {e}")
+
+    # 2) Bad configs (quick QA list)
+    st.markdown("### 🚨 Configs to Review")
+
+    try:
+        sql_bad = """
+        WITH cur AS (
+          SELECT *
+          FROM (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY device, drawer, pocket, med_id
+                     ORDER BY ts DESC
+                   ) AS rn
+            FROM pyxis_activity_simple
+          ) x
+          WHERE rn = 1
+        )
+        SELECT
+            ts,
+            device,
+            drawer,
+            pocket,
+            med_id,
+            min_qty,
+            max_qty,
+            is_standard_stock,
+            username
+        FROM cur
+        WHERE
+            -- min > max
+            (min_qty IS NOT NULL AND max_qty IS NOT NULL AND min_qty > max_qty)
+         OR -- negative or obviously bad values
+            (COALESCE(min_qty, 0) < 0 OR COALESCE(max_qty, 0) < 0)
+         OR -- standard stock but missing caps
+            (is_standard_stock IS TRUE AND (min_qty IS NULL OR max_qty IS NULL))
+        ORDER BY ts DESC, device, drawer, pocket, med_id;
+        """
+
+        bad = pd.read_sql(sql_bad, eng)
+
+        if bad.empty:
+            st.success("No obviously bad configs found based on these rules. 🎉")
+        else:
+            st.dataframe(
+                bad,
+                use_container_width=True,
+                height=320,
+            )
+            st.caption(
+                "These rows have min > max, negative values, or standard stock with missing min/max."
+            )
+
+    except Exception as e:
+        st.error(f"Error loading QA list: {e}")
+
+
