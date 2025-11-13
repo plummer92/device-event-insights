@@ -170,40 +170,6 @@ def build_simple_activity_view(df: pd.DataFrame) -> pd.DataFrame:
             "is_min","is_max","is_standard_stock"]
     return combined[cols]
 
-
-    # ---------- NEW: combine same timestamp+slot+med into one row ----------
-    # Keys: same exact time, device, drawer, pocket, med
-    keys = ["ts","device","drawer","pocket","med_id"]
-    def _first(s):
-        s = s.dropna()
-        return s.iloc[0] if not s.empty else None
-
-    combined = (
-        out.groupby(keys, as_index=False)
-           .agg(
-               username=("username", _first),
-               # keep either min or max qty when present, prefer the non-null (max over NaN works)
-               min_qty=("min_qty", "max"),
-               max_qty=("max_qty", "max"),
-               # if you still want to see the raw qty on single rows, keep the first:
-               qty=("qty", _first),
-               # roll up flags (any True → True)
-               is_min=("is_min", "any"),
-               is_max=("is_max", "any"),
-               is_standard_stock=("is_standard_stock", "any"),
-               # optional: keep a sample activity_type for reference
-               activity_type=("activity_type", _first),
-           )
-           .sort_values("ts")
-    )
-
-    # Final column order
-    cols = ["ts","device","drawer","pocket","med_id","min_qty","max_qty",
-            "qty","username","is_min","is_max","is_standard_stock","activity_type"]
-    return combined[cols]
-
-
-
 def _device_base(s: str) -> str:
     s = "" if s is None else str(s).strip().upper()
     return s.split("_", 1)[0]  # SJS7ES_MAIN → SJS7ES
@@ -1604,6 +1570,54 @@ def load_history_sql(colmap: Dict[str, str], eng) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+def upsert_activity_simple(eng, df_simple: pd.DataFrame) -> int:
+    """
+    UPSERT rows from build_simple_activity_view(df) into pyxis_activity_simple.
+    PK: (ts, device, drawer, pocket, med_id)
+    """
+    if df_simple is None or df_simple.empty:
+        return 0
+
+    df = df_simple.copy()
+
+    # Coerce/clean types expected by SQL
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    df = df.dropna(subset=["ts", "device", "drawer", "pocket", "med_id"])
+
+    for c in ("min_qty", "max_qty"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").round().astype("Int64")
+
+    # Shape rows for execute-many
+    rows = df[[
+        "ts","device","drawer","pocket","med_id",
+        "username","min_qty","max_qty","is_min","is_max","is_standard_stock"
+    ]].to_dict(orient="records")
+
+    sql = text("""
+        INSERT INTO pyxis_activity_simple
+          (ts, device, drawer, pocket, med_id,
+           username, min_qty, max_qty, is_min, is_max, is_standard_stock)
+        VALUES
+          (:ts, :device, :drawer, :pocket, :med_id,
+           :username, :min_qty, :max_qty, :is_min, :is_max, :is_standard_stock)
+        ON CONFLICT (ts, device, drawer, pocket, med_id)
+        DO UPDATE SET
+          username          = COALESCE(EXCLUDED.username, pyxis_activity_simple.username),
+          min_qty           = COALESCE(EXCLUDED.min_qty, pyxis_activity_simple.min_qty),
+          max_qty           = COALESCE(EXCLUDED.max_qty, pyxis_activity_simple.max_qty),
+          is_min            = COALESCE(EXCLUDED.is_min, pyxis_activity_simple.is_min),
+          is_max            = COALESCE(EXCLUDED.is_max, pyxis_activity_simple.is_max),
+          is_standard_stock = COALESCE(EXCLUDED.is_standard_stock, pyxis_activity_simple.is_standard_stock);
+    """)
+
+    with eng.begin() as con:
+        con.execute(text("SET LOCAL statement_timeout = '120s'"))
+        con.execute(sql, rows)
+
+    return len(rows)
+
+
 def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
     if df_pends is None or df_pends.empty:
         return 0
@@ -1672,7 +1686,11 @@ def ensure_indexes(eng, timeout_sec: int = 15):
         # thresholds
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_thresh_med    ON pyxis_thresholds (med_id)',
         'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_thresh_full   ON pyxis_thresholds (med_id, device, drawer, pocket)'
-    ]
+        # activity_simple
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pas_ts       ON pyxis_activity_simple (ts)',
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pas_device   ON pyxis_activity_simple (device)',
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pas_med      ON pyxis_activity_simple (med_id)',
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pas_slot     ON pyxis_activity_simple (device, drawer, pocket)',]
 
     with eng.connect().execution_options(isolation_level="AUTOCOMMIT") as con:
         try:
@@ -2082,14 +2100,25 @@ with tab11:
 
     view = build_simple_activity_view(raw)
     if view.empty:
-        st.warning("No parsable rows found (check column names).")
+    st.warning("No parsable rows found (check column names).")
     else:
-        # exactly what you asked for, visible at a glance
-        st.dataframe(view.head(300), use_container_width=True, height=480)
+    st.dataframe(view.head(300), use_container_width=True, height=480)
 
+    c1, c2 = st.columns(2)
+        with c1:
+            if st.button("💾 Save parsed snapshot to Postgres", type="primary", key="save_simple"):
+                try:
+                init_db(eng)  # ensures table exists
+                n = upsert_activity_simple(eng, view)
+                st.success(f"Saved {n:,} rows into pyxis_activity_simple (UPSERT).")
+                except Exception as e:
+                st.error(f"Save failed: {e}")
+
+        with c2:
         st.download_button(
             "Download parsed sheet (CSV)",
             data=view.to_csv(index=False).encode("utf-8"),
             file_name="device_activity_parsed.csv",
             mime="text/csv"
         )
+
