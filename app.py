@@ -276,45 +276,69 @@ def weekly_summary(ev: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
 
 def refill_trend(ev: pd.DataFrame, colmap: Dict[str, str], freq: str = "W-SUN") -> pd.DataFrame:
     """
-    Build a refill-only time series so you can compare weeks/months.
+    Build a refill-only time series and compare to total events in the same buckets.
 
-    freq:
-      - 'W-SUN' for weekly buckets
-      - 'M'     for calendar months
+    Returns columns:
+      - period (date)
+      - refill_events
+      - total_events
+      - refill_share (0–1 float)
     """
     ts_col = colmap["datetime"]
     typ_col = colmap["type"]
 
     if ts_col not in ev.columns or typ_col not in ev.columns:
-        return pd.DataFrame(columns=["period", "refill_events"])
+        return pd.DataFrame(columns=["period", "refill_events", "total_events", "refill_share"])
 
     df = ev[[ts_col, typ_col]].copy()
     df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
     df = df.dropna(subset=[ts_col])
-
-    # Only rows where TransactionType contains 'refill' (case-insensitive)
-    mask = df[typ_col].astype(str).str.contains("refill", case=False, na=False)
-    df = df[mask]
     if df.empty:
-        return pd.DataFrame(columns=["period", "refill_events"])
+        return pd.DataFrame(columns=["period", "refill_events", "total_events", "refill_share"])
 
-    # Period column depending on requested frequency
+    # Determine period bucket
     if freq.upper().startswith("W"):
         df["period"] = df[ts_col].dt.to_period(freq).apply(lambda p: p.start_time.date())
     elif freq.upper().startswith("M"):
-        # calendar months, as yyyy-mm-01 style date
         df["period"] = df[ts_col].dt.to_period("M").dt.to_timestamp().dt.date
     else:
         df["period"] = df[ts_col].dt.date
 
-    out = (
+    # Total events per period
+    total = (
         df.groupby("period", observed=True)
           .size()
-          .rename("refill_events")
+          .rename("total_events")
           .reset_index()
-          .sort_values("period")
     )
-    return out
+
+    # Refill-only events per period
+    mask_refill = df[typ_col].astype(str).str.contains("refill", case=False, na=False)
+    df_ref = df[mask_refill]
+    if df_ref.empty:
+        out = total.copy()
+        out["refill_events"] = 0
+        out["refill_share"] = 0.0
+        return out[["period", "refill_events", "total_events", "refill_share"]]
+
+    ref = (
+        df_ref.groupby("period", observed=True)
+             .size()
+             .rename("refill_events")
+             .reset_index()
+    )
+
+    out = total.merge(ref, on="period", how="left").fillna({"refill_events": 0})
+    out["refill_events"] = out["refill_events"].astype(int)
+    out["total_events"] = out["total_events"].astype(int)
+    out["refill_share"] = np.where(
+        out["total_events"] > 0,
+        out["refill_events"] / out["total_events"],
+        0.0,
+    )
+
+    return out.sort_values("period")
+
 
 
 def _non_empty_frames(frames: List[pd.DataFrame]) -> List[pd.DataFrame]:
@@ -2037,7 +2061,7 @@ with tab1:
         fig = px.bar(week_df, x="week", y="events", title="Weekly events")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Refill transaction comparison (weekly & monthly)
+       # Refill transaction comparison (weekly & monthly)
     ref_week = refill_trend(ev_time, colmap, freq="W-SUN")
     ref_month = refill_trend(ev_time, colmap, freq="M")
 
@@ -2046,6 +2070,57 @@ with tab1:
             st.info("No transactions with 'refill' in the type field in this time range.")
         else:
             c_rw, c_rm = st.columns(2)
+
+            # ---- Weekly comparison ----
+            if not ref_week.empty:
+                fig_rw = px.bar(
+                    ref_week,
+                    x="period",
+                    y="refill_events",
+                    title="Weekly refill count",
+                )
+                c_rw.plotly_chart(fig_rw, use_container_width=True)
+
+                # Last week vs prior week (count + % of all events)
+                if len(ref_week) >= 2:
+                    last = ref_week.iloc[-1]
+                    prev = ref_week.iloc[-2]
+
+                    last_ref = int(last["refill_events"])
+                    prev_ref = int(prev["refill_events"])
+                    delta = last_ref - prev_ref
+                    pct_vs_prev = (delta / prev_ref * 100.0) if prev_ref != 0 else None
+
+                    # % of all events that were refills last week
+                    last_share = float(last.get("refill_share", 0.0))
+                    share_label = f"{last_share:.1%} of all events"
+
+                    delta_label = f"{delta:+,}" + (f" ({pct_vs_prev:+.1f}%)" if pct_vs_prev is not None else "")
+
+                    c_rw.metric(
+                        "Last week vs prior week (refills)",
+                        f"{last_ref:,} refills",
+                        delta=delta_label,
+                    )
+                    c_rw.caption(f"Last full week: {share_label}")
+
+            # ---- Monthly comparison ----
+            if not ref_month.empty:
+                fig_rm = px.bar(
+                    ref_month,
+                    x="period",
+                    y="refill_events",
+                    title="Monthly refill count",
+                )
+                c_rm.plotly_chart(fig_rm, use_container_width=True)
+
+            # Raw weekly table (easy export)
+            if not ref_week.empty:
+                ref_disp = ref_week.copy()
+                ref_disp["refill_share"] = ref_disp["refill_share"].map(lambda x: f"{x:.1%}")
+                st.markdown("**Weekly refill table**")
+                st.dataframe(ref_disp, use_container_width=True)
+
 
             # ---- Weekly comparison ----
             if not ref_week.empty:
@@ -2087,12 +2162,8 @@ with tab1:
             if not ref_week.empty:
                 st.markdown("**Weekly refill table**")
                 st.dataframe(ref_week, use_container_width=True)
-    # Refill transaction comparison (weekly & monthly)
-    ref_week = refill_trend(ev_time, colmap, freq="W-SUN")
-    ref_month = refill_trend(ev_time, colmap, freq="M")
-
-    with st.expander("Refill volume vs other weeks/months", expanded=False):
-        if ref_week.empty and ref_month.empty:
+  
+         if ref_week.empty and ref_month.empty:
             st.info("No transactions with 'refill' in the type field in this time range.")
         else:
             c_rw, c_rm = st.columns(2)
