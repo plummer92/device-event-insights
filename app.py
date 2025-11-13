@@ -1089,6 +1089,32 @@ def _heatmap_by_hour_weekday(g: pd.DataFrame):
     p["weekday"] = pd.Categorical(p["weekday"], categories=order, ordered=True)
     mat = p.pivot(index="weekday", columns="hour", values="qty_signed").reindex(order)
     return px.imshow(mat, aspect="auto", title="Avg Signed Qty by Hour × Weekday (loads=+, unloads=−)")
+
+def _refill_heatmap(ref: pd.DataFrame, ts_col: str):
+    """
+    Simple count-based heatmap: how many refill events by weekday × hour.
+    """
+    if ref is None or ref.empty or ts_col not in ref.columns:
+        return px.imshow([[0]], title="No refill data")
+
+    df = ref[[ts_col]].copy()
+    df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+    df = df.dropna(subset=[ts_col])
+    if df.empty:
+        return px.imshow([[0]], title="No refill data")
+
+    df["weekday"] = df[ts_col].dt.day_name()
+    df["hour"] = df[ts_col].dt.hour
+
+    order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    grp = df.groupby(["weekday","hour"]).size().reset_index(name="refills")
+    grp["weekday"] = pd.Categorical(grp["weekday"], categories=order, ordered=True)
+
+    mat = grp.pivot(index="weekday", columns="hour", values="refills").reindex(order)
+    mat = mat.fillna(0)
+
+    return px.imshow(mat, aspect="auto", title="Refills by Hour × Weekday")
+
 def _by_device(g: pd.DataFrame) -> pd.DataFrame:
     base = (g.groupby(["device","dir"]).agg(events=("events","sum"), qty=("qty_signed","sum")).reset_index())
     pv = (base.pivot_table(index="device", columns="dir", values="qty", aggfunc="sum", fill_value=0)
@@ -1481,6 +1507,158 @@ def build_load_unload_section(df: pd.DataFrame, colmap: Dict[str,str]):
             st.plotly_chart(_plot_med_timeseries(daily_view, med_ts), use_container_width=True)
 
 # ==== Load/Unload Insights END ====
+
+def build_refill_efficiency_section(ev_time: pd.DataFrame, data_f: pd.DataFrame, colmap: Dict[str, str]):
+    """
+    Focused view just on refill transactions:
+      - Refill share of all events
+      - Per-tech refill workload + walk/dwell medians
+      - Per-device refill workload
+      - Weekly refill trend
+      - Refill heatmap (weekday × hour)
+    """
+    ts_col   = colmap["datetime"]
+    type_col = colmap["type"]
+    user_col = colmap["user"]
+    dev_col  = colmap["device"]
+
+    if data_f is None or data_f.empty:
+        st.info("No events in current filter.")
+        return
+
+    if type_col not in data_f.columns:
+        st.info("No transaction type column available for refill analysis.")
+        return
+
+    # Identify refill events by TransactionType text
+    df = data_f.copy()
+    mask = df[type_col].astype(str).str.contains("refill", case=False, na=False)
+    ref = df[mask].copy()
+
+    if ref.empty:
+        st.info("No transactions with 'refill' in the type field in the current range/filters.")
+        return
+
+    total_events_all = len(df)
+    total_refills    = len(ref)
+    refill_pct       = (total_refills / total_events_all * 100.0) if total_events_all else 0.0
+
+    n_refill_techs   = ref[user_col].nunique() if user_col in ref.columns else 0
+    n_refill_devices = ref[dev_col].nunique() if dev_col in ref.columns else 0
+
+    st.markdown("#### Refill workload snapshot")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Refill events", f"{total_refills:,}")
+    m2.metric("Refill share of all events", f"{refill_pct:.1f}%")
+    m3.metric("Techs who performed refills", f"{n_refill_techs:,}")
+    m4.metric("Devices with refills", f"{n_refill_devices:,}")
+
+    # ---- Per-tech refill efficiency ----
+    st.markdown("### Per-tech refill efficiency")
+
+    # Total events per tech (for share)
+    tot_by_user = (
+        df.groupby(user_col, observed=True)
+          .size()
+          .rename("total_events")
+          .reset_index()
+    )
+
+    tech = (
+        ref.groupby(user_col, observed=True)
+           .agg(
+               refill_events=(type_col, "count"),
+               median_walk_gap_s=("__walk_gap_s", "median"),
+               median_dwell_s=("__dwell_s", "median"),
+           )
+           .reset_index()
+    )
+
+    tech = tech.merge(tot_by_user, on=user_col, how="left")
+    tech["refill_pct_of_user"] = np.where(
+        tech["total_events"] > 0,
+        tech["refill_events"] / tech["total_events"] * 100.0,
+        np.nan,
+    )
+    tech["median_walk_gap_hms"] = tech["median_walk_gap_s"].map(fmt_hms)
+    tech["median_dwell_hms"]    = tech["median_dwell_s"].map(fmt_hms)
+
+    # Order by refill_events desc
+    tech = tech.sort_values("refill_events", ascending=False)
+
+    c_t1, c_t2 = st.columns([2, 1])
+
+    with c_t1:
+        st.dataframe(
+            tech[[user_col, "refill_events", "refill_pct_of_user",
+                  "median_walk_gap_hms", "median_dwell_hms"]],
+            use_container_width=True,
+            height=380,
+        )
+
+    with c_t2:
+        fig = px.bar(
+            tech.head(15),
+            x=user_col,
+            y="refill_events",
+            title="Top techs by refill count (current filters)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        "Tip: high refill count + long median walk gaps usually means that tech is walking too far for refills."
+    )
+
+    # ---- Per-device refill workload ----
+    st.markdown("### Devices that drive refills")
+
+    dev = (
+        ref.groupby(dev_col, observed=True)
+           .agg(refill_events=(type_col, "count"))
+           .reset_index()
+           .sort_values("refill_events", ascending=False)
+    )
+
+    c_d1, c_d2 = st.columns([2, 1])
+
+    with c_d1:
+        st.dataframe(dev, use_container_width=True, height=320)
+
+    with c_d2:
+        fig_dev = px.bar(
+            dev.head(15),
+            x=dev_col,
+            y="refill_events",
+            title="Top devices by refill count",
+        )
+        st.plotly_chart(fig_dev, use_container_width=True)
+
+    # ---- Trend + heatmap ----
+    st.markdown("### When do refills spike?")
+
+    c_tr1, c_tr2 = st.columns(2)
+
+    # Weekly trend using existing helper (based on ev_time, not just filtered-for-UI)
+    ref_week = refill_trend(ev_time, colmap, freq="W-SUN")
+    if not ref_week.empty:
+        fig_rw = px.bar(
+            ref_week,
+            x="period",
+            y="refill_events",
+            title="Weekly refill count (full dataset within selected time range)",
+        )
+        c_tr1.plotly_chart(fig_rw, use_container_width=True)
+    else:
+        c_tr1.info("No weekly refill data available for this range.")
+
+    # Heatmap based on current filters (data_f subset)
+    if ts_col in ref.columns:
+        fig_hm = _refill_heatmap(ref, ts_col)
+        c_tr2.plotly_chart(fig_hm, use_container_width=True)
+    else:
+        c_tr2.info("Timestamp column not available for refill heatmap.")
+
 
 
 # ------------------------- PERSISTENCE (POSTGRES via Supabase) ----------------------
@@ -2040,11 +2218,12 @@ run_stats_f    = run_stats[run_stats[colmap["user"]].isin(data_f[colmap["user"]]
 st.success(f"Loaded {len(data_f):,} events for analysis.")
 
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs(
     ["📈 Overview", "🚶 Delivery Analytics", "🧑‍🔧 Tech Comparison",
      "📦 Devices", "⏱ Hourly", "🧪 Drill-down", "🔟 Weekly Top 10",
-     "🚨 Outliers", "❓ Ask the data", "📥 Load/Unload", "🧷 Pended Loads"]
+     "🚨 Outliers", "❓ Ask the data", "📥 Load/Unload", "💊 Refill Efficiency", "🧷 Pended Loads"]
 )
+
 
 
 
@@ -2268,4 +2447,41 @@ with tab11:
                 file_name="device_activity_parsed.csv",
                 mime="text/csv"
             )
+
+with tab12:
+    st.subheader("Pended / Threshold Activity (simple view)")
+
+    up = st.file_uploader("Upload DeviceActivityLog CSV", type=["csv","xlsx"])
+    if not up:
+        st.info("Upload your DeviceActivityLog and I’ll show the parsed view.")
+        st.stop()
+
+    raw = pd.read_excel(up) if up.name.lower().endswith(".xlsx") else pd.read_csv(up, low_memory=False)
+    raw = dedupe_columns(raw)
+
+    view = build_simple_activity_view(raw)
+    if view.empty:
+        st.warning("No parsable rows found (check column names).")
+    else:
+        st.dataframe(view.head(300), use_container_width=True, height=480)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("💾 Save parsed snapshot to Postgres", type="primary", key="save_simple"):
+                try:
+                    init_db(eng)  # ensures table exists
+                    n = upsert_activity_simple(eng, view)
+                    st.success(f"Saved {n:,} rows into pyxis_activity_simple (UPSERT).")
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
+
+        with c2:
+            st.download_button(
+                "Download parsed sheet (CSV)",
+                data=view.to_csv(index=False).encode("utf-8"),
+                file_name="device_activity_parsed.csv",
+                mime="text/csv"
+            )
+
+
 
