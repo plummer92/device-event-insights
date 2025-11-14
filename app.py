@@ -747,6 +747,9 @@ def build_delivery_analytics(
         how="left",
         validate="m:1",
     )
+        # use visit duration as a per-row dwell metric (seconds)
+    data["dwell_sec"] = data["visit_duration_s"].fillna(0)
+
 
     # device stats
     device_counts = data.groupby(dev, observed=True).size().rename("events")
@@ -836,15 +839,16 @@ def build_refill_audit(df_in: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFr
 
     # Adjust to match your actual refill transaction strings
     REFILL_TYPES = {
-        "REFILL",
-        "REFILL-LOAD",
-        "REFILL LOAD",
-        "LOAD",
-        "REFILL RETURN",
+    "REFILL",
+    "REFILL-LOAD",
+    "REFILL LOAD",
+    "LOAD",
+    "REFILL RETURN",
     }
 
     df_refill = df[df["type"].isin(REFILL_TYPES)].copy()
     df_refill = df_refill[df_refill["dwell_sec"] > 0]
+
 
     if df_refill.empty:
         return pd.DataFrame(
