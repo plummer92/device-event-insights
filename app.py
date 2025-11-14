@@ -799,34 +799,32 @@ def build_delivery_analytics(
 
     return data, device_stats, tech_stats, run_stats, hourly, visit
 
-def build_refill_audit(ev_time: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
+def build_refill_audit(df_in: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
     """
-    Per-user refill audit metrics:
-    - refill_count
-    - median/avg dwell_sec
-    - risk_score (high volume + low dwell)
+    Per-user refill audit metrics, using the dataframe that HAS dwell_sec
+    (in your case, this is likely data_f from delivery analytics).
+
+    Returns:
+        user, refill_count, median_dwell_sec, avg_dwell_sec, risk_score
     """
-    if ev_time is None or ev_time.empty:
+    if df_in is None or df_in.empty:
         return pd.DataFrame(
             columns=["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
         )
 
-    # Map your actual column names via colmap
+    df = df_in.copy()
+
+    # Map your actual names
     user_col = colmap.get("user", "UserName")
     type_col = colmap.get("type", "TransactionType")
 
-    df = ev_time.copy()
-
-    # We assume dwell time is in 'dwell_sec' – if your column is named
-    # differently, change this line:
+    # We assume dwell is in 'dwell_sec' in data_f – change here if named differently
     dwell_col = "dwell_sec"
     if dwell_col not in df.columns:
-        # Nothing to do if we don't have dwell
         return pd.DataFrame(
             columns=["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
         )
 
-    # Normalize for internal use
     df = df.rename(
         columns={
             user_col: "user",
@@ -836,7 +834,7 @@ def build_refill_audit(ev_time: pd.DataFrame, colmap: Dict[str, str]) -> pd.Data
         errors="ignore",
     )
 
-    # Define what counts as REFILL – adjust to your TransactionType values
+    # Adjust to match your actual refill transaction strings
     REFILL_TYPES = {
         "REFILL",
         "REFILL-LOAD",
@@ -853,7 +851,6 @@ def build_refill_audit(ev_time: pd.DataFrame, colmap: Dict[str, str]) -> pd.Data
             columns=["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
         )
 
-    # Aggregate per user
     per_user = (
         df_refill
         .groupby("user", as_index=False)
@@ -864,22 +861,20 @@ def build_refill_audit(ev_time: pd.DataFrame, colmap: Dict[str, str]) -> pd.Data
         )
     )
 
-    # Build a combined risk score: high volume + low dwell
-
-    # Volume 0–1
+    # Volume score 0–1
     max_refills = per_user["refill_count"].max()
     if max_refills == 0:
         max_refills = 1
     per_user["volume_score"] = per_user["refill_count"] / max_refills
 
-    # Speed 0–1 (fast = short dwell)
+    # Speed score 0–1 (fast = short dwell)
     max_median = per_user["median_dwell_sec"].max()
     if max_median == 0:
         max_median = 1
     per_user["speed_score"] = (max_median - per_user["median_dwell_sec"]) / max_median
     per_user["speed_score"] = per_user["speed_score"].clip(lower=0)
 
-    # Weighted combo → 0–100
+    # Combined risk 0–100
     per_user["risk_score"] = (
         0.6 * per_user["speed_score"] + 0.4 * per_user["volume_score"]
     ) * 100
@@ -2636,7 +2631,9 @@ with tab11:
     st.markdown("---")
     st.subheader("Refill Audit – High Volume & Short Dwell")
 
-    refill_audit = build_refill_audit(ev_time, colmap)
+    # ✅ use data_f, which has dwell_sec
+    refill_audit = build_refill_audit(data_f, colmap)
+
 
     if refill_audit.empty:
         st.info("No refill dwell-time data available for this period.")
