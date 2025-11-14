@@ -170,6 +170,99 @@ def build_simple_activity_view(df: pd.DataFrame) -> pd.DataFrame:
             "is_min","is_max","is_standard_stock"]
     return combined[cols]
 
+def build_refill_audit(ev_time: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
+    """
+    Per-user refill audit metrics:
+    - refill_count
+    - median/avg dwell_sec
+    - risk_score (high volume + low dwell)
+    """
+    if ev_time is None or ev_time.empty:
+        return pd.DataFrame(
+            columns=["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
+        )
+
+    # Map your actual column names via colmap
+    user_col = colmap.get("user", "UserName")
+    type_col = colmap.get("type", "TransactionType")
+
+    df = ev_time.copy()
+
+    # We assume dwell time is in 'dwell_sec' – if your column is named
+    # differently, change this line:
+    dwell_col = "dwell_sec"
+    if dwell_col not in df.columns:
+        # Nothing to do if we don't have dwell
+        return pd.DataFrame(
+            columns=["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
+        )
+
+    # Normalize for internal use
+    df = df.rename(
+        columns={
+            user_col: "user",
+            type_col: "type",
+            dwell_col: "dwell_sec",
+        },
+        errors="ignore",
+    )
+
+    # Define what counts as REFILL – adjust to your TransactionType values
+    REFILL_TYPES = {
+        "REFILL",
+        "REFILL-LOAD",
+        "REFILL LOAD",
+        "LOAD",
+        "REFILL RETURN",
+    }
+
+    df_refill = df[df["type"].isin(REFILL_TYPES)].copy()
+    df_refill = df_refill[df_refill["dwell_sec"] > 0]
+
+    if df_refill.empty:
+        return pd.DataFrame(
+            columns=["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
+        )
+
+    # Aggregate per user
+    per_user = (
+        df_refill
+        .groupby("user", as_index=False)
+        .agg(
+            refill_count=("type", "size"),
+            median_dwell_sec=("dwell_sec", "median"),
+            avg_dwell_sec=("dwell_sec", "mean"),
+        )
+    )
+
+    # Build a combined risk score: high volume + low dwell
+
+    # Volume 0–1
+    max_refills = per_user["refill_count"].max()
+    if max_refills == 0:
+        max_refills = 1
+    per_user["volume_score"] = per_user["refill_count"] / max_refills
+
+    # Speed 0–1 (fast = short dwell)
+    max_median = per_user["median_dwell_sec"].max()
+    if max_median == 0:
+        max_median = 1
+    per_user["speed_score"] = (max_median - per_user["median_dwell_sec"]) / max_median
+    per_user["speed_score"] = per_user["speed_score"].clip(lower=0)
+
+    # Weighted combo → 0–100
+    per_user["risk_score"] = (
+        0.6 * per_user["speed_score"] + 0.4 * per_user["volume_score"]
+    ) * 100
+    per_user["risk_score"] = per_user["risk_score"].round(0).astype(int)
+
+    per_user = per_user.sort_values("risk_score", ascending=False)
+
+    return per_user[
+        ["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
+    ]
+
+
 def _device_base(s: str) -> str:
     s = "" if s is None else str(s).strip().upper()
     return s.split("_", 1)[0]  # SJS7ES_MAIN → SJS7ES
@@ -2539,6 +2632,104 @@ with tab10:
 with tab11:
     st.subheader("Refill Efficiency")
     build_refill_efficiency_section(ev_time, data_f, colmap)
+
+    st.markdown("---")
+    st.subheader("Refill Audit – High Volume & Short Dwell")
+
+    refill_audit = build_refill_audit(ev_time, colmap)
+
+    if refill_audit.empty:
+        st.info("No refill dwell-time data available for this period.")
+    else:
+        # Threshold controls
+        c1, c2 = st.columns(2)
+
+        with c1:
+            min_refills = st.slider(
+                "Minimum refills in selected period",
+                min_value=int(refill_audit["refill_count"].min()),
+                max_value=int(refill_audit["refill_count"].max()),
+                value=int(refill_audit["refill_count"].quantile(0.5)),  # default ~median
+                step=1,
+            )
+
+        with c2:
+            max_median_dwell = st.slider(
+                "Max median dwell (seconds)",
+                min_value=int(refill_audit["median_dwell_sec"].min()),
+                max_value=int(refill_audit["median_dwell_sec"].max()),
+                value=int(refill_audit["median_dwell_sec"].quantile(0.25)),  # fast quartile
+                step=5,
+            )
+
+        # Filter likely “rushing” users
+        candidates = refill_audit[
+            (refill_audit["refill_count"] >= min_refills)
+            & (refill_audit["median_dwell_sec"] <= max_median_dwell)
+        ].copy()
+
+        st.markdown("### 📋 Audit candidates")
+        st.dataframe(
+            candidates,
+            use_container_width=True,
+        )
+
+        # Drill-down to “what they refilled”
+        if not candidates.empty:
+            st.markdown("### 🔍 Drill-down: refills to audit")
+
+            user_col = colmap.get("user", "UserName")
+            type_col = colmap.get("type", "TransactionType")
+            dt_col = colmap.get("datetime", "TransactionDateTime")
+            device_col = colmap.get("device", "Device")
+            desc_col = colmap.get("desc", "MedDescription")
+            qty_col = colmap.get("qty", "Quantity")
+            medid_col = colmap.get("medid", "MedID")
+
+            selected_user = st.selectbox(
+                "Choose a colleague to review",
+                options=candidates["user"].tolist(),
+            )
+
+            REFILL_TYPES = {
+                "REFILL",
+                "REFILL-LOAD",
+                "REFILL LOAD",
+                "LOAD",
+                "REFILL RETURN",
+            }
+
+            df_user = ev_time.copy()
+
+            # Filter to this user's refill transactions
+            df_user = df_user[
+                (df_user[user_col] == selected_user)
+                & (df_user[type_col].isin(REFILL_TYPES))
+            ].copy()
+
+            # Sort newest first if datetime present
+            if dt_col in df_user.columns:
+                df_user = df_user.sort_values(dt_col, ascending=False)
+
+            dwell_col = "dwell_sec" if "dwell_sec" in df_user.columns else None
+
+            cols_to_show = [
+                c for c in [
+                    dt_col,
+                    device_col,
+                    medid_col,
+                    desc_col,
+                    qty_col,
+                    dwell_col,
+                ]
+                if c is not None and c in df_user.columns
+            ]
+
+            st.dataframe(
+                df_user[cols_to_show],
+                use_container_width=True,
+            )
+
 
 # ---------- TAB 12: PENDED / THRESHOLD ACTIVITY ----------
 # ---------- TAB 12: PENDED / THRESHOLD ACTIVITY ----------
