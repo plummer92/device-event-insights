@@ -170,99 +170,6 @@ def build_simple_activity_view(df: pd.DataFrame) -> pd.DataFrame:
             "is_min","is_max","is_standard_stock"]
     return combined[cols]
 
-def build_refill_audit(ev_time: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
-    """
-    Per-user refill audit metrics:
-    - refill_count
-    - median/avg dwell_sec
-    - risk_score (high volume + low dwell)
-    """
-    if ev_time is None or ev_time.empty:
-        return pd.DataFrame(
-            columns=["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
-        )
-
-    # Map your actual column names via colmap
-    user_col = colmap.get("user", "UserName")
-    type_col = colmap.get("type", "TransactionType")
-
-    df = ev_time.copy()
-
-    # We assume dwell time is in 'dwell_sec' – if your column is named
-    # differently, change this line:
-    dwell_col = "dwell_sec"
-    if dwell_col not in df.columns:
-        # Nothing to do if we don't have dwell
-        return pd.DataFrame(
-            columns=["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
-        )
-
-    # Normalize for internal use
-    df = df.rename(
-        columns={
-            user_col: "user",
-            type_col: "type",
-            dwell_col: "dwell_sec",
-        },
-        errors="ignore",
-    )
-
-    # Define what counts as REFILL – adjust to your TransactionType values
-    REFILL_TYPES = {
-        "REFILL",
-        "REFILL-LOAD",
-        "REFILL LOAD",
-        "LOAD",
-        "REFILL RETURN",
-    }
-
-    df_refill = df[df["type"].isin(REFILL_TYPES)].copy()
-    df_refill = df_refill[df_refill["dwell_sec"] > 0]
-
-    if df_refill.empty:
-        return pd.DataFrame(
-            columns=["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
-        )
-
-    # Aggregate per user
-    per_user = (
-        df_refill
-        .groupby("user", as_index=False)
-        .agg(
-            refill_count=("type", "size"),
-            median_dwell_sec=("dwell_sec", "median"),
-            avg_dwell_sec=("dwell_sec", "mean"),
-        )
-    )
-
-    # Build a combined risk score: high volume + low dwell
-
-    # Volume 0–1
-    max_refills = per_user["refill_count"].max()
-    if max_refills == 0:
-        max_refills = 1
-    per_user["volume_score"] = per_user["refill_count"] / max_refills
-
-    # Speed 0–1 (fast = short dwell)
-    max_median = per_user["median_dwell_sec"].max()
-    if max_median == 0:
-        max_median = 1
-    per_user["speed_score"] = (max_median - per_user["median_dwell_sec"]) / max_median
-    per_user["speed_score"] = per_user["speed_score"].clip(lower=0)
-
-    # Weighted combo → 0–100
-    per_user["risk_score"] = (
-        0.6 * per_user["speed_score"] + 0.4 * per_user["volume_score"]
-    ) * 100
-    per_user["risk_score"] = per_user["risk_score"].round(0).astype(int)
-
-    per_user = per_user.sort_values("risk_score", ascending=False)
-
-    return per_user[
-        ["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
-    ]
-
-
 def _device_base(s: str) -> str:
     s = "" if s is None else str(s).strip().upper()
     return s.split("_", 1)[0]  # SJS7ES_MAIN → SJS7ES
@@ -891,6 +798,99 @@ def build_delivery_analytics(
     )
 
     return data, device_stats, tech_stats, run_stats, hourly, visit
+
+def build_refill_audit(ev_time: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
+    """
+    Per-user refill audit metrics:
+    - refill_count
+    - median/avg dwell_sec
+    - risk_score (high volume + low dwell)
+    """
+    if ev_time is None or ev_time.empty:
+        return pd.DataFrame(
+            columns=["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
+        )
+
+    # Map your actual column names via colmap
+    user_col = colmap.get("user", "UserName")
+    type_col = colmap.get("type", "TransactionType")
+
+    df = ev_time.copy()
+
+    # We assume dwell time is in 'dwell_sec' – if your column is named
+    # differently, change this line:
+    dwell_col = "dwell_sec"
+    if dwell_col not in df.columns:
+        # Nothing to do if we don't have dwell
+        return pd.DataFrame(
+            columns=["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
+        )
+
+    # Normalize for internal use
+    df = df.rename(
+        columns={
+            user_col: "user",
+            type_col: "type",
+            dwell_col: "dwell_sec",
+        },
+        errors="ignore",
+    )
+
+    # Define what counts as REFILL – adjust to your TransactionType values
+    REFILL_TYPES = {
+        "REFILL",
+        "REFILL-LOAD",
+        "REFILL LOAD",
+        "LOAD",
+        "REFILL RETURN",
+    }
+
+    df_refill = df[df["type"].isin(REFILL_TYPES)].copy()
+    df_refill = df_refill[df_refill["dwell_sec"] > 0]
+
+    if df_refill.empty:
+        return pd.DataFrame(
+            columns=["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
+        )
+
+    # Aggregate per user
+    per_user = (
+        df_refill
+        .groupby("user", as_index=False)
+        .agg(
+            refill_count=("type", "size"),
+            median_dwell_sec=("dwell_sec", "median"),
+            avg_dwell_sec=("dwell_sec", "mean"),
+        )
+    )
+
+    # Build a combined risk score: high volume + low dwell
+
+    # Volume 0–1
+    max_refills = per_user["refill_count"].max()
+    if max_refills == 0:
+        max_refills = 1
+    per_user["volume_score"] = per_user["refill_count"] / max_refills
+
+    # Speed 0–1 (fast = short dwell)
+    max_median = per_user["median_dwell_sec"].max()
+    if max_median == 0:
+        max_median = 1
+    per_user["speed_score"] = (max_median - per_user["median_dwell_sec"]) / max_median
+    per_user["speed_score"] = per_user["speed_score"].clip(lower=0)
+
+    # Weighted combo → 0–100
+    per_user["risk_score"] = (
+        0.6 * per_user["speed_score"] + 0.4 * per_user["volume_score"]
+    ) * 100
+    per_user["risk_score"] = per_user["risk_score"].round(0).astype(int)
+
+    per_user = per_user.sort_values("risk_score", ascending=False)
+
+    return per_user[
+        ["user", "refill_count", "median_dwell_sec", "avg_dwell_sec", "risk_score"]
+    ]
+
 
 def anomalies_top10(history: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> pd.DataFrame:
     ts, dev, usr, typ = colmap["datetime"], colmap["device"], colmap["user"], colmap["type"]
