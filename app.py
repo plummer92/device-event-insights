@@ -2536,9 +2536,12 @@ with tab5:
         fig = px.line(hourly_f, x="hour", y="events", markers=True, title="Events by hour")
         st.plotly_chart(fig, use_container_width=True)
 
-# ---------- TAB 6: DRILL-DOWN ----------
 with tab6:
     st.subheader("Drill-down (exportable)")
+
+    # -------------------------
+    # Build base drill-down table
+    # -------------------------
     show_cols = [
         colmap["datetime"],
         colmap["user"],
@@ -2561,6 +2564,25 @@ with tab6:
     show_cols = [c for c in show_cols if c in data_f.columns]
 
     table = data_f[show_cols].copy()
+
+    # -------------------------
+    # NEW: Med Description filter
+    # -------------------------
+    desc_col = colmap.get("desc")
+    if desc_col and desc_col in table.columns:
+        med_options = sorted(table[desc_col].dropna().unique())
+        selected_meds = st.multiselect(
+            "Filter by Medication Description",
+            options=med_options,
+            placeholder="Select one or more meds to include...",
+        )
+
+        if selected_meds:
+            table = table[table[desc_col].isin(selected_meds)]
+
+    # -------------------------
+    # Show filtered table + export
+    # -------------------------
     st.dataframe(table, use_container_width=True, height=520)
 
     st.download_button(
@@ -2570,6 +2592,9 @@ with tab6:
         mime="text/csv",
     )
 
+    # -------------------------
+    # Per-visit summary (unchanged)
+    # -------------------------
     st.markdown("### Per-visit summary (continuous time at a device)")
     ts, dev, usr = colmap["datetime"], colmap["device"], colmap["user"]
     visit_show = visit_f[[usr, dev, "start", "end", "visit_duration_s"]].copy()
