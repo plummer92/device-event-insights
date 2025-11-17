@@ -2393,107 +2393,116 @@ if uploads:
         st.stop()
 
 # ============================ PROCESS UPLOADS ============================
-carousel_files: list[pd.DataFrame] = []
+carousel_files = []
+new_files = []
 
 if uploads:
-    new_files = []  # event files only
 
     for up in uploads:
         name_upper = up.name.upper()
 
-       raw = load_upload(up)
-
-# If the file contains a TransactionType column with Pyxis-style events
-has_pyxis_columns = any(
-    col.lower() in raw.columns.str.lower().tolist() 
-    for col in [colmap["datetime"], colmap["device"], colmap["type"]]
-)
-
-# If the file contains Carousel columns
-has_carousel_columns = "PriorityCode" in raw.columns or "StationName" in raw.columns
-
-# --------- CASE 1: Mixed file (Pyxis + Carousel)
-if has_pyxis_columns and has_carousel_columns:
-    # Split by PriorityCode (Carousel) vs Pyxis events
-    carousel_part = raw[raw.get("PriorityCode").notna()].copy()
-    pyxis_part = raw[raw.get("PriorityCode").isna()].copy()
-
-    if not carousel_part.empty:
-        cleaned_rc = preprocess_carousel_logistics(carousel_part)
-        carousel_files.append(cleaned_rc)
-
-    if not pyxis_part.empty:
-        cleaned_pyxis = base_clean(pyxis_part, colmap)
-        new_files.append(cleaned_pyxis)
-
-    continue
-
-# --------- CASE 2: Pure carousel file
-elif has_carousel_columns and not has_pyxis_columns:
-    cleaned_rc = preprocess_carousel_logistics(raw)
-    carousel_files.append(cleaned_rc)
-    continue
-
-# --------- CASE 3: Pure pyxis events
-elif has_pyxis_columns:
-    cleaned = base_clean(raw, colmap)
-    new_files.append(cleaned)
-    continue
-
-else:
-    st.warning(f"{up.name}: Could not classify file.")
-    continue
-
-
-        # --- Normal Pyxis event files (your existing path) ---
+        # Load raw file once
         try:
             raw = load_upload(up)
-            cleaned = base_clean(raw, colmap)
-            if cleaned.empty:
-                st.warning(f"{up.name}: no valid rows.")
-                continue
-            new_files.append(cleaned)
         except Exception as e:
             st.error(f"Failed to read {up.name}: {e}")
+            continue
 
+        # Normalize colnames for detection
+        raw_cols = [c.lower().strip() for c in raw.columns]
+
+        # Detect Pyxis columns
+        has_pyxis = (
+            colmap["datetime"].lower() in raw_cols
+            and colmap["device"].lower() in raw_cols
+            and colmap["type"].lower() in raw_cols
+        )
+
+        # Detect Carousel columns
+        has_carousel = (
+            "prioritycode" in raw_cols
+            or "stationname" in raw_cols
+            or "sourcesystem" in raw_cols
+        )
+
+        # -------------------------------------
+        # CASE 1: Mixed file (Pyxis + Carousel)
+        # -------------------------------------
+        if has_pyxis and has_carousel:
+            st.info(f"{up.name}: detected mixed Pyxis + Carousel file. Splitting…")
+
+            # Split by presence of PriorityCode
+            rc_part = raw[raw.get("PriorityCode").notna()] if "PriorityCode" in raw.columns else pd.DataFrame()
+            pyxis_part = raw[raw.get("PriorityCode").isna()] if "PriorityCode" in raw.columns else raw.copy()
+
+            # Clean Carousel part
+            if not rc_part.empty:
+                cleaned_rc = preprocess_carousel_logistics(rc_part)
+                carousel_files.append(cleaned_rc)
+
+            # Clean Pyxis part
+            if not pyxis_part.empty:
+                try:
+                    cleaned_pyxis = base_clean(pyxis_part, colmap)
+                    if not cleaned_pyxis.empty:
+                        new_files.append(cleaned_pyxis)
+                except Exception as e:
+                    st.error(f"{up.name}: Pyxis content could not be parsed: {e}")
+
+            continue
+
+        # -------------------------------------
+        # CASE 2: Pure carousel file
+        # -------------------------------------
+        if has_carousel and not has_pyxis:
+            st.info(f"{up.name}: treated as pure Carousel/Logistics file.")
+            cleaned_rc = preprocess_carousel_logistics(raw)
+            carousel_files.append(cleaned_rc)
+            continue
+
+        # -------------------------------------
+        # CASE 3: Pure pyxis event file
+        # -------------------------------------
+        if has_pyxis:
+            try:
+                cleaned = base_clean(raw, colmap)
+                if not cleaned.empty:
+                    new_files.append(cleaned)
+            except Exception as e:
+                st.error(f"{up.name}: Pyxis event parse error: {e}")
+            continue
+
+        # -------------------------------------
+        # CASE 4: Unrecognized
+        # -------------------------------------
+        st.warning(f"{up.name}: File not recognized as Pyxis or Carousel.")
+        continue
+
+    # -----------------------------------------
+    # STOP if no Pyxis event files were found
+    # -----------------------------------------
     if not new_files:
-        st.warning("No usable event files found.")
+        st.warning("No usable Pyxis event files found.")
         st.stop()
 
+    # -----------------------------------------
+    # MERGE new files into DB
+    # -----------------------------------------
     new_ev = pd.concat(new_files, ignore_index=True)
-
-    # Build pk for upload rows (needed for UPSERT)
     new_ev["pk"] = build_pk(new_ev, colmap)
     new_ev = new_ev.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
 
-    # ============================ MERGE & SAVE ============================
-    frames = []
-    if isinstance(history, pd.DataFrame) and not history.empty:
-        frames.append(history)
-    frames.append(new_ev)
-
+    frames = [history, new_ev] if not history.empty else [new_ev]
     ev_all = (
         pd.concat(frames, ignore_index=True)
-          .drop_duplicates(subset=["pk"])
-          .sort_values(colmap["datetime"])
+        .drop_duplicates(subset=["pk"])
+        .sort_values(colmap["datetime"])
     )
 
-    # Upload summary
     new_pks = set(new_ev["pk"])
-    old_pks = set(history["pk"]) if (isinstance(history, pd.DataFrame) and "pk" in history.columns) else set()
-    num_new = len(new_pks - old_pks)
-    num_dup = len(new_pks & old_pks)
-    earliest = pd.to_datetime(ev_all[colmap["datetime"]].min())
-    latest   = pd.to_datetime(ev_all[colmap["datetime"]].max())
+    old_pks = set(history["pk"]) if (not history.empty and "pk" in history.columns) else set()
+    to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
 
-    with st.expander("📥 Upload summary", expanded=True):
-        st.write(f"**Rows in this upload:** {len(new_ev):,}")
-        st.write(f"- New rows vs DB: **{num_new:,}**")
-        st.write(f"- Already existed (upserts): **{num_dup:,}**")
-        st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
-
-    # --- SAVE (uploads only): write only the delta ---
-    to_save = new_ev if not old_pks else new_ev[~new_ev["pk"].isin(old_pks)].copy()
     if to_save.empty:
         st.sidebar.info("No new rows to save.")
     else:
@@ -2501,19 +2510,12 @@ else:
         (st.sidebar.success if ok else st.sidebar.error)(msg)
 
 else:
-    # Database-only mode; analyze what’s already in Postgres
+    # Database-only mode
     ev_all = history.copy()
 
-# Build carousel_df (may be empty if no RC files uploaded)
-if carousel_files:
-    carousel_df = pd.concat(carousel_files, ignore_index=True)
-else:
-    carousel_df = pd.DataFrame()
+# Build carousel_df
+carousel_df = pd.concat(carousel_files, ignore_index=True) if carousel_files else pd.DataFrame()
 
-# Guard: stop early if nothing to analyze
-if not isinstance(ev_all, pd.DataFrame) or ev_all.empty:
-    st.warning("No events available yet. Upload files or verify your DB.")
-    st.stop()
 
 # =================== TIME RANGE FILTER ===================
 _min = pd.to_datetime(ev_all[colmap["datetime"]].min())
