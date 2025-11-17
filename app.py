@@ -111,7 +111,7 @@ def attach_carousel_pick_to_refills(
 
     df = data_f.copy()
 
-    # Only refill rows
+    # Only refill-like rows
     refills = df[df[type_col].str.contains("REFILL", case=False, na=False)].copy()
     if refills.empty:
         return df
@@ -121,9 +121,15 @@ def attach_carousel_pick_to_refills(
     if rc_picks.empty:
         return df
 
-    # Sort for merge_asof
-    refills = refills.sort_values([med_col, ts_col])
-    rc_picks = rc_picks.sort_values(["MedID", "TransactionDateTime"])
+    # Ensure datetime types
+    refills[ts_col] = pd.to_datetime(refills[ts_col], errors="coerce")
+    rc_picks["TransactionDateTime"] = pd.to_datetime(
+        rc_picks["TransactionDateTime"], errors="coerce"
+    )
+
+    # 🔑 merge_asof requirement: left_on / right_on must be sorted by time
+    refills = refills.sort_values(ts_col)
+    rc_picks = rc_picks.sort_values("TransactionDateTime")
 
     # Merge asof: nearest PRIOR pick for the same MedID
     merged = pd.merge_asof(
@@ -137,21 +143,39 @@ def attach_carousel_pick_to_refills(
         suffixes=("", "_rc"),
     )
 
-    # Filter to those within max_hours window (optional safety)
+    # Filter to those within max_hours window
     max_delta = pd.to_timedelta(max_hours, unit="h")
     delta = merged[ts_col] - merged["TransactionDateTime"]
-    merged.loc[delta > max_delta, ["TransactionDateTime", "MedDescription", "PriorityCode"]] = pd.NaT, None, None
+    too_far = delta > max_delta
 
-    # Keep only a few useful RC columns
+    merged.loc[too_far, ["TransactionDateTime", "StationName", "PriorityCode"]] = [
+        pd.NaT,
+        None,
+        None,
+    ]
+
+    # Expose clean columns
     merged["carousel_pick_ts"] = merged["TransactionDateTime"]
     merged["carousel_pick_station"] = merged.get("StationName")
     merged["carousel_pick_priority"] = merged.get("PriorityCode")
 
-    # Drop the raw RC columns we don't want to duplicate everywhere
-    drop_cols = [c for c in merged.columns if c.endswith("_rc") or c in ["TransactionDateTime", "PriorityCode", "StationName"]]
-    # BUT keep our new pick_* columns
-    drop_cols = [c for c in drop_cols if c not in ["carousel_pick_ts", "carousel_pick_station", "carousel_pick_priority"]]
-
+    # Drop raw RC columns we don't want
+    drop_cols = [
+        c
+        for c in merged.columns
+        if c.endswith("_rc")
+        or c in ["TransactionDateTime", "StationName", "PriorityCode"]
+    ]
+    drop_cols = [
+        c
+        for c in drop_cols
+        if c
+        not in [
+            "carousel_pick_ts",
+            "carousel_pick_station",
+            "carousel_pick_priority",
+        ]
+    ]
     merged = merged.drop(columns=drop_cols, errors="ignore")
 
     # Put merged refill rows back into df
@@ -166,7 +190,7 @@ def attach_carousel_return_to_unloads(
     max_hours: float = 8.0,
 ) -> pd.DataFrame:
     """
-    For each Pyxis UNLOAD (return from device), find the nearest FOLLOWING
+    For each Pyxis UNLOAD event, find the nearest FOLLOWING
     carousel event with PriorityCode == 'RETURN' for the same MedID.
     """
     if carousel_df.empty:
@@ -191,12 +215,17 @@ def attach_carousel_return_to_unloads(
     if rc_returns.empty:
         return df
 
-    # Sort for forward merge_asof by time
-    unloads = unloads.sort_values([med_col, ts_col])
-    rc_returns = rc_returns.sort_values(["MedID", "TransactionDateTime"])
+    # Ensure datetime types
+    unloads[ts_col] = pd.to_datetime(unloads[ts_col], errors="coerce")
+    rc_returns["TransactionDateTime"] = pd.to_datetime(
+        rc_returns["TransactionDateTime"], errors="coerce"
+    )
 
-    # To match "forward in time", we can invert time and use backward,
-    # or use direction='forward'. Here we use forward directly:
+    # 🔑 merge_asof requirement: sort by time column
+    unloads = unloads.sort_values(ts_col)
+    rc_returns = rc_returns.sort_values("TransactionDateTime")
+
+    # Match "forward in time"
     merged = pd.merge_asof(
         unloads,
         rc_returns,
@@ -208,23 +237,43 @@ def attach_carousel_return_to_unloads(
         suffixes=("", "_rc_return"),
     )
 
-    # Limit by max_hours (same idea as refills)
+    # Limit by max_hours
     max_delta = pd.to_timedelta(max_hours, unit="h")
     delta = merged["TransactionDateTime"] - merged[ts_col]
-    merged.loc[delta > max_delta, ["TransactionDateTime", "PriorityCode"]] = pd.NaT, None
+    too_far = delta > max_delta
+
+    merged.loc[too_far, ["TransactionDateTime", "StationName", "PriorityCode"]] = [
+        pd.NaT,
+        None,
+        None,
+    ]
 
     merged["carousel_return_ts"] = merged["TransactionDateTime"]
     merged["carousel_return_station"] = merged.get("StationName")
     merged["carousel_return_priority"] = merged.get("PriorityCode")
 
-    drop_cols = [c for c in merged.columns if c.endswith("_rc_return") or c in ["TransactionDateTime", "PriorityCode", "StationName"]]
-    drop_cols = [c for c in drop_cols if c not in ["carousel_return_ts", "carousel_return_station", "carousel_return_priority"]]
-
+    drop_cols = [
+        c
+        for c in merged.columns
+        if c.endswith("_rc_return")
+        or c in ["TransactionDateTime", "StationName", "PriorityCode"]
+    ]
+    drop_cols = [
+        c
+        for c in drop_cols
+        if c
+        not in [
+            "carousel_return_ts",
+            "carousel_return_station",
+            "carousel_return_priority",
+        ]
+    ]
     merged = merged.drop(columns=drop_cols, errors="ignore")
 
     df.loc[merged.index, merged.columns] = merged
 
     return df
+
 
 
 
