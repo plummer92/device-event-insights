@@ -2718,16 +2718,35 @@ with tab6:
         "visit_duration_s",
         "__device_change",
     ]
+
+    # Insert desc / qty / medid early in the table
     for opt in ["desc", "qty", "medid"]:
         c = colmap.get(opt)
         if c and c in data_f.columns:
             show_cols.insert(4, c)  # keep details near the left
+
+    # -------------------------
+    # Add carousel mapping columns (picks + returns)
+    # -------------------------
+    for extra in [
+        "carousel_pick_ts",
+        "carousel_pick_station",
+        "carousel_pick_priority",
+        "carousel_return_ts",
+        "carousel_return_station",
+        "carousel_return_priority",
+    ]:
+        if extra in data_f.columns and extra not in show_cols:
+            show_cols.append(extra)
+
+    # Final guard: only include columns actually present
     show_cols = [c for c in show_cols if c in data_f.columns]
 
+    # Build filtered table
     table = data_f[show_cols].copy()
 
     # -------------------------
-    # NEW: Med Description filter
+    # Med Description filter
     # -------------------------
     desc_col = colmap.get("desc")
     if desc_col and desc_col in table.columns:
@@ -2737,20 +2756,8 @@ with tab6:
             options=med_options,
             placeholder="Select one or more meds to include...",
         )
-
         if selected_meds:
             table = table[table[desc_col].isin(selected_meds)]
-
-    # -------------------------
-    # Show filtered table + export
-    # -------------------------
-    st.dataframe(table, use_container_width=True, height=520)
-
-    st.download_button(
-        "Download current drill-down as CSV",
-        data=table.to_csv(index=False).encode("utf-8"),
-        file_name="drilldown.csv",
-        mime="text/csv",
     )
 
     # -------------------------
