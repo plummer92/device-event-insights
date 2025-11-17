@@ -60,6 +60,175 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
     return df
 
+def preprocess_carousel_logistics(df_rc_raw: pd.DataFrame) -> pd.DataFrame:
+    df = df_rc_raw.copy()
+
+    # Normalize columns (strip spaces)
+    df.columns = df.columns.str.strip()
+
+    # Normalize datetime
+    if "TransactionDateTime" in df.columns:
+        df["TransactionDateTime"] = pd.to_datetime(
+            df["TransactionDateTime"], errors="coerce"
+        )
+
+    # Normalize MedID / description if present
+    if "MedID" in df.columns:
+        df["MedID"] = df["MedID"].astype(str).str.strip()
+    if "MedDescription" in df.columns:
+        df["MedDescription"] = df["MedDescription"].astype(str).str.strip()
+
+    # Priority code (for RETURN mapping)
+    if "PriorityCode" in df.columns:
+        df["PriorityCode"] = (
+            df["PriorityCode"].astype(str).str.strip().str.upper()
+        )
+    else:
+        df["PriorityCode"] = ""
+
+    df["__source"] = "carousel"
+    return df
+
+def attach_carousel_pick_to_refills(
+    data_f: pd.DataFrame,
+    carousel_df: pd.DataFrame,
+    colmap: dict,
+    max_hours: float = 8.0,
+) -> pd.DataFrame:
+    """
+    For each Pyxis REFILL event, find the most recent prior carousel event
+    for the same MedID (excluding PriorityCode == 'RETURN') within max_hours.
+    """
+    if carousel_df.empty:
+        return data_f.copy()
+
+    type_col = colmap["type"]
+    med_col = colmap.get("medid")
+    ts_col = colmap["datetime"]
+
+    if med_col is None or med_col not in data_f.columns:
+        return data_f.copy()
+
+    df = data_f.copy()
+
+    # Only refill rows
+    refills = df[df[type_col].str.contains("REFILL", case=False, na=False)].copy()
+    if refills.empty:
+        return df
+
+    # Carousel picks (not RETURN)
+    rc_picks = carousel_df[carousel_df["PriorityCode"] != "RETURN"].copy()
+    if rc_picks.empty:
+        return df
+
+    # Sort for merge_asof
+    refills = refills.sort_values([med_col, ts_col])
+    rc_picks = rc_picks.sort_values(["MedID", "TransactionDateTime"])
+
+    # Merge asof: nearest PRIOR pick for the same MedID
+    merged = pd.merge_asof(
+        refills,
+        rc_picks,
+        left_on=ts_col,
+        right_on="TransactionDateTime",
+        left_by=med_col,
+        right_by="MedID",
+        direction="backward",
+        suffixes=("", "_rc"),
+    )
+
+    # Filter to those within max_hours window (optional safety)
+    max_delta = pd.to_timedelta(max_hours, unit="h")
+    delta = merged[ts_col] - merged["TransactionDateTime"]
+    merged.loc[delta > max_delta, ["TransactionDateTime", "MedDescription", "PriorityCode"]] = pd.NaT, None, None
+
+    # Keep only a few useful RC columns
+    merged["carousel_pick_ts"] = merged["TransactionDateTime"]
+    merged["carousel_pick_station"] = merged.get("StationName")
+    merged["carousel_pick_priority"] = merged.get("PriorityCode")
+
+    # Drop the raw RC columns we don't want to duplicate everywhere
+    drop_cols = [c for c in merged.columns if c.endswith("_rc") or c in ["TransactionDateTime", "PriorityCode", "StationName"]]
+    # BUT keep our new pick_* columns
+    drop_cols = [c for c in drop_cols if c not in ["carousel_pick_ts", "carousel_pick_station", "carousel_pick_priority"]]
+
+    merged = merged.drop(columns=drop_cols, errors="ignore")
+
+    # Put merged refill rows back into df
+    df.loc[merged.index, merged.columns] = merged
+
+    return df
+
+def attach_carousel_return_to_unloads(
+    data_f: pd.DataFrame,
+    carousel_df: pd.DataFrame,
+    colmap: dict,
+    max_hours: float = 8.0,
+) -> pd.DataFrame:
+    """
+    For each Pyxis UNLOAD (return from device), find the nearest FOLLOWING
+    carousel event with PriorityCode == 'RETURN' for the same MedID.
+    """
+    if carousel_df.empty:
+        return data_f.copy()
+
+    type_col = colmap["type"]
+    med_col = colmap.get("medid")
+    ts_col = colmap["datetime"]
+
+    if med_col is None or med_col not in data_f.columns:
+        return data_f.copy()
+
+    df = data_f.copy()
+
+    # Only unload rows
+    unloads = df[df[type_col].str.contains("UNLOAD", case=False, na=False)].copy()
+    if unloads.empty:
+        return df
+
+    # Carousel returns ONLY
+    rc_returns = carousel_df[carousel_df["PriorityCode"] == "RETURN"].copy()
+    if rc_returns.empty:
+        return df
+
+    # Sort for forward merge_asof by time
+    unloads = unloads.sort_values([med_col, ts_col])
+    rc_returns = rc_returns.sort_values(["MedID", "TransactionDateTime"])
+
+    # To match "forward in time", we can invert time and use backward,
+    # or use direction='forward'. Here we use forward directly:
+    merged = pd.merge_asof(
+        unloads,
+        rc_returns,
+        left_on=ts_col,
+        right_on="TransactionDateTime",
+        left_by=med_col,
+        right_by="MedID",
+        direction="forward",
+        suffixes=("", "_rc_return"),
+    )
+
+    # Limit by max_hours (same idea as refills)
+    max_delta = pd.to_timedelta(max_hours, unit="h")
+    delta = merged["TransactionDateTime"] - merged[ts_col]
+    merged.loc[delta > max_delta, ["TransactionDateTime", "PriorityCode"]] = pd.NaT, None
+
+    merged["carousel_return_ts"] = merged["TransactionDateTime"]
+    merged["carousel_return_station"] = merged.get("StationName")
+    merged["carousel_return_priority"] = merged.get("PriorityCode")
+
+    drop_cols = [c for c in merged.columns if c.endswith("_rc_return") or c in ["TransactionDateTime", "PriorityCode", "StationName"]]
+    drop_cols = [c for c in drop_cols if c not in ["carousel_return_ts", "carousel_return_station", "carousel_return_priority"]]
+
+    merged = merged.drop(columns=drop_cols, errors="ignore")
+
+    df.loc[merged.index, merged.columns] = merged
+
+    return df
+
+
+
+
 # ---------- SIMPLE EXTRACTOR FOR DEVICE ACTIVITY LOG ----------
 
 A_MIN  = r"Inventory\s*Refill\s*Point\s*Min\s*Quantity"
@@ -2224,9 +2393,29 @@ if uploads:
         st.stop()
 
 # ============================ PROCESS UPLOADS ============================
+carousel_files: list[pd.DataFrame] = []
+
 if uploads:
-    new_files = []
+    new_files = []  # event files only
+
     for up in uploads:
+        name_upper = up.name.upper()
+
+        # --- Detect carousel / logistics uploads (RC file) ---
+        if "_RC" in name_upper or "LOGISTICS" in name_upper or "CAROUSEL" in name_upper:
+            try:
+                raw_rc = load_upload(up)          # same loader, or pd.read_csv
+                cleaned_rc = preprocess_carousel_logistics(raw_rc)
+                if cleaned_rc.empty:
+                    st.warning(f"{up.name}: no valid carousel rows.")
+                    continue
+                carousel_files.append(cleaned_rc)
+                st.info(f"{up.name}: treated as Carousel/Logistics file.")
+            except Exception as e:
+                st.error(f"Failed to read carousel file {up.name}: {e}")
+            continue  # important: skip normal event cleaning for RC files
+
+        # --- Normal Pyxis event files (your existing path) ---
         try:
             raw = load_upload(up)
             cleaned = base_clean(raw, colmap)
@@ -2238,55 +2427,16 @@ if uploads:
             st.error(f"Failed to read {up.name}: {e}")
 
     if not new_files:
-        st.warning("No usable files found.")
+        st.warning("No usable event files found.")
         st.stop()
 
     new_ev = pd.concat(new_files, ignore_index=True)
+
     # Build pk for upload rows (needed for UPSERT)
     new_ev["pk"] = build_pk(new_ev, colmap)
     new_ev = new_ev.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
 
-    # Merge with DB history
-    frames = [history, new_ev] if not history.empty else [new_ev]
-    ev_all = pd.concat([f for f in frames if not f.empty], ignore_index=True)
-    ev_all = ev_all.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
-
-    # Upload summary
-    new_pks = set(new_ev["pk"])
-    old_pks = set(history["pk"]) if not history.empty and "pk" in history.columns else set()
-    num_new = len(new_pks - old_pks)
-    num_dup = len(new_pks & old_pks)
-    earliest = pd.to_datetime(ev_all[colmap["datetime"]].min())
-    latest   = pd.to_datetime(ev_all[colmap["datetime"]].max())
-
-    with st.expander("📥 Upload summary", expanded=True):
-        st.write(f"**Rows in this upload:** {len(new_ev):,}")
-        st.write(f"- New rows vs DB: **{num_new:,}**")
-        st.write(f"- Already existed (upserts): **{num_dup:,}**")
-        st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
-
-# --- SAVE (uploads only) ---
-if uploads:
-    # Save only new rows (huge speedup; avoids hammering indexes)
-    if history.empty or "pk" not in history.columns:
-        to_save = new_ev
-    else:
-        old_pks = set(history["pk"])
-        to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
-
-    if to_save.empty:
-        st.sidebar.info("No new rows to save.")
-    else:
-        ok, msg = save_history_sql(to_save, colmap, eng)
-        (st.sidebar.success if ok else st.sidebar.error)(msg)
-else:
-    # Database-only mode; nothing to write
-    pass
-
-# =================== TIME RANGE FILTER ===================
-# ============================ MERGE & SAVE ============================
-if uploads:
-    # new_ev was already created above from uploaded files
+    # ============================ MERGE & SAVE ============================
     frames = []
     if isinstance(history, pd.DataFrame) and not history.empty:
         frames.append(history)
@@ -2324,6 +2474,12 @@ else:
     # Database-only mode; analyze what’s already in Postgres
     ev_all = history.copy()
 
+# Build carousel_df (may be empty if no RC files uploaded)
+if carousel_files:
+    carousel_df = pd.concat(carousel_files, ignore_index=True)
+else:
+    carousel_df = pd.DataFrame()
+
 # Guard: stop early if nothing to analyze
 if not isinstance(ev_all, pd.DataFrame) or ev_all.empty:
     st.warning("No events available yet. Upload files or verify your DB.")
@@ -2349,7 +2505,6 @@ ev_time = ev_all[
 if ev_time.empty:
     st.warning("No events in selected time range.")
     st.stop()
-
 
 
 # =================== ANALYTICS ===================
