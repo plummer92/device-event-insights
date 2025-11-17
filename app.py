@@ -2512,11 +2512,17 @@ data, device_stats, tech_stats, run_stats, hourly, visit = build_delivery_analyt
     ev_time, colmap, idle_min=idle_min, idle_max=idle_max
 )
 
+# --- NEW: map carousel events to refills/unloads ---
+if not carousel_df.empty:
+    data = attach_carousel_pick_to_refills(data, carousel_df, colmap)
+    data = attach_carousel_return_to_unloads(data, carousel_df, colmap)
+
 # Pre-format for Drill-down
 data["gap_hms"]      = data["__gap_s"].map(fmt_hms)
 data["walk_gap_hms"] = data["__walk_gap_s"].map(fmt_hms)
 data["dwell_hms"]    = data["__dwell_s"].map(fmt_hms)
 data["visit_hms"]    = data["visit_duration_s"].map(fmt_hms)
+
 
 # =================== FILTERS (post-analytics) ===================
 pick_devices = st.sidebar.multiselect("Devices", safe_unique(ev_time, colmap["device"]))
