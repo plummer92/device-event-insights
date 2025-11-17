@@ -2723,23 +2723,25 @@ with tab6:
     for opt in ["desc", "qty", "medid"]:
         c = colmap.get(opt)
         if c and c in data_f.columns:
-            show_cols.insert(4, c)  # keep details near the left
+            show_cols.insert(4, c)
 
     # -------------------------
-    # Add carousel mapping columns (picks + returns)
+    # Add carousel columns (Picks + Returns)
     # -------------------------
-    for extra in [
+    carousel_cols = [
         "carousel_pick_ts",
         "carousel_pick_station",
         "carousel_pick_priority",
         "carousel_return_ts",
         "carousel_return_station",
         "carousel_return_priority",
-    ]:
+    ]
+
+    for extra in carousel_cols:
         if extra in data_f.columns and extra not in show_cols:
             show_cols.append(extra)
 
-    # Final guard: only include columns actually present
+    # Final cleanup: only include columns that exist
     show_cols = [c for c in show_cols if c in data_f.columns]
 
     # Build filtered table
@@ -2758,7 +2760,17 @@ with tab6:
         )
         if selected_meds:
             table = table[table[desc_col].isin(selected_meds)]
+
+    # Display
+    st.dataframe(table, use_container_width=True, height=520)
+
+    st.download_button(
+        "Download current drill-down as CSV",
+        data=table.to_csv(index=False).encode("utf-8"),
+        file_name="drilldown.csv",
+        mime="text/csv",
     )
+
 
     # -------------------------
     # Per-visit summary (unchanged)
