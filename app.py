@@ -24,6 +24,7 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 import matplotlib.pyplot as plt  # needed for pandas Styler gradients
 from pandas.api.types import DatetimeTZDtype
+from sqlalchemy import text
 
 
 
@@ -2182,6 +2183,30 @@ def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[boo
     except Exception as e:
         return False, f"DB save error: {e}"
 
+def delete_events_by_pk(pk_list, eng):
+    """
+    Delete rows from the events table matching the given pk values.
+    Safe to run even if some pk values don't exist.
+    """
+    if not pk_list:
+        return 0, "No PKs to delete."
+
+    # Chunk to avoid parameter explosion
+    chunk_size = 1000
+    total_deleted = 0
+
+    with eng.begin() as conn:
+        for i in range(0, len(pk_list), chunk_size):
+            chunk = pk_list[i : i + chunk_size]
+            conn.execute(
+                text("DELETE FROM events WHERE pk = ANY(:pks)"),
+                {"pks": chunk},
+            )
+            # Postgres doesn't easily return rowcount reliably across engines;
+            # we can ignore exact count or estimate by len(chunk).
+
+    return len(pk_list), "Delete by pk completed."
+
 
 def load_history_sql(colmap: Dict[str, str], eng) -> pd.DataFrame:
     """Load canonical table and alias columns back to current mapping."""
@@ -2360,24 +2385,38 @@ ENGINE_SALT = st.secrets.get("ENGINE_SALT", "")
 eng = get_engine(DB_URL, ENGINE_SALT)
 
 # ================================ SIDEBAR ==============================
-st.sidebar.header("Data source")
-data_mode = st.sidebar.radio(
-    "Choose data source",
-    ["Upload files", "Database only"],
-    help="Use 'Database only' to analyze existing Postgres data without uploading new files."
-)
+st.sidebar.title("⚙️ Controls")
 
-idle_min = st.sidebar.number_input(
-    "Walk gap threshold min (seconds)",
-    min_value=5, max_value=900, value=DEFAULT_IDLE_MIN, step=5
-)
-idle_max = st.sidebar.number_input(
-    "Walk gap threshold max (seconds, 0 = unlimited)",
-    min_value=0, max_value=7200, value=1800, step=60,
-    help="Only count walk gaps ≤ this many seconds as walking. Set 0 to disable the cap."
-)
+# -----------------------------
+# Data Source
+# -----------------------------
+with st.sidebar.expander("📁 Data Source", expanded=True):
+    data_mode = st.radio(
+        "Choose data source",
+        ["Upload files", "Database only"],
+        help="Use 'Database only' to analyze existing Postgres data without uploading new files."
+    )
 
-st.sidebar.header("Admin")
+# -----------------------------
+# Walk Gap Thresholds
+# -----------------------------
+with st.sidebar.expander("🚶 Walk Gap Settings", expanded=False):
+    idle_min = st.number_input(
+        "Walk gap threshold (min seconds)",
+        min_value=5, max_value=900, value=DEFAULT_IDLE_MIN, step=5
+    )
+    idle_max = st.number_input(
+        "Walk gap threshold (max seconds, 0 = unlimited)",
+        min_value=0, max_value=7200, value=1800, step=60,
+        help="Only count walk gaps ≤ this many seconds. Set 0 for no cap."
+    )
+
+# -----------------------------
+# Admin Tools
+# -----------------------------
+st.sidebar.markdown("---")
+st.sidebar.header("🔧 Admin Tools")
+
 if st.sidebar.button("🧹 Daily closeout (refresh & clear caches)"):
     ok_mv, mv_msg = refresh_materialized_views(eng)
     st.sidebar.success(mv_msg if ok_mv else mv_msg)
@@ -2386,15 +2425,46 @@ if st.sidebar.button("🧹 Daily closeout (refresh & clear caches)"):
         st.cache_resource.clear()
     except Exception:
         pass
-    st.sidebar.info("Caches cleared — rerunning app...")
+    st.sidebar.info("Caches cleared — rerunning app…")
     st.rerun()
 
 if st.sidebar.button("🛠 Build/repair DB indexes"):
     try:
         ensure_indexes(eng)
-        st.sidebar.success("Index build/repair requested.")
+        st.sidebar.success("Index build/repair started.")
     except Exception as e:
         st.sidebar.warning(f"Index maintenance skipped: {e}")
+
+# -----------------------------
+# Maintenance: Delete Events from a File
+# -----------------------------
+st.sidebar.markdown("---")
+with st.sidebar.expander("🧹 Maintenance: Undo an Upload (Delete Events)"):
+    st.write("Upload the *same Pyxis CSV* you previously uploaded to remove those rows from the database.")
+
+    del_file = st.file_uploader(
+        "File to delete from DB",
+        type=["csv", "xlsx"],
+        key="delete_file"
+    )
+
+    if del_file is not None and st.button("❌ Delete events from this file"):
+        try:
+            raw_del = load_upload(del_file)
+            cleaned_del = base_clean(raw_del, colmap)
+
+            if cleaned_del.empty:
+                st.warning("No usable Pyxis rows found in this file.")
+            else:
+                cleaned_del["pk"] = build_pk(cleaned_del, colmap)
+                pk_list = cleaned_del["pk"].dropna().unique().tolist()
+
+                n, msg = delete_events_by_pk(pk_list, eng)
+                st.success(f"Requested delete of {n} pk keys. {msg}")
+
+        except Exception as e:
+            st.error(f"Delete failed: {e}")
+
 
 # ===================== LOAD HISTORY (needed early) =====================
 history = load_history_sql(colmap, eng)
