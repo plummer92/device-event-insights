@@ -2401,19 +2401,49 @@ if uploads:
     for up in uploads:
         name_upper = up.name.upper()
 
-        # --- Detect carousel / logistics uploads (RC file) ---
-        if "_RC" in name_upper or "LOGISTICS" in name_upper or "CAROUSEL" in name_upper:
-            try:
-                raw_rc = load_upload(up)          # same loader, or pd.read_csv
-                cleaned_rc = preprocess_carousel_logistics(raw_rc)
-                if cleaned_rc.empty:
-                    st.warning(f"{up.name}: no valid carousel rows.")
-                    continue
-                carousel_files.append(cleaned_rc)
-                st.info(f"{up.name}: treated as Carousel/Logistics file.")
-            except Exception as e:
-                st.error(f"Failed to read carousel file {up.name}: {e}")
-            continue  # important: skip normal event cleaning for RC files
+       raw = load_upload(up)
+
+# If the file contains a TransactionType column with Pyxis-style events
+has_pyxis_columns = any(
+    col.lower() in raw.columns.str.lower().tolist() 
+    for col in [colmap["datetime"], colmap["device"], colmap["type"]]
+)
+
+# If the file contains Carousel columns
+has_carousel_columns = "PriorityCode" in raw.columns or "StationName" in raw.columns
+
+# --------- CASE 1: Mixed file (Pyxis + Carousel)
+if has_pyxis_columns and has_carousel_columns:
+    # Split by PriorityCode (Carousel) vs Pyxis events
+    carousel_part = raw[raw.get("PriorityCode").notna()].copy()
+    pyxis_part = raw[raw.get("PriorityCode").isna()].copy()
+
+    if not carousel_part.empty:
+        cleaned_rc = preprocess_carousel_logistics(carousel_part)
+        carousel_files.append(cleaned_rc)
+
+    if not pyxis_part.empty:
+        cleaned_pyxis = base_clean(pyxis_part, colmap)
+        new_files.append(cleaned_pyxis)
+
+    continue
+
+# --------- CASE 2: Pure carousel file
+elif has_carousel_columns and not has_pyxis_columns:
+    cleaned_rc = preprocess_carousel_logistics(raw)
+    carousel_files.append(cleaned_rc)
+    continue
+
+# --------- CASE 3: Pure pyxis events
+elif has_pyxis_columns:
+    cleaned = base_clean(raw, colmap)
+    new_files.append(cleaned)
+    continue
+
+else:
+    st.warning(f"{up.name}: Could not classify file.")
+    continue
+
 
         # --- Normal Pyxis event files (your existing path) ---
         try:
