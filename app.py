@@ -413,22 +413,67 @@ def parse_datetime_series(s: pd.Series) -> pd.Series:
         out = out.dt.tz_convert("UTC").dt.tz_localize(None)
     return out
 
+def normalize_event_columns(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize different Pyxis export formats into the common column set
+    that the app expects (All Device Event Report style).
+
+    Currently supports:
+    - Classic "All Device Event Report" (has Device, Area, DrwSubDrwPkt)
+    - AuditTransactionDetail export (has StationName, CareAreaName,
+      DrawerSubDrawerPocket, etc.)
+    """
+    df = dedupe_columns(df_raw).copy()
+    cols = set(df.columns)
+
+    # Map AuditTransactionDetail -> All Device style
+    # Device
+    if "StationName" in cols and "Device" not in cols:
+        df["Device"] = df["StationName"]
+
+    # Care area / location
+    if "CareAreaName" in cols and "Area" not in cols:
+        df["Area"] = df["CareAreaName"]
+
+    # Drawer / pocket addressing
+    if "DrawerSubDrawerPocket" in cols and "DrwSubDrwPkt" not in cols:
+        df["DrwSubDrwPkt"] = df["DrawerSubDrawerPocket"]
+
+    # Ensure TransactionDateTime exists where a close variant is present
+    if "TransactionDateTime" not in cols:
+        for alt in ["EventDateTime", "Event Time", "DateTime"]:
+            if alt in cols:
+                df["TransactionDateTime"] = df[alt]
+                break
+
+    return df
+
+
 def load_upload(up) -> pd.DataFrame:
-    name = up.name.lower()
+    """Read an uploaded file (CSV/XLSX) and normalize its columns.
+
+    This now supports both:
+    - "All Device Event Report" exports
+    - "AuditTransactionDetail" exports (richer data, different column names)
+    by mapping them into the common column set that the rest of the app expects.
+    """
+    name = getattr(up, "name", "").lower()
+
+    # Read raw file
     if name.endswith(".xlsx"):
-        return pd.read_excel(up)
-    try:
-        up.seek(0)
-        return pd.read_csv(up, low_memory=False)
-    except UnicodeDecodeError:
-        up.seek(0)
-        return pd.read_csv(up, encoding="latin-1", low_memory=False)
-    try:
-        up.seek(0)
-        return pd.read_csv(up)
-    except UnicodeDecodeError:
-        up.seek(0)
-        return pd.read_csv(up, encoding="latin-1")
+        df_raw = pd.read_excel(up)
+    else:
+        # Try UTF-8 first with low_memory=False for wide files
+        try:
+            up.seek(0)
+            df_raw = pd.read_csv(up, low_memory=False)
+        except UnicodeDecodeError:
+            up.seek(0)
+            df_raw = pd.read_csv(up, encoding="latin-1", low_memory=False)
+
+    # Normalize columns so downstream logic can assume All-Device-style names
+    return normalize_event_columns(df_raw)
+
 
 def base_clean(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
     out = dedupe_columns(df_raw).copy()
