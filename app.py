@@ -53,6 +53,38 @@ colmap: Dict[str, str] = DEFAULT_COLMAP.copy()
 
 DEFAULT_IDLE_MIN = 30  # seconds to qualify as "walk/travel" gap
 
+MY_STAFF_USERS = {
+    "FRAZIER, ELIZABETH",
+    "SPAIN, DELORIS",
+    "DORSEY, LATESSA",
+    "EVANICH, DAVID",
+    "SCHUERMAN, ADREAN",
+    "UNDERWOOD, RICK",
+    "CLAY, NICHOLAS",
+    "KAYLOR, HEATHER",
+    "GALL, MALLORY",
+    "JABUSCH, DANIEL",
+    "SHIELDS, MELISSA",
+    "FOLEY, JAIMES",
+    "SIMMONS, NICOLE",
+    "SALEH, SHAIMA",
+    "HARRIS, MEGAN",
+    "OZEE, KARA",
+    "GARTSHORE, JOHN",
+    "MOQUIA, WILMAR",
+    "BHANDARI, SHIVA",
+    "WALKER, JERMON",
+    "EPPS, RAEVEN",
+    "ALLEN, LOGAN",
+    "DYKSTRA, JAVIER",
+    "NUGENT, KATHLEEN",
+    "HO, ALI",
+    "COOK, CANDICE",
+    "DUFER, MELISSA",
+    "BERNSTEIN, SHIRLEY",
+    "PHILLIPS, SYDNI",
+}
+
 # ----------------------------- HELPERS --------------------------------
 def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure column names are unique by dropping exact dupes; trim whitespace."""
@@ -508,30 +540,24 @@ def load_upload(up) -> pd.DataFrame:
 
 
 
-def base_clean(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
-    out = dedupe_columns(df_raw).copy()
-    dtcol = colmap["datetime"]
-    if dtcol not in out.columns:
-        raise ValueError(f"Mapped datetime column '{dtcol}' not found in file.")
-    s = out[dtcol]
-    if isinstance(s, pd.DataFrame):
-        s = s.iloc[:, 0]
-    out[dtcol] = parse_datetime_series(s)
+def base_clean(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
+    ev = pd.DataFrame()
 
-    if colmap.get("qty") and colmap["qty"] in out.columns:
-        out[colmap["qty"]] = pd.to_numeric(out[colmap["qty"]], errors="coerce")
+    ev["dt"]     = pd.to_datetime(df[colmap["datetime"]], errors="coerce")
+    ev["device"] = df[colmap["device"]].astype("string")
+    ev["user"]   = df[colmap["user"]].astype("string")
+    ev["type"]   = df[colmap["type"]].astype("string")
+    ev["desc"]   = df.get(colmap.get("desc", ""), pd.NA)
+    ev["qty"]    = pd.to_numeric(df[colmap["qty"]], errors="coerce")
+    ev["medid"]  = df[colmap["medid"]].astype("string")
 
-    for key in ["device", "user", "type", "desc", "medid"]:
-        c = colmap.get(key)
-        if c and c in out.columns:
-            out[c] = out[c].astype("string").str.strip()
+    # 🔥 Filter to MY STAFF ONLY — THIS is the correct place
+    ev = ev[ev["user"].str.upper().isin(MY_STAFF_USERS)].copy()
 
-    out = out.dropna(subset=[dtcol]).copy()
-    out = out.sort_values(dtcol).reset_index(drop=True)
-    out["__date"] = out[dtcol].dt.date
-    out["__hour"] = out[dtcol].dt.hour
-    out["__dow"]  = out[dtcol].dt.day_name()
-    return out
+    # (Rest of your base_clean logic: build pk, drop empty dt, sort, etc.)
+    ...
+    return ev
+
 
 def fmt_hms(x) -> str:
     if pd.isna(x):
