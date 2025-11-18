@@ -2202,6 +2202,18 @@ def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[boo
         if not rows:
             return True, "No rows to save."
 
+        # 🔧 Clean pandas.NA / NaN values so psycopg2 can handle them
+        cleaned_rows = []
+        for row in rows:
+            cleaned = {}
+            for k, v in row.items():
+                # Turn pandas.NA / NaN into plain None (NULL in SQL)
+                if pd.isna(v):
+                    cleaned[k] = None
+                else:
+                    cleaned[k] = v
+            cleaned_rows.append(cleaned)
+
         upsert_sql = text("""
             INSERT INTO events (pk, dt, device, "user", "type", "desc", qty, medid)
             VALUES (:pk, :dt, :device, :user, :type, :desc, :qty, :medid)
@@ -2220,8 +2232,8 @@ def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[boo
         with eng.begin() as con:
             con.execute(text("SET LOCAL statement_timeout = '120s'"))
             con.execute(text("SET LOCAL synchronous_commit = OFF"))
-            for i in range(0, len(rows), CHUNK):
-                batch = rows[i:i+CHUNK]
+            for i in range(0, len(cleaned_rows), CHUNK):
+                batch = cleaned_rows[i:i+CHUNK]
                 con.execute(upsert_sql, batch)
                 total += len(batch)
         return True, f"Saved to Postgres: {total:,} rows (upserted by pk)."
@@ -2297,16 +2309,26 @@ def upsert_activity_simple(eng, df_simple: pd.DataFrame) -> int:
 
     # Coerce/clean types expected by SQL
     df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+
+    # Drop rows that can't possibly form a valid PK
     df = df.dropna(subset=["ts", "device", "drawer", "pocket", "med_id"])
 
+    # Make sure min/max are numeric and psycopg2-safe (None instead of NA)
     for c in ("min_qty", "max_qty"):
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").round().astype("Int64")
+            df[c] = pd.to_numeric(df[c], errors="coerce").round()
+            df[c] = df[c].where(df[c].notna(), None)
+
+    # Replace pandas.NA with None in other nullable columns
+    nullable_cols = ["username", "is_min", "is_max", "is_standard_stock"]
+    for col in nullable_cols:
+        if col in df.columns:
+            df[col] = df[col].where(df[col].notna(), None)
 
     # Shape rows for execute-many
     rows = df[[
-        "ts","device","drawer","pocket","med_id",
-        "username","min_qty","max_qty","is_min","is_max","is_standard_stock"
+        "ts", "device", "drawer", "pocket", "med_id",
+        "username", "min_qty", "max_qty", "is_min", "is_max", "is_standard_stock"
     ]].to_dict(orient="records")
 
     sql = text("""
@@ -2331,6 +2353,7 @@ def upsert_activity_simple(eng, df_simple: pd.DataFrame) -> int:
         con.execute(sql, rows)
 
     return len(rows)
+
 
 
 def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
