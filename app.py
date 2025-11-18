@@ -448,22 +448,53 @@ def normalize_event_columns(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+def normalize_event_columns(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize different Pyxis export formats into the common column set
+    that the app expects (All Device Event Report style).
+
+    - For classic All Device Event Report, columns already match.
+    - For AuditTransactionDetail, we map:
+        StationName          -> Device
+        CareAreaName         -> Area
+        DrawerSubDrawerPocket-> DrwSubDrwPkt
+    """
+    df = dedupe_columns(df_raw).copy()
+    cols = set(df.columns)
+
+    # Device / station name
+    if "StationName" in cols and "Device" not in cols:
+        df["Device"] = df["StationName"]
+
+    # Care area / location
+    if "CareAreaName" in cols and "Area" not in cols:
+        df["Area"] = df["CareAreaName"]
+
+    # Drawer + pocket
+    if "DrawerSubDrawerPocket" in cols and "DrwSubDrwPkt" not in cols:
+        df["DrwSubDrwPkt"] = df["DrawerSubDrawerPocket"]
+
+    # Make sure TransactionDateTime exists (Audit file already has it,
+    # but this keeps us flexible for future variants)
+    if "TransactionDateTime" not in cols:
+        for alt in ["EventDateTime", "Event Time", "DateTime"]:
+            if alt in cols:
+                df["TransactionDateTime"] = df[alt]
+                break
+
+    return df
+
+
 
 def load_upload(up) -> pd.DataFrame:
-    """Read an uploaded file (CSV/XLSX) and normalize its columns.
+    """Read an uploaded file (CSV/XLSX) and normalize its columns."""
+    name = up.name.lower()
 
-    This now supports both:
-    - "All Device Event Report" exports
-    - "AuditTransactionDetail" exports (richer data, different column names)
-    by mapping them into the common column set that the rest of the app expects.
-    """
-    name = getattr(up, "name", "").lower()
-
-    # Read raw file
+    # 1) Read the raw file
     if name.endswith(".xlsx"):
         df_raw = pd.read_excel(up)
     else:
-        # Try UTF-8 first with low_memory=False for wide files
+        # Try utf-8 first
         try:
             up.seek(0)
             df_raw = pd.read_csv(up, low_memory=False)
@@ -471,8 +502,10 @@ def load_upload(up) -> pd.DataFrame:
             up.seek(0)
             df_raw = pd.read_csv(up, encoding="latin-1", low_memory=False)
 
-    # Normalize columns so downstream logic can assume All-Device-style names
+    # 2) Normalize columns so the rest of the app always sees:
+    #    TransactionDateTime, Device, Area, DrwSubDrwPkt, etc.
     return normalize_event_columns(df_raw)
+
 
 
 def base_clean(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
