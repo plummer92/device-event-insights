@@ -92,6 +92,11 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
     return df
 
+
+def is_audit_transaction_detail(df):
+    return "CareAreaName" in df.columns and "TransactionDateTime" in df.columns
+
+
 def preprocess_carousel_logistics(df_rc_raw: pd.DataFrame) -> pd.DataFrame:
     df = df_rc_raw.copy()
 
