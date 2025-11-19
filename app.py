@@ -520,13 +520,31 @@ def normalize_event_columns(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 def load_upload(up) -> pd.DataFrame:
     """Read an uploaded file (CSV/XLSX) and normalize its columns."""
+
     name = up.name.lower()
 
-    # 1) Read the raw file
+    # ----------------------------------------------------------------------
+    # 1) Smart Excel reader: detect if this is AuditTransactionDetail format
+    # ----------------------------------------------------------------------
     if name.endswith(".xlsx"):
-        df_raw = pd.read_excel(up)
+        # Read the first 25 rows without headers just for detection
+        df_probe = pd.read_excel(up, header=None, nrows=25)
+
+        # If row 18 (index 17) contains known A-TD headers → use header=17
+        if df_probe.iloc[17].astype(str).str.contains(
+            r"TransactionDateTime|TransactionType|MedDescription|Quantity",
+            case=False
+        ).any():
+            up.seek(0)
+            df_raw = pd.read_excel(up, header=17)  # The FIX
+        else:
+            up.seek(0)
+            df_raw = pd.read_excel(up)
+
+    # ----------------------------------------------------------------------
+    # CSV handler (unchanged)
+    # ----------------------------------------------------------------------
     else:
-        # Try utf-8 first
         try:
             up.seek(0)
             df_raw = pd.read_csv(up, low_memory=False)
@@ -534,11 +552,10 @@ def load_upload(up) -> pd.DataFrame:
             up.seek(0)
             df_raw = pd.read_csv(up, encoding="latin-1", low_memory=False)
 
-    # 2) Normalize columns so the rest of the app always sees:
-    #    TransactionDateTime, Device, Area, DrwSubDrwPkt, etc.
+    # ----------------------------------------------------------------------
+    # 2) Normalize column names into canonical Pyxis events format
+    # ----------------------------------------------------------------------
     return normalize_event_columns(df_raw)
-
-
 
 def base_clean(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
     ev = pd.DataFrame()
