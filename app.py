@@ -467,25 +467,29 @@ def normalize_event_columns(df: pd.DataFrame) -> pd.DataFrame:
         TransactionDateTime, Device, UserName, TransactionType,
         MedDescription, Quantity, MedID, DrawerSubDrawerPocket
     """
+
+    # 1. Validate required columns
     required = [
-    "TransactionDateTime", "UserName",
-    "TransactionType", "MedDescription",
-    "Quantity", "MedID"
-]
+        "TransactionDateTime", "UserName",
+        "TransactionType", "MedDescription",
+        "Quantity", "MedID"
+    ]
 
-for col in required:
-    if col not in df.columns:
-        raise ValueError(f"Missing required column: {col}. Columns: {df.columns.tolist()}")
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}. Columns: {df.columns.tolist()}")
 
+    # 2. Safe copy
     df = df.copy()
 
-    # Parse datetime — optimized strict format
+    # 3. Parse datetime (strict format)
     dt = pd.to_datetime(
         df["TransactionDateTime"],
         format="%m/%d/%Y %H:%M:%S",
         errors="coerce"
     )
 
+    # 4. Build clean normalized table
     out = pd.DataFrame({
         "TransactionDateTime": dt,
         "Device": df.get("StationName", "").astype("string"),
@@ -497,7 +501,7 @@ for col in required:
         "DrawerSubDrawerPocket": df.get("DrawerSubDrawerPocket", "").astype("string"),
     })
 
-     return out
+    return out
 
 
     # --------------------------
