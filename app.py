@@ -601,24 +601,37 @@ def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
 
 def build_pk(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.Series:
     """
-    Extremely fast vectorized PK generator.
-    Hashes concatenated strings instead of row-by-row Python loops.
+    Build a stable primary key from a combination of columns.
+    Optional fields (desc, qty, medid) are handled safely if missing.
     """
 
+    def safe_col(key: str) -> pd.Series:
+        col = colmap.get(key)
+        if not col or col not in df.columns:
+            # Return empty strings aligned to df index
+            return pd.Series([""] * len(df), index=df.index, dtype="string")
+        return df[col].astype("string")
+
+    # datetime is required – if it's missing, fail loudly
+    dt_col = colmap.get("datetime", "TransactionDateTime")
+    if dt_col not in df.columns:
+        raise KeyError(f"Datetime column '{dt_col}' not found in dataframe for PK build.")
+
+    base = df[dt_col].astype("string")
+
     concat_str = (
-        df[colmap["datetime"]].astype(str) + "|" +
-        df[colmap["device"]].astype(str) + "|" +
-        df[colmap["user"]].astype(str) + "|" +
-        df[colmap["type"]].astype(str) + "|" +
-        df[colmap["desc"]].astype(str) + "|" +
-        df[colmap["qty"]].astype(str) + "|" +
-        df[colmap["medid"]].astype(str)
+        base + "|" +
+        safe_col("device") + "|" +
+        safe_col("user") + "|" +
+        safe_col("type") + "|" +
+        safe_col("desc") + "|" +
+        safe_col("qty") + "|" +
+        safe_col("medid")
     )
 
-    # Vectorized SHA-1 hashing
     return concat_str.apply(
-        lambda x: hashlib.sha1(x.encode()).hexdigest()
-    ).astype("string")
+        lambda s: hashlib.sha256((s + ENGINE_SALT).encode("utf-8")).hexdigest()
+    )
 
 
 def weekly_summary(ev: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
@@ -2750,38 +2763,35 @@ carousel_df = pd.concat(carousel_files, ignore_index=True) if carousel_files els
 
 # =================== TIME RANGE FILTER ===================
 
-# If ev_all is completely empty, stop early
-if ev_all.empty:
-    st.warning("No events available to filter.")
+# =================== TIME RANGE FILTER ===================
+
+# Make sure we actually have a datetime column configured
+dt_col = colmap.get("datetime", "TransactionDateTime")
+if dt_col not in ev_all.columns:
+    st.error(f"Configured datetime column '{dt_col}' not found in data.")
     st.stop()
 
-# Extract datetime column safely
-dt_col = colmap.get("datetime", "TransactionDateTime")
-
-# Convert datetime column
+# Convert to datetime with coercion
 ev_all[dt_col] = pd.to_datetime(ev_all[dt_col], errors="coerce")
 
-# Drop rows where datetime is missing
-ev_all = ev_all.dropna(subset=[dt_col])
+# Drop rows with invalid timestamps
+valid_times = ev_all[dt_col].dropna()
 
-# If still empty after cleaning, stop
-if ev_all.empty:
+if valid_times.empty:
     st.warning("No valid timestamps found in dataset.")
     st.stop()
 
-# Compute min + max timestamps
-_min = ev_all[dt_col].min()
-_max = ev_all[dt_col].max()
+# Compute min/max from valid timestamps ONLY
+_min = valid_times.min()
+_max = valid_times.max()
 
-# Ensure Python datetime objects
-min_ts = pd.to_datetime(_min).to_pydatetime()
-max_ts = pd.to_datetime(_max).to_pydatetime()
+min_ts = _min.to_pydatetime()
+max_ts = _max.to_pydatetime()
 
-# Safety: if min == max, expand max by +1 minute
+# Safety: if min == max, bump max by 1 minute so slider has a range
 if min_ts == max_ts:
     max_ts = min_ts + timedelta(minutes=1)
 
-# Build slider
 rng = st.sidebar.slider(
     "Time range",
     min_value=min_ts,
@@ -2790,16 +2800,16 @@ rng = st.sidebar.slider(
     format="YYYY-MM-DD HH:mm",
 )
 
-# Filter the dataframe
+# Filter using the same datetime column
 ev_time = ev_all[
-    (ev_all[dt_col] >= pd.to_datetime(rng[0])) &
-    (ev_all[dt_col] <= pd.to_datetime(rng[1]))
+    (ev_all[dt_col] >= rng[0]) &
+    (ev_all[dt_col] <= rng[1])
 ].copy()
 
-# If resulting time window is empty, stop
 if ev_time.empty:
     st.warning("No events in selected time range.")
     st.stop()
+
 
 
 # =================== ANALYTICS ===================
