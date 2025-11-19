@@ -451,31 +451,38 @@ def parse_datetime_series(s: pd.Series) -> pd.Series:
 
 def normalize_event_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize all input files to a common Pyxis event schema:
-    TransactionDateTime, Device, UserName, TransactionType, MedDescription, Quantity, MedID
-    Supports both:
-      - Old 'All Device Event Report'
-      - New 'AuditTransactionDetail_RC' format
+    Normalize AuditTransactionDetail → Pyxis schema.
+    Ensures TransactionDateTime is parsed to datetime.
     """
 
     df = df.copy()
 
-    # --------------------------
-    # CASE 1 — AuditTransactionDetail format
-    # --------------------------
-    if "TransactionDateTime" in df.columns and "UserName" in df.columns:
+    # Case: AuditTransactionDetail format
+    if ("TransactionDateTime" in df.columns
+        and "UserName" in df.columns
+        and "CareAreaName" in df.columns):
+
         df_norm = pd.DataFrame()
 
-        df_norm["TransactionDateTime"] = df["TransactionDateTime"]
-        df_norm["Device"]             = df.get("StationName", "")
-        df_norm["UserName"]           = df["UserName"]
-        df_norm["TransactionType"]    = df["TransactionType"]
-        df_norm["MedDescription"]     = df.get("MedDescription", "")
-        df_norm["Quantity"]           = df.get("Quantity", "")
-        df_norm["MedID"]              = df.get("MedID", "")
+        df_norm["TransactionDateTime"] = pd.to_datetime(
+            df["TransactionDateTime"], 
+            errors="coerce",
+            format="%m/%d/%Y %H:%M:%S"  # your exact format
+        )
+
+        df_norm["Device"]          = df.get("StationName", "")
+        df_norm["UserName"]        = df["UserName"]
+        df_norm["TransactionType"] = df["TransactionType"]
+        df_norm["MedDescription"]  = df.get("MedDescription", "")
+        df_norm["Quantity"]        = df.get("Quantity", "")
+        df_norm["MedID"]           = df.get("MedID", "")
         df_norm["DrawerSubDrawerPocket"] = df.get("DrawerSubDrawerPocket", "")
 
         return df_norm
+
+    # Fallback: support older formats
+    # ...
+
 
     # --------------------------
     # CASE 2 — Original All Device Event Report
