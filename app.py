@@ -2749,22 +2749,54 @@ carousel_df = pd.concat(carousel_files, ignore_index=True) if carousel_files els
 
 
 # =================== TIME RANGE FILTER ===================
-_min = pd.to_datetime(ev_all[colmap["datetime"]].min())
-_max = pd.to_datetime(ev_all[colmap["datetime"]].max())
-min_ts = _min.to_pydatetime()
-max_ts = _max.to_pydatetime() if _max > _min else (min_ts + timedelta(minutes=1))
 
+# If ev_all is completely empty, stop early
+if ev_all.empty:
+    st.warning("No events available to filter.")
+    st.stop()
+
+# Extract datetime column safely
+dt_col = colmap.get("datetime", "TransactionDateTime")
+
+# Convert datetime column
+ev_all[dt_col] = pd.to_datetime(ev_all[dt_col], errors="coerce")
+
+# Drop rows where datetime is missing
+ev_all = ev_all.dropna(subset=[dt_col])
+
+# If still empty after cleaning, stop
+if ev_all.empty:
+    st.warning("No valid timestamps found in dataset.")
+    st.stop()
+
+# Compute min + max timestamps
+_min = ev_all[dt_col].min()
+_max = ev_all[dt_col].max()
+
+# Ensure Python datetime objects
+min_ts = pd.to_datetime(_min).to_pydatetime()
+max_ts = pd.to_datetime(_max).to_pydatetime()
+
+# Safety: if min == max, expand max by +1 minute
+if min_ts == max_ts:
+    max_ts = min_ts + timedelta(minutes=1)
+
+# Build slider
 rng = st.sidebar.slider(
     "Time range",
-    min_value=min_ts, max_value=max_ts, value=(min_ts, max_ts),
-    format="YYYY-MM-DD HH:mm"
+    min_value=min_ts,
+    max_value=max_ts,
+    value=(min_ts, max_ts),
+    format="YYYY-MM-DD HH:mm",
 )
 
+# Filter the dataframe
 ev_time = ev_all[
-    (ev_all[colmap["datetime"]] >= pd.to_datetime(rng[0])) &
-    (ev_all[colmap["datetime"]] <= pd.to_datetime(rng[1]))
+    (ev_all[dt_col] >= pd.to_datetime(rng[0])) &
+    (ev_all[dt_col] <= pd.to_datetime(rng[1]))
 ].copy()
 
+# If resulting time window is empty, stop
 if ev_time.empty:
     st.warning("No events in selected time range.")
     st.stop()
