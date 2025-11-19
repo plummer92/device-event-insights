@@ -1,4 +1,3 @@
- app.py
 # Device Event Insights — Pro (Supabase Postgres + cache-busted engine)
 # - Upload CSV/XLSX OR analyze Postgres history only
 # - Column mapping UI with duplicate guard
