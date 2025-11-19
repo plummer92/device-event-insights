@@ -44,10 +44,8 @@ DEFAULT_COLMAP = {
     "qty":      "Quantity",
     "medid":    "MedID",
 }
+colmap = DEFAULT_COLMAP.copy()
 
-# Make a default mapping available immediately (prevents NameError)
-# Make a default mapping available immediately (prevents NameError before mapping UI runs)
-colmap: Dict[str, str] = DEFAULT_COLMAP.copy()
 
 
 DEFAULT_IDLE_MIN = 30  # seconds to qualify as "walk/travel" gap
@@ -451,37 +449,39 @@ def parse_datetime_series(s: pd.Series) -> pd.Series:
 
 def normalize_event_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize AuditTransactionDetail → Pyxis schema.
-    Ensures TransactionDateTime is parsed to datetime.
+    Convert an AuditTransactionDetail CSV into the unified Pyxis event schema.
     """
 
     df = df.copy()
 
-    # Case: AuditTransactionDetail format
-    if ("TransactionDateTime" in df.columns
-        and "UserName" in df.columns
-        and "CareAreaName" in df.columns):
+    # --- REQUIRED columns for this format ---
+    required = [
+        "TransactionDateTime", "UserName", "TransactionType",
+        "MedDescription", "Quantity", "MedID"
+    ]
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
 
-        df_norm = pd.DataFrame()
+    # --- Build normalized event table ---
+    out = pd.DataFrame()
+    out["TransactionDateTime"] = pd.to_datetime(
+        df["TransactionDateTime"], 
+        format="%m/%d/%Y %H:%M:%S",
+        errors="coerce"
+    )
 
-        df_norm["TransactionDateTime"] = pd.to_datetime(
-            df["TransactionDateTime"], 
-            errors="coerce",
-            format="%m/%d/%Y %H:%M:%S"  # your exact format
-        )
+    out["Device"]          = df.get("StationName", "")
+    out["UserName"]        = df["UserName"]
+    out["TransactionType"] = df["TransactionType"]
+    out["MedDescription"]  = df["MedDescription"].astype(str)
+    out["Quantity"]        = pd.to_numeric(df["Quantity"], errors="coerce")
+    out["MedID"]           = df["MedID"].astype(str)
 
-        df_norm["Device"]          = df.get("StationName", "")
-        df_norm["UserName"]        = df["UserName"]
-        df_norm["TransactionType"] = df["TransactionType"]
-        df_norm["MedDescription"]  = df.get("MedDescription", "")
-        df_norm["Quantity"]        = df.get("Quantity", "")
-        df_norm["MedID"]           = df.get("MedID", "")
-        df_norm["DrawerSubDrawerPocket"] = df.get("DrawerSubDrawerPocket", "")
+    # Optional drawer/pocket mapping if it exists
+    out["DrawerSubDrawerPocket"] = df.get("DrawerSubDrawerPocket", "")
 
-        return df_norm
-
-    # Fallback: support older formats
-    # ...
+    return out
 
 
     # --------------------------
@@ -504,101 +504,18 @@ def normalize_event_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def normalize_event_columns(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize different Pyxis export formats into the common column set
-    that the app expects (All Device Event Report style).
-
-    - For classic All Device Event Report, columns already match.
-    - For AuditTransactionDetail, we map:
-        StationName          -> Device
-        CareAreaName         -> Area
-        DrawerSubDrawerPocket-> DrwSubDrwPkt
-    """
-    df = dedupe_columns(df_raw).copy()
-    cols = set(df.columns)
-
-    # Device / station name
-    if "StationName" in cols and "Device" not in cols:
-        df["Device"] = df["StationName"]
-
-    # Care area / location
-    if "CareAreaName" in cols and "Area" not in cols:
-        df["Area"] = df["CareAreaName"]
-
-    # Drawer + pocket
-    if "DrawerSubDrawerPocket" in cols and "DrwSubDrwPkt" not in cols:
-        df["DrwSubDrwPkt"] = df["DrawerSubDrawerPocket"]
-
-    # Make sure TransactionDateTime exists (Audit file already has it,
-    # but this keeps us flexible for future variants)
-    if "TransactionDateTime" not in cols:
-        for alt in ["EventDateTime", "Event Time", "DateTime"]:
-            if alt in cols:
-                df["TransactionDateTime"] = df[alt]
-                break
-
-    return df
-
-
-
 def load_upload(up) -> pd.DataFrame:
-    """
-    Preferred CSV-first loader.
-    - If CSV → load normally (fast & clean)
-    - If XLSX → convert to clean CSV structure
-    - Detect AuditTransactionDetail format automatically
-    - Normalize columns afterward
-    """
-
     name = up.name.lower()
 
-    # -----------------------------------------------------
-    # CASE 1: DIRECT CSV UPLOAD (BEST)
-    # -----------------------------------------------------
-    if name.endswith(".csv"):
-        try:
-            up.seek(0)
-            df_raw = pd.read_csv(up, low_memory=False)
-        except UnicodeDecodeError:
-            up.seek(0)
-            df_raw = pd.read_csv(up, encoding="latin-1", low_memory=False)
-
-        return normalize_event_columns(df_raw)
-
-    # -----------------------------------------------------
-    # CASE 2: XLSX → CONVERT TO CLEAN CSV STRUCTURE
-    # -----------------------------------------------------
-    elif name.endswith(".xlsx"):
-        # Peek at first 25 rows to detect AuditTransactionDetail format
-        probe = pd.read_excel(up, header=None, nrows=25)
-
-        # AuditTransactionDetail_RC: first 17 rows junk, row 18 header
-        audit_header_detected = probe.iloc[17].astype(str).str.contains(
-            r"TransactionDateTime|Transaction Type|MedDescription|Quantity",
-            case=False
-        ).any()
-
-        up.seek(0)
-
-        if audit_header_detected:
-            # Read with header row at index 17 → row 18 in Excel
-            df_raw = pd.read_excel(up, header=17)
+    try:
+        if name.endswith(".xlsx"):
+            return pd.read_excel(up)
         else:
-            # Fallback for normal Excel files
-            df_raw = pd.read_excel(up)
-
-        # Drop any leftover unnamed columns (common in Excel)
-        df_raw = df_raw.loc[:, ~df_raw.columns.str.contains("^Unnamed", case=False)]
-
-        return normalize_event_columns(df_raw)
-
-    # -----------------------------------------------------
-    # UNKNOWN FILE TYPE
-    # -----------------------------------------------------
-    else:
-        st.error("Unsupported file type. Please upload CSV or XLSX.")
-        return pd.DataFrame()
+            up.seek(0)
+            return pd.read_csv(up)
+    except Exception:
+        up.seek(0)
+        return pd.read_csv(up, encoding="latin-1")
 
 
 def base_clean(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
@@ -634,39 +551,23 @@ def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
     return sorted([x for x in df[col].dropna().astype(str).unique()])
 
 def build_pk(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.Series:
-    """
-    Build a stable SHA1 PK. Safe for empty DataFrames and mixed Pyxis/Carousel files.
-    """
-
-    # ========== 1. Handle empty DF safely ==========
-    if df is None or df.empty:
-        return pd.Series([], index=df.index if df is not None else None, dtype="string")
+    if df.empty:
+        return pd.Series([], dtype="string", index=df.index)
 
     cols = []
-
-    # ========== 2. Build each component column safely ==========
-    for k in ["datetime", "device", "user", "type", "desc", "qty", "medid"]:
-        c = colmap.get(k)
-
-        if c and c in df.columns:
-            # Normal case
-            s = df[c].astype("string").fillna("")
+    for key in ["datetime","device","user","type","desc","qty","medid"]:
+        col = colmap.get(key)
+        if col in df.columns:
+            cols.append(df[col].astype(str))
         else:
-            # Fallback: must be length-matched to df
-            s = pd.Series([""] * len(df), index=df.index, dtype="string")
+            cols.append(pd.Series([""] * len(df), dtype="string"))
 
-        cols.append(s)
-
-    # ========== 3. Stack safely ==========
-    arr = np.column_stack([c.values for c in cols])
-
-    # ========== 4. Hash each row to create PK ==========
-    out = [
-        hashlib.sha1("|".join(row).encode("utf-8")).hexdigest()
-        for row in arr
-    ]
-
-    return pd.Series(out, index=df.index, dtype="string")
+    arr = np.vstack([c.values for c in cols]).T
+    return pd.Series(
+        [hashlib.sha1("|".join(row).encode()).hexdigest() for row in arr],
+        index=df.index,
+        dtype="string",
+    )
 
 
 
@@ -2725,123 +2626,44 @@ if uploads:
         st.stop()
 
 # ============================ PROCESS UPLOADS ============================
-carousel_files = []
+carousel_files = []   # kept for compatibility but unused
 new_files = []
 
 if uploads:
-
     for up in uploads:
-        name_upper = up.name.upper()
-
-        # Load raw file once
         try:
             raw = load_upload(up)
-        except Exception as e:
-            st.error(f"Failed to read {up.name}: {e}")
-            continue
-
-        # Normalize colnames for detection
-        raw_cols = [c.lower().strip() for c in raw.columns]
-
-        # -------------------------------------
-        # HARD OVERRIDE: AuditTransactionDetail → treat as Pyxis event file
-        # -------------------------------------
-        if "transactiondatetime" in raw_cols and "username" in raw_cols and "careareaname" in raw_cols:
-            st.info(f"{up.name}: detected AuditTransactionDetail format. Treating as Pyxis events.")
             cleaned = normalize_event_columns(raw)
             new_files.append(cleaned)
+            st.success(f"{up.name}: loaded {len(cleaned):,} rows.")
+        except Exception as e:
+            st.error(f"{up.name}: failed to import: {e}")
             continue
 
-        # Detect Pyxis columns
-        has_pyxis = (
-            colmap["datetime"].lower() in raw_cols
-            and colmap["device"].lower() in raw_cols
-            and colmap["type"].lower() in raw_cols
-        )
-
-        # Detect Carousel columns
-        has_carousel = (
-            "prioritycode" in raw_cols
-            or "stationname" in raw_cols
-            or "sourcesystem" in raw_cols
-        )
-
-        # -------------------------------------
-        # CASE 1: Mixed file (Pyxis + Carousel)
-        # -------------------------------------
-        if has_pyxis and has_carousel:
-            st.info(f"{up.name}: detected mixed Pyxis + Carousel file. Splitting…")
-
-            # Split by presence of PriorityCode
-            rc_part = raw[raw.get("PriorityCode").notna()] if "PriorityCode" in raw.columns else pd.DataFrame()
-            pyxis_part = raw[raw.get("PriorityCode").isna()] if "PriorityCode" in raw.columns else raw.copy()
-
-            # Clean Carousel part
-            if not rc_part.empty:
-                cleaned_rc = preprocess_carousel_logistics(rc_part)
-                carousel_files.append(cleaned_rc)
-
-            # Clean Pyxis part
-            if not pyxis_part.empty:
-                try:
-                    cleaned_pyxis = base_clean(pyxis_part, colmap)
-                    if not cleaned_pyxis.empty:
-                        new_files.append(cleaned_pyxis)
-                except Exception as e:
-                    st.error(f"{up.name}: Pyxis content could not be parsed: {e}")
-
-            continue
-
-        # -------------------------------------
-        # CASE 2: Pure carousel file
-        # -------------------------------------
-        if has_carousel and not has_pyxis:
-            st.info(f"{up.name}: treated as pure Carousel/Logistics file.")
-            cleaned_rc = preprocess_carousel_logistics(raw)
-            carousel_files.append(cleaned_rc)
-            continue
-
-        # -------------------------------------
-        # CASE 3: Pure pyxis event file
-        # -------------------------------------
-        if has_pyxis:
-            try:
-                cleaned = base_clean(raw, colmap)
-                if not cleaned.empty:
-                    new_files.append(cleaned)
-            except Exception as e:
-                st.error(f"{up.name}: Pyxis event parse error: {e}")
-            continue
-
-        # -------------------------------------
-        # CASE 4: Unrecognized
-        # -------------------------------------
-        st.warning(f"{up.name}: File not recognized as Pyxis or Carousel.")
-        continue
-
-    # -----------------------------------------
-    # STOP if no Pyxis event files were found
-    # -----------------------------------------
     if not new_files:
-        st.warning("No usable Pyxis event files found.")
+        st.error("No valid AuditTransactionDetail CSVs uploaded.")
         st.stop()
 
-    # -----------------------------------------
-    # MERGE new files into DB
-    # -----------------------------------------
     new_ev = pd.concat(new_files, ignore_index=True)
-    new_ev["pk"] = build_pk(new_ev, colmap)
-    new_ev = new_ev.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
 
+    # --- Build PK ---
+    new_ev["pk"] = build_pk(new_ev, colmap)
+
+    new_ev = (
+        new_ev.drop_duplicates(subset=["pk"])
+              .sort_values("TransactionDateTime")
+    )
+
+    # Merge with history
     frames = [history, new_ev] if not history.empty else [new_ev]
     ev_all = (
         pd.concat(frames, ignore_index=True)
-        .drop_duplicates(subset=["pk"])
-        .sort_values(colmap["datetime"])
+          .drop_duplicates(subset=["pk"])
+          .sort_values("TransactionDateTime")
     )
 
-    new_pks = set(new_ev["pk"])
-    old_pks = set(history["pk"]) if (not history.empty and "pk" in history.columns) else set()
+    # Identify new rows
+    old_pks = set(history["pk"]) if not history.empty else set()
     to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
 
     if to_save.empty:
@@ -2851,8 +2673,8 @@ if uploads:
         (st.sidebar.success if ok else st.sidebar.error)(msg)
 
 else:
-    # Database-only mode
     ev_all = history.copy()
+
 
 # Build carousel_df
 carousel_df = pd.concat(carousel_files, ignore_index=True) if carousel_files else pd.DataFrame()
