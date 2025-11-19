@@ -610,16 +610,46 @@ def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
     return sorted([x for x in df[col].dropna().astype(str).unique()])
 
 def build_pk(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.Series:
+    """
+    Build a stable SHA1 hash primary key for each Pyxis event row.
+    Safe for empty DataFrames and mixed-format files.
+    """
+
+    # ------------------------------------------------------------------
+    # If df is empty -> return an empty Series (avoids ValueError)
+    # ------------------------------------------------------------------
+    if df is None or df.empty:
+        return pd.Series([], index=df.index if df is not None else None, dtype="string")
+
     cols = []
-    for k in ["datetime","device","user","type","desc","qty","medid"]:
+
+    for k in ["datetime", "device", "user", "type", "desc", "qty", "medid"]:
         c = colmap.get(k)
+
         if c and c in df.columns:
-            cols.append(df[c].astype(str))
+            # Normal case: column exists
+            s = df[c].astype("string").fillna("")
         else:
-            cols.append(pd.Series([""], index=df.index, dtype="string"))
-    arr = np.vstack([c.values for c in cols]).T
-    out = [hashlib.sha1("|".join(row).encode("utf-8")).hexdigest() for row in arr]
+            # Fallback: create a Series of empty strings of correct length
+            s = pd.Series([""] * len(df), index=df.index, dtype="string")
+
+        cols.append(s)
+
+    # ------------------------------------------------------------------
+    # Stack values safely for hashing
+    # ------------------------------------------------------------------
+    arr = np.column_stack([c.values for c in cols])
+
+    # ------------------------------------------------------------------
+    # SHA1 hash per row
+    # ------------------------------------------------------------------
+    out = [
+        hashlib.sha1("|".join(row).encode("utf-8")).hexdigest()
+        for row in arr
+    ]
+
     return pd.Series(out, index=df.index, dtype="string")
+
 
 def weekly_summary(ev: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
     ts, dev, usr, typ = colmap["datetime"], colmap["device"], colmap["user"], colmap["type"]
