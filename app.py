@@ -89,6 +89,21 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
         df = df.loc[:, ~df.columns.duplicated()].copy()
     df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
     return df
+def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove BOM characters, whitespace, invisible unicode, and standardize column names.
+    Example: 'ï»¿CareAreaName ' → 'CareAreaName'
+    """
+    cleaned = {}
+    for c in df.columns:
+        new = (
+            c.replace("\ufeff", "")            # remove BOM
+             .replace("ï»¿", "")               # remove BOM variant
+             .strip()                          # trim whitespace
+        )
+        cleaned[c] = new
+    df = df.rename(columns=cleaned)
+    return df
 
 
 def is_audit_transaction_detail(df):
@@ -501,11 +516,10 @@ def normalize_event_columns(df: pd.DataFrame) -> pd.DataFrame:
 def load_upload(up) -> pd.DataFrame:
     """
     Fast CSV/XLSX loader optimized for large AuditTransactionDetail files.
-    Uses pyarrow for 10x faster CSV parsing.
+    Cleans BOM and column names automatically.
     """
     name = up.name.lower()
 
-    # Define common dtypes to prevent mixed-type warnings & speed parsing
     dtype_map = {
         "StationName": "string",
         "UserName": "string",
@@ -517,26 +531,29 @@ def load_upload(up) -> pd.DataFrame:
 
     try:
         if name.endswith(".xlsx"):
-            return pd.read_excel(up, engine="openpyxl")
-
-        # Try pyarrow engine first (super fast)
-        up.seek(0)
-        return pd.read_csv(
-            up,
-            engine="pyarrow",
-            dtype=dtype_map,
-            low_memory=False
-        )
+            df = pd.read_excel(up, engine="openpyxl")
+        else:
+            up.seek(0)
+            df = pd.read_csv(
+                up,
+                engine="pyarrow",
+                dtype=dtype_map,
+                low_memory=False,
+            )
 
     except Exception:
-        # Fallback for weird encodings
         up.seek(0)
-        return pd.read_csv(
+        df = pd.read_csv(
             up,
             dtype=dtype_map,
             low_memory=False,
             encoding="latin-1"
         )
+
+    # 🔥 Fix BOM and bad column names
+    df = clean_column_names(df)
+
+    return df
 
 
 
