@@ -519,32 +519,20 @@ def normalize_event_columns(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_upload(up) -> pd.DataFrame:
-    """Read an uploaded file (CSV/XLSX) and normalize its columns."""
+    """
+    Preferred CSV-first loader.
+    - If CSV → load normally (fast & clean)
+    - If XLSX → convert to clean CSV structure
+    - Detect AuditTransactionDetail format automatically
+    - Normalize columns afterward
+    """
 
     name = up.name.lower()
 
-    # ----------------------------------------------------------------------
-    # 1) Smart Excel reader: detect if this is AuditTransactionDetail format
-    # ----------------------------------------------------------------------
-    if name.endswith(".xlsx"):
-        # Read the first 25 rows without headers just for detection
-        df_probe = pd.read_excel(up, header=None, nrows=25)
-
-        # If row 18 (index 17) contains known A-TD headers → use header=17
-        if df_probe.iloc[17].astype(str).str.contains(
-            r"TransactionDateTime|TransactionType|MedDescription|Quantity",
-            case=False
-        ).any():
-            up.seek(0)
-            df_raw = pd.read_excel(up, header=17)  # The FIX
-        else:
-            up.seek(0)
-            df_raw = pd.read_excel(up)
-
-    # ----------------------------------------------------------------------
-    # CSV handler (unchanged)
-    # ----------------------------------------------------------------------
-    else:
+    # -----------------------------------------------------
+    # CASE 1: DIRECT CSV UPLOAD (BEST)
+    # -----------------------------------------------------
+    if name.endswith(".csv"):
         try:
             up.seek(0)
             df_raw = pd.read_csv(up, low_memory=False)
@@ -552,10 +540,42 @@ def load_upload(up) -> pd.DataFrame:
             up.seek(0)
             df_raw = pd.read_csv(up, encoding="latin-1", low_memory=False)
 
-    # ----------------------------------------------------------------------
-    # 2) Normalize column names into canonical Pyxis events format
-    # ----------------------------------------------------------------------
-    return normalize_event_columns(df_raw)
+        return normalize_event_columns(df_raw)
+
+    # -----------------------------------------------------
+    # CASE 2: XLSX → CONVERT TO CLEAN CSV STRUCTURE
+    # -----------------------------------------------------
+    elif name.endswith(".xlsx"):
+        # Peek at first 25 rows to detect AuditTransactionDetail format
+        probe = pd.read_excel(up, header=None, nrows=25)
+
+        # AuditTransactionDetail_RC: first 17 rows junk, row 18 header
+        audit_header_detected = probe.iloc[17].astype(str).str.contains(
+            r"TransactionDateTime|Transaction Type|MedDescription|Quantity",
+            case=False
+        ).any()
+
+        up.seek(0)
+
+        if audit_header_detected:
+            # Read with header row at index 17 → row 18 in Excel
+            df_raw = pd.read_excel(up, header=17)
+        else:
+            # Fallback for normal Excel files
+            df_raw = pd.read_excel(up)
+
+        # Drop any leftover unnamed columns (common in Excel)
+        df_raw = df_raw.loc[:, ~df_raw.columns.str.contains("^Unnamed", case=False)]
+
+        return normalize_event_columns(df_raw)
+
+    # -----------------------------------------------------
+    # UNKNOWN FILE TYPE
+    # -----------------------------------------------------
+    else:
+        st.error("Unsupported file type. Please upload CSV or XLSX.")
+        return pd.DataFrame()
+
 
 def base_clean(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
     ev = pd.DataFrame()
