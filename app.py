@@ -40,7 +40,6 @@ DEFAULT_COLMAP = {
     "device":   "Device",
     "user":     "UserName",
     "type":     "TransactionType",
-    # optional:
     "desc":     "MedDescription",
     "qty":      "Quantity",
     "medid":    "MedID",
@@ -445,40 +444,53 @@ def parse_datetime_series(s: pd.Series) -> pd.Series:
         out = out.dt.tz_convert("UTC").dt.tz_localize(None)
     return out
 
-def normalize_event_columns(df_raw: pd.DataFrame) -> pd.DataFrame:
+def normalize_event_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize different Pyxis export formats into the common column set
-    that the app expects (All Device Event Report style).
-
-    Currently supports:
-    - Classic "All Device Event Report" (has Device, Area, DrwSubDrwPkt)
-    - AuditTransactionDetail export (has StationName, CareAreaName,
-      DrawerSubDrawerPocket, etc.)
+    Normalize all input files to a common Pyxis event schema:
+    TransactionDateTime, Device, UserName, TransactionType, MedDescription, Quantity, MedID
+    Supports both:
+      - Old 'All Device Event Report'
+      - New 'AuditTransactionDetail_RC' format
     """
-    df = dedupe_columns(df_raw).copy()
-    cols = set(df.columns)
 
-    # Map AuditTransactionDetail -> All Device style
-    # Device
-    if "StationName" in cols and "Device" not in cols:
-        df["Device"] = df["StationName"]
+    df = df.copy()
 
-    # Care area / location
-    if "CareAreaName" in cols and "Area" not in cols:
-        df["Area"] = df["CareAreaName"]
+    # --------------------------
+    # CASE 1 — AuditTransactionDetail format
+    # --------------------------
+    if "TransactionDateTime" in df.columns and "UserName" in df.columns:
+        df_norm = pd.DataFrame()
 
-    # Drawer / pocket addressing
-    if "DrawerSubDrawerPocket" in cols and "DrwSubDrwPkt" not in cols:
-        df["DrwSubDrwPkt"] = df["DrawerSubDrawerPocket"]
+        df_norm["TransactionDateTime"] = df["TransactionDateTime"]
+        df_norm["Device"]             = df.get("StationName", "")
+        df_norm["UserName"]           = df["UserName"]
+        df_norm["TransactionType"]    = df["TransactionType"]
+        df_norm["MedDescription"]     = df.get("MedDescription", "")
+        df_norm["Quantity"]           = df.get("Quantity", "")
+        df_norm["MedID"]              = df.get("MedID", "")
+        df_norm["DrawerSubDrawerPocket"] = df.get("DrawerSubDrawerPocket", "")
 
-    # Ensure TransactionDateTime exists where a close variant is present
-    if "TransactionDateTime" not in cols:
-        for alt in ["EventDateTime", "Event Time", "DateTime"]:
-            if alt in cols:
-                df["TransactionDateTime"] = df[alt]
-                break
+        return df_norm
+
+    # --------------------------
+    # CASE 2 — Original All Device Event Report
+    # --------------------------
+    # Try to match your previous schema
+    possible_dt_cols = [
+        "TransactionDateTime", "DateTime", "Transaction Date/Time", "EventTime"
+    ]
+    dt_col = next((c for c in possible_dt_cols if c in df.columns), None)
+
+    if dt_col:
+        df = df.rename(columns={dt_col: "TransactionDateTime"})
+    
+    # Fill missing core columns
+    for col in ["Device", "UserName", "TransactionType", "MedDescription", "Quantity", "MedID"]:
+        if col not in df.columns:
+            df[col] = ""
 
     return df
+
 
 def normalize_event_columns(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
