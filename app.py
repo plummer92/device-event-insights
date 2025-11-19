@@ -2736,6 +2736,15 @@ if uploads:
         # Normalize colnames for detection
         raw_cols = [c.lower().strip() for c in raw.columns]
 
+        # -------------------------------------
+        # HARD OVERRIDE: AuditTransactionDetail → treat as Pyxis event file
+        # -------------------------------------
+        if "transactiondatetime" in raw_cols and "username" in raw_cols and "careareaname" in raw_cols:
+            st.info(f"{up.name}: detected AuditTransactionDetail format. Treating as Pyxis events.")
+            cleaned = normalize_event_columns(raw)
+            new_files.append(cleaned)
+            continue
+
         # Detect Pyxis columns
         has_pyxis = (
             colmap["datetime"].lower() in raw_cols
