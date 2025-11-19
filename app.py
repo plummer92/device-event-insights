@@ -602,22 +602,25 @@ def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
 def build_pk(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.Series:
     """
     Build a stable primary key from a combination of columns.
-    Optional fields (desc, qty, medid) are handled safely if missing.
+    Optional fields (device, user, type, desc, qty, medid) are handled safely
+    if missing OR containing null/NA values.
     """
 
     def safe_col(key: str) -> pd.Series:
         col = colmap.get(key)
         if not col or col not in df.columns:
-            # Return empty strings aligned to df index
+            # Return empty strings aligned with df index
             return pd.Series([""] * len(df), index=df.index, dtype="string")
-        return df[col].astype("string")
+        # Convert to string and replace NA/NaN with ""
+        return df[col].astype("string").fillna("")
 
     # datetime is required – if it's missing, fail loudly
     dt_col = colmap.get("datetime", "TransactionDateTime")
     if dt_col not in df.columns:
         raise KeyError(f"Datetime column '{dt_col}' not found in dataframe for PK build.")
 
-    base = df[dt_col].astype("string")
+    # Base datetime string, no NA
+    base = df[dt_col].astype("string").fillna("")
 
     concat_str = (
         base + "|" +
@@ -629,7 +632,10 @@ def build_pk(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.Series:
         safe_col("medid")
     )
 
-    return concat_str.apply(
+    # Final safety: if anything is still NA, convert to "" and ensure plain str
+    concat_str = concat_str.fillna("").astype(str)
+
+    return concat_str.map(
         lambda s: hashlib.sha256((s + ENGINE_SALT).encode("utf-8")).hexdigest()
     )
 
