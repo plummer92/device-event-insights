@@ -91,20 +91,18 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Remove BOM characters, whitespace, invisible unicode, and standardize column names.
-    Example: 'ï»¿CareAreaName ' → 'CareAreaName'
+    Remove BOM characters (ï»¿, \ufeff), trim whitespace,
+    and normalize headers to proper column names.
     """
     cleaned = {}
     for c in df.columns:
         new = (
-            c.replace("\ufeff", "")            # remove BOM
-             .replace("ï»¿", "")               # remove BOM variant
-             .strip()                          # trim whitespace
+            c.replace("\ufeff", "")     # Unicode BOM
+             .replace("ï»¿", "")        # UTF-8 BOM variant
+             .strip()                   # strip whitespace
         )
         cleaned[c] = new
-    df = df.rename(columns=cleaned)
-    return df
-
+    return df.rename(columns=cleaned)
 
 def is_audit_transaction_detail(df):
     return "CareAreaName" in df.columns and "TransactionDateTime" in df.columns
@@ -469,6 +467,15 @@ def normalize_event_columns(df: pd.DataFrame) -> pd.DataFrame:
         TransactionDateTime, Device, UserName, TransactionType,
         MedDescription, Quantity, MedID, DrawerSubDrawerPocket
     """
+    required = [
+    "TransactionDateTime", "UserName",
+    "TransactionType", "MedDescription",
+    "Quantity", "MedID"
+]
+
+for col in required:
+    if col not in df.columns:
+        raise ValueError(f"Missing required column: {col}. Columns: {df.columns.tolist()}")
 
     df = df.copy()
 
@@ -514,10 +521,6 @@ def normalize_event_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_upload(up) -> pd.DataFrame:
-    """
-    Fast CSV/XLSX loader optimized for large AuditTransactionDetail files.
-    Cleans BOM and column names automatically.
-    """
     name = up.name.lower()
 
     dtype_map = {
@@ -530,8 +533,11 @@ def load_upload(up) -> pd.DataFrame:
     }
 
     try:
+        # Excel
         if name.endswith(".xlsx"):
             df = pd.read_excel(up, engine="openpyxl")
+
+        # CSV (fast path)
         else:
             up.seek(0)
             df = pd.read_csv(
@@ -542,19 +548,19 @@ def load_upload(up) -> pd.DataFrame:
             )
 
     except Exception:
+        # Fallback for odd encodings
         up.seek(0)
         df = pd.read_csv(
             up,
             dtype=dtype_map,
             low_memory=False,
-            encoding="latin-1"
+            encoding="latin-1",
         )
 
-    # 🔥 Fix BOM and bad column names
+    # 🔥 CLEAN ALL COLUMN NAMES (Fixes ï»¿CareAreaName & others)
     df = clean_column_names(df)
 
     return df
-
 
 
 def base_clean(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
