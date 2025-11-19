@@ -611,44 +611,39 @@ def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
 
 def build_pk(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.Series:
     """
-    Build a stable SHA1 hash primary key for each Pyxis event row.
-    Safe for empty DataFrames and mixed-format files.
+    Build a stable SHA1 PK. Safe for empty DataFrames and mixed Pyxis/Carousel files.
     """
 
-    # ------------------------------------------------------------------
-    # If df is empty -> return an empty Series (avoids ValueError)
-    # ------------------------------------------------------------------
+    # ========== 1. Handle empty DF safely ==========
     if df is None or df.empty:
         return pd.Series([], index=df.index if df is not None else None, dtype="string")
 
     cols = []
 
+    # ========== 2. Build each component column safely ==========
     for k in ["datetime", "device", "user", "type", "desc", "qty", "medid"]:
         c = colmap.get(k)
 
         if c and c in df.columns:
-            # Normal case: column exists
+            # Normal case
             s = df[c].astype("string").fillna("")
         else:
-            # Fallback: create a Series of empty strings of correct length
+            # Fallback: must be length-matched to df
             s = pd.Series([""] * len(df), index=df.index, dtype="string")
 
         cols.append(s)
 
-    # ------------------------------------------------------------------
-    # Stack values safely for hashing
-    # ------------------------------------------------------------------
+    # ========== 3. Stack safely ==========
     arr = np.column_stack([c.values for c in cols])
 
-    # ------------------------------------------------------------------
-    # SHA1 hash per row
-    # ------------------------------------------------------------------
+    # ========== 4. Hash each row to create PK ==========
     out = [
         hashlib.sha1("|".join(row).encode("utf-8")).hexdigest()
         for row in arr
     ]
 
     return pd.Series(out, index=df.index, dtype="string")
+
 
 
 def weekly_summary(ev: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
