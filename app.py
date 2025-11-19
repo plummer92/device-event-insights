@@ -1,4 +1,4 @@
-# app.py
+ app.py
 # Device Event Insights — Pro (Supabase Postgres + cache-busted engine)
 # - Upload CSV/XLSX OR analyze Postgres history only
 # - Column mapping UI with duplicate guard
@@ -24,7 +24,6 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 import matplotlib.pyplot as plt  # needed for pandas Styler gradients
 from pandas.api.types import DatetimeTZDtype
-from sqlalchemy import text
 
 
 
@@ -40,47 +39,18 @@ DEFAULT_COLMAP = {
     "device":   "Device",
     "user":     "UserName",
     "type":     "TransactionType",
+    # optional:
     "desc":     "MedDescription",
     "qty":      "Quantity",
     "medid":    "MedID",
 }
-colmap = DEFAULT_COLMAP.copy()
 
+# Make a default mapping available immediately (prevents NameError)
+# Make a default mapping available immediately (prevents NameError before mapping UI runs)
+colmap: Dict[str, str] = DEFAULT_COLMAP.copy()
 
 
 DEFAULT_IDLE_MIN = 30  # seconds to qualify as "walk/travel" gap
-
-MY_STAFF_USERS = {
-    "FRAZIER, ELIZABETH",
-    "SPAIN, DELORIS",
-    "DORSEY, LATESSA",
-    "EVANICH, DAVID",
-    "SCHUERMAN, ADREAN",
-    "UNDERWOOD, RICK",
-    "CLAY, NICHOLAS",
-    "KAYLOR, HEATHER",
-    "GALL, MALLORY",
-    "JABUSCH, DANIEL",
-    "SHIELDS, MELISSA",
-    "FOLEY, JAIMES",
-    "SIMMONS, NICOLE",
-    "SALEH, SHAIMA",
-    "HARRIS, MEGAN",
-    "OZEE, KARA",
-    "GARTSHORE, JOHN",
-    "MOQUIA, WILMAR",
-    "BHANDARI, SHIVA",
-    "WALKER, JERMON",
-    "EPPS, RAEVEN",
-    "ALLEN, LOGAN",
-    "DYKSTRA, JAVIER",
-    "NUGENT, KATHLEEN",
-    "HO, ALI",
-    "COOK, CANDICE",
-    "DUFER, MELISSA",
-    "BERNSTEIN, SHIRLEY",
-    "PHILLIPS, SYDNI",
-}
 
 # ----------------------------- HELPERS --------------------------------
 def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -89,242 +59,6 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
         df = df.loc[:, ~df.columns.duplicated()].copy()
     df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
     return df
-def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Remove BOM characters (ï»¿, \ufeff), trim whitespace,
-    and normalize headers to proper column names.
-    """
-    cleaned = {}
-    for c in df.columns:
-        new = (
-            c.replace("\ufeff", "")     # Unicode BOM
-             .replace("ï»¿", "")        # UTF-8 BOM variant
-             .strip()                   # strip whitespace
-        )
-        cleaned[c] = new
-    return df.rename(columns=cleaned)
-
-def is_audit_transaction_detail(df):
-    return "CareAreaName" in df.columns and "TransactionDateTime" in df.columns
-
-
-def preprocess_carousel_logistics(df_rc_raw: pd.DataFrame) -> pd.DataFrame:
-    df = df_rc_raw.copy()
-
-    # Normalize columns (strip spaces)
-    df.columns = df.columns.str.strip()
-
-    # Normalize datetime
-    if "TransactionDateTime" in df.columns:
-        df["TransactionDateTime"] = pd.to_datetime(
-            df["TransactionDateTime"], errors="coerce"
-        )
-
-    # Normalize MedID / description if present
-    if "MedID" in df.columns:
-        df["MedID"] = df["MedID"].astype(str).str.strip()
-    if "MedDescription" in df.columns:
-        df["MedDescription"] = df["MedDescription"].astype(str).str.strip()
-
-    # Priority code (for RETURN mapping)
-    if "PriorityCode" in df.columns:
-        df["PriorityCode"] = (
-            df["PriorityCode"].astype(str).str.strip().str.upper()
-        )
-    else:
-        df["PriorityCode"] = ""
-
-    df["__source"] = "carousel"
-    return df
-
-def attach_carousel_pick_to_refills(
-    data_f: pd.DataFrame,
-    carousel_df: pd.DataFrame,
-    colmap: dict,
-    max_hours: float = 8.0,
-) -> pd.DataFrame:
-    """
-    For each Pyxis REFILL event, find the most recent prior carousel event
-    for the same MedID (excluding PriorityCode == 'RETURN') within max_hours.
-    """
-    if carousel_df.empty:
-        return data_f.copy()
-
-    type_col = colmap["type"]
-    med_col = colmap.get("medid")
-    ts_col = colmap["datetime"]
-
-    if med_col is None or med_col not in data_f.columns:
-        return data_f.copy()
-
-    df = data_f.copy()
-
-    # Only refill-like rows
-    refills = df[df[type_col].str.contains("REFILL", case=False, na=False)].copy()
-    if refills.empty:
-        return df
-
-    # Carousel picks (not RETURN)
-    rc_picks = carousel_df[carousel_df["PriorityCode"] != "RETURN"].copy()
-    if rc_picks.empty:
-        return df
-
-    # Ensure datetime types
-    refills[ts_col] = pd.to_datetime(refills[ts_col], errors="coerce")
-    rc_picks["TransactionDateTime"] = pd.to_datetime(
-        rc_picks["TransactionDateTime"], errors="coerce"
-    )
-
-    # 🔑 merge_asof requirement: left_on / right_on must be sorted by time
-    refills = refills.sort_values(ts_col)
-    rc_picks = rc_picks.sort_values("TransactionDateTime")
-
-    # Merge asof: nearest PRIOR pick for the same MedID
-    merged = pd.merge_asof(
-        refills,
-        rc_picks,
-        left_on=ts_col,
-        right_on="TransactionDateTime",
-        left_by=med_col,
-        right_by="MedID",
-        direction="backward",
-        suffixes=("", "_rc"),
-    )
-
-    # Filter to those within max_hours window
-    max_delta = pd.to_timedelta(max_hours, unit="h")
-    delta = merged[ts_col] - merged["TransactionDateTime"]
-    too_far = delta > max_delta
-
-    merged.loc[too_far, ["TransactionDateTime", "StationName", "PriorityCode"]] = [
-        pd.NaT,
-        None,
-        None,
-    ]
-
-    # Expose clean columns
-    merged["carousel_pick_ts"] = merged["TransactionDateTime"]
-    merged["carousel_pick_station"] = merged.get("StationName")
-    merged["carousel_pick_priority"] = merged.get("PriorityCode")
-
-    # Drop raw RC columns we don't want
-    drop_cols = [
-        c
-        for c in merged.columns
-        if c.endswith("_rc")
-        or c in ["TransactionDateTime", "StationName", "PriorityCode"]
-    ]
-    drop_cols = [
-        c
-        for c in drop_cols
-        if c
-        not in [
-            "carousel_pick_ts",
-            "carousel_pick_station",
-            "carousel_pick_priority",
-        ]
-    ]
-    merged = merged.drop(columns=drop_cols, errors="ignore")
-
-    # Put merged refill rows back into df
-    df.loc[merged.index, merged.columns] = merged
-
-    return df
-
-def attach_carousel_return_to_unloads(
-    data_f: pd.DataFrame,
-    carousel_df: pd.DataFrame,
-    colmap: dict,
-    max_hours: float = 8.0,
-) -> pd.DataFrame:
-    """
-    For each Pyxis UNLOAD event, find the nearest FOLLOWING
-    carousel event with PriorityCode == 'RETURN' for the same MedID.
-    """
-    if carousel_df.empty:
-        return data_f.copy()
-
-    type_col = colmap["type"]
-    med_col = colmap.get("medid")
-    ts_col = colmap["datetime"]
-
-    if med_col is None or med_col not in data_f.columns:
-        return data_f.copy()
-
-    df = data_f.copy()
-
-    # Only unload rows
-    unloads = df[df[type_col].str.contains("UNLOAD", case=False, na=False)].copy()
-    if unloads.empty:
-        return df
-
-    # Carousel returns ONLY
-    rc_returns = carousel_df[carousel_df["PriorityCode"] == "RETURN"].copy()
-    if rc_returns.empty:
-        return df
-
-    # Ensure datetime types
-    unloads[ts_col] = pd.to_datetime(unloads[ts_col], errors="coerce")
-    rc_returns["TransactionDateTime"] = pd.to_datetime(
-        rc_returns["TransactionDateTime"], errors="coerce"
-    )
-
-    # 🔑 merge_asof requirement: sort by time column
-    unloads = unloads.sort_values(ts_col)
-    rc_returns = rc_returns.sort_values("TransactionDateTime")
-
-    # Match "forward in time"
-    merged = pd.merge_asof(
-        unloads,
-        rc_returns,
-        left_on=ts_col,
-        right_on="TransactionDateTime",
-        left_by=med_col,
-        right_by="MedID",
-        direction="forward",
-        suffixes=("", "_rc_return"),
-    )
-
-    # Limit by max_hours
-    max_delta = pd.to_timedelta(max_hours, unit="h")
-    delta = merged["TransactionDateTime"] - merged[ts_col]
-    too_far = delta > max_delta
-
-    merged.loc[too_far, ["TransactionDateTime", "StationName", "PriorityCode"]] = [
-        pd.NaT,
-        None,
-        None,
-    ]
-
-    merged["carousel_return_ts"] = merged["TransactionDateTime"]
-    merged["carousel_return_station"] = merged.get("StationName")
-    merged["carousel_return_priority"] = merged.get("PriorityCode")
-
-    drop_cols = [
-        c
-        for c in merged.columns
-        if c.endswith("_rc_return")
-        or c in ["TransactionDateTime", "StationName", "PriorityCode"]
-    ]
-    drop_cols = [
-        c
-        for c in drop_cols
-        if c
-        not in [
-            "carousel_return_ts",
-            "carousel_return_station",
-            "carousel_return_priority",
-        ]
-    ]
-    merged = merged.drop(columns=drop_cols, errors="ignore")
-
-    df.loc[merged.index, merged.columns] = merged
-
-    return df
-
-
-
-
 
 # ---------- SIMPLE EXTRACTOR FOR DEVICE ACTIVITY LOG ----------
 
@@ -460,131 +194,47 @@ def parse_datetime_series(s: pd.Series) -> pd.Series:
         out = out.dt.tz_convert("UTC").dt.tz_localize(None)
     return out
 
-def normalize_event_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert AuditTransactionDetail CSV → clean Pyxis event schema.
-    Guaranteed to return:
-        TransactionDateTime, Device, UserName, TransactionType,
-        MedDescription, Quantity, MedID, DrawerSubDrawerPocket
-    """
-
-    # 1. Validate required columns
-    required = [
-        "TransactionDateTime", "UserName",
-        "TransactionType", "MedDescription",
-        "Quantity", "MedID"
-    ]
-
-    for col in required:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}. Columns: {df.columns.tolist()}")
-
-    # 2. Safe copy
-    df = df.copy()
-
-    # 3. Parse datetime (strict format)
-    dt = pd.to_datetime(
-        df["TransactionDateTime"],
-        format="%m/%d/%Y %H:%M:%S",
-        errors="coerce"
-    )
-
-    # 4. Build clean normalized table
-    out = pd.DataFrame({
-        "TransactionDateTime": dt,
-        "Device": df.get("StationName", "").astype("string"),
-        "UserName": df["UserName"].astype("string"),
-        "TransactionType": df["TransactionType"].astype("string"),
-        "MedDescription": df["MedDescription"].astype("string"),
-        "Quantity": pd.to_numeric(df["Quantity"], errors="coerce"),
-        "MedID": df["MedID"].astype("string"),
-        "DrawerSubDrawerPocket": df.get("DrawerSubDrawerPocket", "").astype("string"),
-    })
-
-    return out
-
-
-    # --------------------------
-    # CASE 2 — Original All Device Event Report
-    # --------------------------
-    # Try to match your previous schema
-    possible_dt_cols = [
-        "TransactionDateTime", "DateTime", "Transaction Date/Time", "EventTime"
-    ]
-    dt_col = next((c for c in possible_dt_cols if c in df.columns), None)
-
-    if dt_col:
-        df = df.rename(columns={dt_col: "TransactionDateTime"})
-    
-    # Fill missing core columns
-    for col in ["Device", "UserName", "TransactionType", "MedDescription", "Quantity", "MedID"]:
-        if col not in df.columns:
-            df[col] = ""
-
-    return df
-
-
 def load_upload(up) -> pd.DataFrame:
     name = up.name.lower()
-
-    dtype_map = {
-        "StationName": "string",
-        "UserName": "string",
-        "TransactionType": "string",
-        "MedDescription": "string",
-        "MedID": "string",
-        "DrawerSubDrawerPocket": "string",
-    }
-
+    if name.endswith(".xlsx"):
+        return pd.read_excel(up)
     try:
-        # Excel
-        if name.endswith(".xlsx"):
-            df = pd.read_excel(up, engine="openpyxl")
-
-        # CSV (fast path)
-        else:
-            up.seek(0)
-            df = pd.read_csv(
-                up,
-                engine="pyarrow",
-                dtype=dtype_map,
-                low_memory=False,
-            )
-
-    except Exception:
-        # Fallback for odd encodings
         up.seek(0)
-        df = pd.read_csv(
-            up,
-            dtype=dtype_map,
-            low_memory=False,
-            encoding="latin-1",
-        )
+        return pd.read_csv(up, low_memory=False)
+    except UnicodeDecodeError:
+        up.seek(0)
+        return pd.read_csv(up, encoding="latin-1", low_memory=False)
+    try:
+        up.seek(0)
+        return pd.read_csv(up)
+    except UnicodeDecodeError:
+        up.seek(0)
+        return pd.read_csv(up, encoding="latin-1")
 
-    # 🔥 CLEAN ALL COLUMN NAMES (Fixes ï»¿CareAreaName & others)
-    df = clean_column_names(df)
+def base_clean(df_raw: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
+    out = dedupe_columns(df_raw).copy()
+    dtcol = colmap["datetime"]
+    if dtcol not in out.columns:
+        raise ValueError(f"Mapped datetime column '{dtcol}' not found in file.")
+    s = out[dtcol]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    out[dtcol] = parse_datetime_series(s)
 
-    return df
+    if colmap.get("qty") and colmap["qty"] in out.columns:
+        out[colmap["qty"]] = pd.to_numeric(out[colmap["qty"]], errors="coerce")
 
+    for key in ["device", "user", "type", "desc", "medid"]:
+        c = colmap.get(key)
+        if c and c in out.columns:
+            out[c] = out[c].astype("string").str.strip()
 
-def base_clean(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
-    ev = pd.DataFrame()
-
-    ev["dt"]     = pd.to_datetime(df[colmap["datetime"]], errors="coerce")
-    ev["device"] = df[colmap["device"]].astype("string")
-    ev["user"]   = df[colmap["user"]].astype("string")
-    ev["type"]   = df[colmap["type"]].astype("string")
-    ev["desc"]   = df.get(colmap.get("desc", ""), pd.NA)
-    ev["qty"]    = pd.to_numeric(df[colmap["qty"]], errors="coerce")
-    ev["medid"]  = df[colmap["medid"]].astype("string")
-
-    # 🔥 Filter to MY STAFF ONLY — THIS is the correct place
-    ev = ev[ev["user"].str.upper().isin(MY_STAFF_USERS)].copy()
-
-    # (Rest of your base_clean logic: build pk, drop empty dt, sort, etc.)
-    ...
-    return ev
-
+    out = out.dropna(subset=[dtcol]).copy()
+    out = out.sort_values(dtcol).reset_index(drop=True)
+    out["__date"] = out[dtcol].dt.date
+    out["__hour"] = out[dtcol].dt.hour
+    out["__dow"]  = out[dtcol].dt.day_name()
+    return out
 
 def fmt_hms(x) -> str:
     if pd.isna(x):
@@ -600,45 +250,16 @@ def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
     return sorted([x for x in df[col].dropna().astype(str).unique()])
 
 def build_pk(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.Series:
-    """
-    Build a stable primary key from a combination of columns.
-    Optional fields (device, user, type, desc, qty, medid) are handled safely
-    if missing OR containing null/NA values.
-    """
-
-    def safe_col(key: str) -> pd.Series:
-        col = colmap.get(key)
-        if not col or col not in df.columns:
-            # Return empty strings aligned with df index
-            return pd.Series([""] * len(df), index=df.index, dtype="string")
-        # Convert to string and replace NA/NaN with ""
-        return df[col].astype("string").fillna("")
-
-    # datetime is required – if it's missing, fail loudly
-    dt_col = colmap.get("datetime", "TransactionDateTime")
-    if dt_col not in df.columns:
-        raise KeyError(f"Datetime column '{dt_col}' not found in dataframe for PK build.")
-
-    # Base datetime string, no NA
-    base = df[dt_col].astype("string").fillna("")
-
-    concat_str = (
-        base + "|" +
-        safe_col("device") + "|" +
-        safe_col("user") + "|" +
-        safe_col("type") + "|" +
-        safe_col("desc") + "|" +
-        safe_col("qty") + "|" +
-        safe_col("medid")
-    )
-
-    # Final safety: if anything is still NA, convert to "" and ensure plain str
-    concat_str = concat_str.fillna("").astype(str)
-
-    return concat_str.map(
-        lambda s: hashlib.sha256((s + ENGINE_SALT).encode("utf-8")).hexdigest()
-    )
-
+    cols = []
+    for k in ["datetime","device","user","type","desc","qty","medid"]:
+        c = colmap.get(k)
+        if c and c in df.columns:
+            cols.append(df[c].astype(str))
+        else:
+            cols.append(pd.Series([""], index=df.index, dtype="string"))
+    arr = np.vstack([c.values for c in cols]).T
+    out = [hashlib.sha1("|".join(row).encode("utf-8")).hexdigest() for row in arr]
+    return pd.Series(out, index=df.index, dtype="string")
 
 def weekly_summary(ev: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
     ts, dev, usr, typ = colmap["datetime"], colmap["device"], colmap["user"], colmap["type"]
@@ -2317,18 +1938,6 @@ def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[boo
         if not rows:
             return True, "No rows to save."
 
-        # 🔧 Clean pandas.NA / NaN values so psycopg2 can handle them
-        cleaned_rows = []
-        for row in rows:
-            cleaned = {}
-            for k, v in row.items():
-                # Turn pandas.NA / NaN into plain None (NULL in SQL)
-                if pd.isna(v):
-                    cleaned[k] = None
-                else:
-                    cleaned[k] = v
-            cleaned_rows.append(cleaned)
-
         upsert_sql = text("""
             INSERT INTO events (pk, dt, device, "user", "type", "desc", qty, medid)
             VALUES (:pk, :dt, :device, :user, :type, :desc, :qty, :medid)
@@ -2347,37 +1956,13 @@ def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[boo
         with eng.begin() as con:
             con.execute(text("SET LOCAL statement_timeout = '120s'"))
             con.execute(text("SET LOCAL synchronous_commit = OFF"))
-            for i in range(0, len(cleaned_rows), CHUNK):
-                batch = cleaned_rows[i:i+CHUNK]
+            for i in range(0, len(rows), CHUNK):
+                batch = rows[i:i+CHUNK]
                 con.execute(upsert_sql, batch)
                 total += len(batch)
         return True, f"Saved to Postgres: {total:,} rows (upserted by pk)."
     except Exception as e:
         return False, f"DB save error: {e}"
-
-def delete_events_by_pk(pk_list, eng):
-    """
-    Delete rows from the events table matching the given pk values.
-    Safe to run even if some pk values don't exist.
-    """
-    if not pk_list:
-        return 0, "No PKs to delete."
-
-    # Chunk to avoid parameter explosion
-    chunk_size = 1000
-    total_deleted = 0
-
-    with eng.begin() as conn:
-        for i in range(0, len(pk_list), chunk_size):
-            chunk = pk_list[i : i + chunk_size]
-            conn.execute(
-                text("DELETE FROM events WHERE pk = ANY(:pks)"),
-                {"pks": chunk},
-            )
-            # Postgres doesn't easily return rowcount reliably across engines;
-            # we can ignore exact count or estimate by len(chunk).
-
-    return len(pk_list), "Delete by pk completed."
 
 
 def load_history_sql(colmap: Dict[str, str], eng) -> pd.DataFrame:
@@ -2424,26 +2009,16 @@ def upsert_activity_simple(eng, df_simple: pd.DataFrame) -> int:
 
     # Coerce/clean types expected by SQL
     df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-
-    # Drop rows that can't possibly form a valid PK
     df = df.dropna(subset=["ts", "device", "drawer", "pocket", "med_id"])
 
-    # Make sure min/max are numeric and psycopg2-safe (None instead of NA)
     for c in ("min_qty", "max_qty"):
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").round()
-            df[c] = df[c].where(df[c].notna(), None)
-
-    # Replace pandas.NA with None in other nullable columns
-    nullable_cols = ["username", "is_min", "is_max", "is_standard_stock"]
-    for col in nullable_cols:
-        if col in df.columns:
-            df[col] = df[col].where(df[col].notna(), None)
+            df[c] = pd.to_numeric(df[c], errors="coerce").round().astype("Int64")
 
     # Shape rows for execute-many
     rows = df[[
-        "ts", "device", "drawer", "pocket", "med_id",
-        "username", "min_qty", "max_qty", "is_min", "is_max", "is_standard_stock"
+        "ts","device","drawer","pocket","med_id",
+        "username","min_qty","max_qty","is_min","is_max","is_standard_stock"
     ]].to_dict(orient="records")
 
     sql = text("""
@@ -2468,7 +2043,6 @@ def upsert_activity_simple(eng, df_simple: pd.DataFrame) -> int:
         con.execute(sql, rows)
 
     return len(rows)
-
 
 
 def upsert_pyxis_pends(eng, df_pends: pd.DataFrame) -> int:
@@ -2568,38 +2142,24 @@ ENGINE_SALT = st.secrets.get("ENGINE_SALT", "")
 eng = get_engine(DB_URL, ENGINE_SALT)
 
 # ================================ SIDEBAR ==============================
-st.sidebar.title("⚙️ Controls")
+st.sidebar.header("Data source")
+data_mode = st.sidebar.radio(
+    "Choose data source",
+    ["Upload files", "Database only"],
+    help="Use 'Database only' to analyze existing Postgres data without uploading new files."
+)
 
-# -----------------------------
-# Data Source
-# -----------------------------
-with st.sidebar.expander("📁 Data Source", expanded=True):
-    data_mode = st.radio(
-        "Choose data source",
-        ["Upload files", "Database only"],
-        help="Use 'Database only' to analyze existing Postgres data without uploading new files."
-    )
+idle_min = st.sidebar.number_input(
+    "Walk gap threshold min (seconds)",
+    min_value=5, max_value=900, value=DEFAULT_IDLE_MIN, step=5
+)
+idle_max = st.sidebar.number_input(
+    "Walk gap threshold max (seconds, 0 = unlimited)",
+    min_value=0, max_value=7200, value=1800, step=60,
+    help="Only count walk gaps ≤ this many seconds as walking. Set 0 to disable the cap."
+)
 
-# -----------------------------
-# Walk Gap Thresholds
-# -----------------------------
-with st.sidebar.expander("🚶 Walk Gap Settings", expanded=False):
-    idle_min = st.number_input(
-        "Walk gap threshold (min seconds)",
-        min_value=5, max_value=900, value=DEFAULT_IDLE_MIN, step=5
-    )
-    idle_max = st.number_input(
-        "Walk gap threshold (max seconds, 0 = unlimited)",
-        min_value=0, max_value=7200, value=1800, step=60,
-        help="Only count walk gaps ≤ this many seconds. Set 0 for no cap."
-    )
-
-# -----------------------------
-# Admin Tools
-# -----------------------------
-st.sidebar.markdown("---")
-st.sidebar.header("🔧 Admin Tools")
-
+st.sidebar.header("Admin")
 if st.sidebar.button("🧹 Daily closeout (refresh & clear caches)"):
     ok_mv, mv_msg = refresh_materialized_views(eng)
     st.sidebar.success(mv_msg if ok_mv else mv_msg)
@@ -2608,46 +2168,15 @@ if st.sidebar.button("🧹 Daily closeout (refresh & clear caches)"):
         st.cache_resource.clear()
     except Exception:
         pass
-    st.sidebar.info("Caches cleared — rerunning app…")
+    st.sidebar.info("Caches cleared — rerunning app...")
     st.rerun()
 
 if st.sidebar.button("🛠 Build/repair DB indexes"):
     try:
         ensure_indexes(eng)
-        st.sidebar.success("Index build/repair started.")
+        st.sidebar.success("Index build/repair requested.")
     except Exception as e:
         st.sidebar.warning(f"Index maintenance skipped: {e}")
-
-# -----------------------------
-# Maintenance: Delete Events from a File
-# -----------------------------
-st.sidebar.markdown("---")
-with st.sidebar.expander("🧹 Maintenance: Undo an Upload (Delete Events)"):
-    st.write("Upload the *same Pyxis CSV* you previously uploaded to remove those rows from the database.")
-
-    del_file = st.file_uploader(
-        "File to delete from DB",
-        type=["csv", "xlsx"],
-        key="delete_file"
-    )
-
-    if del_file is not None and st.button("❌ Delete events from this file"):
-        try:
-            raw_del = load_upload(del_file)
-            cleaned_del = base_clean(raw_del, colmap)
-
-            if cleaned_del.empty:
-                st.warning("No usable Pyxis rows found in this file.")
-            else:
-                cleaned_del["pk"] = build_pk(cleaned_del, colmap)
-                pk_list = cleaned_del["pk"].dropna().unique().tolist()
-
-                n, msg = delete_events_by_pk(pk_list, eng)
-                st.success(f"Requested delete of {n} pk keys. {msg}")
-
-        except Exception as e:
-            st.error(f"Delete failed: {e}")
-
 
 # ===================== LOAD HISTORY (needed early) =====================
 history = load_history_sql(colmap, eng)
@@ -2695,121 +2224,126 @@ if uploads:
         st.stop()
 
 # ============================ PROCESS UPLOADS ============================
-carousel_files = []     # unused with Option A, kept for safety
-new_files = []
-
 if uploads:
-
-    progress = st.progress(0)      # live progress bar
-    step = 0
-
+    new_files = []
     for up in uploads:
         try:
-            progress.progress(step := 5)
             raw = load_upload(up)
-
-            progress.progress(step := 20)
-            cleaned = normalize_event_columns(raw)
-
+            cleaned = base_clean(raw, colmap)
+            if cleaned.empty:
+                st.warning(f"{up.name}: no valid rows.")
+                continue
             new_files.append(cleaned)
-            st.success(f"{up.name}: loaded {len(cleaned):,} rows.")
         except Exception as e:
-            st.error(f"{up.name} failed: {e}")
-            continue
+            st.error(f"Failed to read {up.name}: {e}")
 
     if not new_files:
-        st.error("No valid AuditTransactionDetail files uploaded.")
+        st.warning("No usable files found.")
         st.stop()
 
-    # Combine
-    progress.progress(step := 40)
     new_ev = pd.concat(new_files, ignore_index=True)
-
-    # PKs
-    progress.progress(step := 60)
+    # Build pk for upload rows (needed for UPSERT)
     new_ev["pk"] = build_pk(new_ev, colmap)
+    new_ev = new_ev.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
 
-    # Sort & dedupe
-    progress.progress(step := 70)
-    new_ev = (
-        new_ev.drop_duplicates(subset=["pk"])
-              .sort_values(colmap["datetime"])
-    )
-
-    # Merge with history
+    # Merge with DB history
     frames = [history, new_ev] if not history.empty else [new_ev]
+    ev_all = pd.concat([f for f in frames if not f.empty], ignore_index=True)
+    ev_all = ev_all.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
+
+    # Upload summary
+    new_pks = set(new_ev["pk"])
+    old_pks = set(history["pk"]) if not history.empty and "pk" in history.columns else set()
+    num_new = len(new_pks - old_pks)
+    num_dup = len(new_pks & old_pks)
+    earliest = pd.to_datetime(ev_all[colmap["datetime"]].min())
+    latest   = pd.to_datetime(ev_all[colmap["datetime"]].max())
+
+    with st.expander("📥 Upload summary", expanded=True):
+        st.write(f"**Rows in this upload:** {len(new_ev):,}")
+        st.write(f"- New rows vs DB: **{num_new:,}**")
+        st.write(f"- Already existed (upserts): **{num_dup:,}**")
+        st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
+
+# --- SAVE (uploads only) ---
+if uploads:
+    # Save only new rows (huge speedup; avoids hammering indexes)
+    if history.empty or "pk" not in history.columns:
+        to_save = new_ev
+    else:
+        old_pks = set(history["pk"])
+        to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
+
+    if to_save.empty:
+        st.sidebar.info("No new rows to save.")
+    else:
+        ok, msg = save_history_sql(to_save, colmap, eng)
+        (st.sidebar.success if ok else st.sidebar.error)(msg)
+else:
+    # Database-only mode; nothing to write
+    pass
+
+# =================== TIME RANGE FILTER ===================
+# ============================ MERGE & SAVE ============================
+if uploads:
+    # new_ev was already created above from uploaded files
+    frames = []
+    if isinstance(history, pd.DataFrame) and not history.empty:
+        frames.append(history)
+    frames.append(new_ev)
+
     ev_all = (
         pd.concat(frames, ignore_index=True)
           .drop_duplicates(subset=["pk"])
           .sort_values(colmap["datetime"])
     )
 
-    # Detect new rows
-    old_pks = set(history["pk"]) if not history.empty else set()
-    to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
+    # Upload summary
+    new_pks = set(new_ev["pk"])
+    old_pks = set(history["pk"]) if (isinstance(history, pd.DataFrame) and "pk" in history.columns) else set()
+    num_new = len(new_pks - old_pks)
+    num_dup = len(new_pks & old_pks)
+    earliest = pd.to_datetime(ev_all[colmap["datetime"]].min())
+    latest   = pd.to_datetime(ev_all[colmap["datetime"]].max())
 
-    # Save
-    progress.progress(step := 85)
+    with st.expander("📥 Upload summary", expanded=True):
+        st.write(f"**Rows in this upload:** {len(new_ev):,}")
+        st.write(f"- New rows vs DB: **{num_new:,}**")
+        st.write(f"- Already existed (upserts): **{num_dup:,}**")
+        st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
+
+    # --- SAVE (uploads only): write only the delta ---
+    to_save = new_ev if not old_pks else new_ev[~new_ev["pk"].isin(old_pks)].copy()
     if to_save.empty:
         st.sidebar.info("No new rows to save.")
     else:
         ok, msg = save_history_sql(to_save, colmap, eng)
         (st.sidebar.success if ok else st.sidebar.error)(msg)
 
-    progress.progress(100)
-
 else:
+    # Database-only mode; analyze what’s already in Postgres
     ev_all = history.copy()
 
-
-
-# Build carousel_df
-carousel_df = pd.concat(carousel_files, ignore_index=True) if carousel_files else pd.DataFrame()
-
-
-# =================== TIME RANGE FILTER ===================
-
-# =================== TIME RANGE FILTER ===================
-
-# Make sure we actually have a datetime column configured
-dt_col = colmap.get("datetime", "TransactionDateTime")
-if dt_col not in ev_all.columns:
-    st.error(f"Configured datetime column '{dt_col}' not found in data.")
+# Guard: stop early if nothing to analyze
+if not isinstance(ev_all, pd.DataFrame) or ev_all.empty:
+    st.warning("No events available yet. Upload files or verify your DB.")
     st.stop()
 
-# Convert to datetime with coercion
-ev_all[dt_col] = pd.to_datetime(ev_all[dt_col], errors="coerce")
-
-# Drop rows with invalid timestamps
-valid_times = ev_all[dt_col].dropna()
-
-if valid_times.empty:
-    st.warning("No valid timestamps found in dataset.")
-    st.stop()
-
-# Compute min/max from valid timestamps ONLY
-_min = valid_times.min()
-_max = valid_times.max()
-
+# =================== TIME RANGE FILTER ===================
+_min = pd.to_datetime(ev_all[colmap["datetime"]].min())
+_max = pd.to_datetime(ev_all[colmap["datetime"]].max())
 min_ts = _min.to_pydatetime()
-max_ts = _max.to_pydatetime()
-
-# Safety: if min == max, bump max by 1 minute so slider has a range
-if min_ts == max_ts:
-    max_ts = min_ts + timedelta(minutes=1)
+max_ts = _max.to_pydatetime() if _max > _min else (min_ts + timedelta(minutes=1))
 
 rng = st.sidebar.slider(
     "Time range",
-    min_value=min_ts,
-    max_value=max_ts,
-    value=(min_ts, max_ts),
-    format="YYYY-MM-DD HH:mm",
+    min_value=min_ts, max_value=max_ts, value=(min_ts, max_ts),
+    format="YYYY-MM-DD HH:mm"
 )
 
-# Filter using the same datetime column
 ev_time = ev_all[
-    (ev_all[dt_col] >= rng[0]) &
-    (ev_all[dt_col] <= rng[1])
+    (ev_all[colmap["datetime"]] >= pd.to_datetime(rng[0])) &
+    (ev_all[colmap["datetime"]] <= pd.to_datetime(rng[1]))
 ].copy()
 
 if ev_time.empty:
@@ -2823,17 +2357,11 @@ data, device_stats, tech_stats, run_stats, hourly, visit = build_delivery_analyt
     ev_time, colmap, idle_min=idle_min, idle_max=idle_max
 )
 
-# --- NEW: map carousel events to refills/unloads ---
-if not carousel_df.empty:
-    data = attach_carousel_pick_to_refills(data, carousel_df, colmap)
-    data = attach_carousel_return_to_unloads(data, carousel_df, colmap)
-
 # Pre-format for Drill-down
 data["gap_hms"]      = data["__gap_s"].map(fmt_hms)
 data["walk_gap_hms"] = data["__walk_gap_s"].map(fmt_hms)
 data["dwell_hms"]    = data["__dwell_s"].map(fmt_hms)
 data["visit_hms"]    = data["visit_duration_s"].map(fmt_hms)
-
 
 # =================== FILTERS (post-analytics) ===================
 pick_devices = st.sidebar.multiselect("Devices", safe_unique(ev_time, colmap["device"]))
@@ -3008,12 +2536,9 @@ with tab5:
         fig = px.line(hourly_f, x="hour", y="events", markers=True, title="Events by hour")
         st.plotly_chart(fig, use_container_width=True)
 
+# ---------- TAB 6: DRILL-DOWN ----------
 with tab6:
     st.subheader("Drill-down (exportable)")
-
-    # -------------------------
-    # Build base drill-down table
-    # -------------------------
     show_cols = [
         colmap["datetime"],
         colmap["user"],
@@ -3029,50 +2554,13 @@ with tab6:
         "visit_duration_s",
         "__device_change",
     ]
-
-    # Insert desc / qty / medid early in the table
     for opt in ["desc", "qty", "medid"]:
         c = colmap.get(opt)
         if c and c in data_f.columns:
-            show_cols.insert(4, c)
-
-    # -------------------------
-    # Add carousel columns (Picks + Returns)
-    # -------------------------
-    carousel_cols = [
-        "carousel_pick_ts",
-        "carousel_pick_station",
-        "carousel_pick_priority",
-        "carousel_return_ts",
-        "carousel_return_station",
-        "carousel_return_priority",
-    ]
-
-    for extra in carousel_cols:
-        if extra in data_f.columns and extra not in show_cols:
-            show_cols.append(extra)
-
-    # Final cleanup: only include columns that exist
+            show_cols.insert(4, c)  # keep details near the left
     show_cols = [c for c in show_cols if c in data_f.columns]
 
-    # Build filtered table
     table = data_f[show_cols].copy()
-
-    # -------------------------
-    # Med Description filter
-    # -------------------------
-    desc_col = colmap.get("desc")
-    if desc_col and desc_col in table.columns:
-        med_options = sorted(table[desc_col].dropna().unique())
-        selected_meds = st.multiselect(
-            "Filter by Medication Description",
-            options=med_options,
-            placeholder="Select one or more meds to include...",
-        )
-        if selected_meds:
-            table = table[table[desc_col].isin(selected_meds)]
-
-    # Display
     st.dataframe(table, use_container_width=True, height=520)
 
     st.download_button(
@@ -3082,10 +2570,6 @@ with tab6:
         mime="text/csv",
     )
 
-
-    # -------------------------
-    # Per-visit summary (unchanged)
-    # -------------------------
     st.markdown("### Per-visit summary (continuous time at a device)")
     ts, dev, usr = colmap["datetime"], colmap["device"], colmap["user"]
     visit_show = visit_f[[usr, dev, "start", "end", "visit_duration_s"]].copy()
