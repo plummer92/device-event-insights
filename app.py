@@ -2331,13 +2331,21 @@ if not isinstance(ev_all, pd.DataFrame) or ev_all.empty:
 # =================== TIME RANGE FILTER ===================
 _min = pd.to_datetime(ev_all[colmap["datetime"]].min())
 _max = pd.to_datetime(ev_all[colmap["datetime"]].max())
+
+# If there is no data, .min() / .max() will be NaT and will break the slider.
+if pd.isna(_min) or pd.isna(_max):
+    st.sidebar.warning("No events found yet. Upload data or check your filters.")
+    st.stop()
+
 min_ts = _min.to_pydatetime()
 max_ts = _max.to_pydatetime() if _max > _min else (min_ts + timedelta(minutes=1))
 
 rng = st.sidebar.slider(
     "Time range",
-    min_value=min_ts, max_value=max_ts, value=(min_ts, max_ts),
-    format="YYYY-MM-DD HH:mm"
+    min_value=min_ts,
+    max_value=max_ts,
+    value=(min_ts, max_ts),
+    format="YYYY-MM-DD HH:mm",
 )
 
 ev_time = ev_all[
@@ -2348,7 +2356,6 @@ ev_time = ev_all[
 if ev_time.empty:
     st.warning("No events in selected time range.")
     st.stop()
-
 
 
 # =================== ANALYTICS ===================
