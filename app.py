@@ -1005,7 +1005,12 @@ def outliers_iqr(data: pd.DataFrame, key_col: str, value_col: str, label: str) -
             z_note=f"{label}: > Q3+1.5*IQR (>{upper:.1f}s)"
         )
 
-    out = df.groupby(key_col, dropna=True, observed=True).apply(_flag).reset_index(drop=True)
+    oout = (
+    df.groupby(key_col, dropna=True, observed=True, group_keys=False)
+      .apply(lambda g: _flag(g.drop(columns=[key_col], errors="ignore")))
+      .reset_index(drop=False)
+        )
+
     return out
 
 def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> Tuple[str, pd.DataFrame]:
