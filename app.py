@@ -2224,6 +2224,54 @@ idle_max = st.sidebar.number_input(
     min_value=0, max_value=7200, value=1800, step=60,
     help="Only count walk gaps ≤ this many seconds as walking. Set 0 to disable the cap."
 )
+# ---------- SIDEBAR DELETE TOOL ----------
+st.markdown("### 🧹 Delete Uploaded CSV From Database")
+
+delete_file = st.file_uploader(
+    "Upload a CSV you want to DELETE from the events table",
+    type=["csv"],
+    key="sidebar_delete_csv",
+    help="Must be the same CSV you uploaded originally."
+)
+
+if delete_file is not None:
+    try:
+        df_del = pd.read_csv(delete_file)
+
+        # Normalize column names using DEFAULT_COLMAP
+        df_del = df_del.rename(columns={v: k for k, v in DEFAULT_COLMAP.items() if v in df_del.columns})
+
+        required = ["datetime", "device", "user", "type"]
+        if not all(c in df_del.columns for c in required):
+            st.error("❌ This CSV does not contain the required columns to rebuild PKs.")
+        else:
+            df_del["datetime"] = pd.to_datetime(df_del["datetime"], errors="coerce")
+
+            # Build PK using the same formula as ingestion
+            def compute_pk(row):
+                parts = [
+                    str(row.get("datetime", "")),
+                    str(row.get("device", "")),
+                    str(row.get("user", "")),
+                    str(row.get("type", "")),
+                    str(row.get("desc", "")),
+                    str(row.get("qty", "")),
+                    str(row.get("medid", "")),
+                ]
+                return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
+
+            df_del["pk"] = df_del.apply(compute_pk, axis=1)
+
+            pks = df_del["pk"].dropna().unique().tolist()
+
+            sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
+            with eng.begin() as con:
+                con.execute(sql_delete, {"pks": pks})
+
+            st.success(f"Deleted {len(pks):,} rows from the database.")
+    except Exception as e:
+        st.error(f"Delete failed: {e}")
+
 
 st.sidebar.header("Admin")
 if st.sidebar.button("🧹 Daily closeout (refresh & clear caches)"):
@@ -2700,53 +2748,6 @@ with tab10:
     st.subheader("Load / Unload Insights")
     build_load_unload_section(ev_time, colmap)
 
-    st.markdown("### 🧹 Delete Rows from Database Using a CSV")
-
-    delete_file = st.file_uploader(
-        "Upload a CSV that you previously uploaded to REMOVE those rows from the database",
-        type=["csv"],
-        key="delete_csv_upload",
-        help="This will delete rows from the `events` table using the PK column."
-    )
-
-    # <-- THIS MUST BE 4 SPACES, NOT MORE
-    if delete_file is not None:
-        try:
-            # Load CSV
-            df_del = pd.read_csv(delete_file)
-
-            # Normalize columns using the same mapping as ingestion
-            df_del = df_del.rename(columns={v: k for k, v in DEFAULT_COLMAP.items() if v in df_del.columns})
-
-            required = ["datetime", "device", "user", "type"]
-            if not all(c in df_del.columns for c in required):
-                st.error("This CSV does not contain the required columns to rebuild PKs.")
-            else:
-                # Build datetime properly
-                df_del["datetime"] = pd.to_datetime(df_del["datetime"], errors="coerce")
-
-                # Build PK using the FULL PK formula (desc, qty, medid included)
-                def compute_pk(row):
-                    parts = [
-                        str(row.get("datetime", "")),
-                        str(row.get("device", "")),
-                        str(row.get("user", "")),
-                        str(row.get("type", "")),
-                        str(row.get("desc", "")),
-                        str(row.get("qty", "")),
-                        str(row.get("medid", "")),
-                    ]
-                    return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
-
-                df_del["pk"] = df_del.apply(compute_pk, axis=1)
-
-                pks = df_del["pk"].dropna().unique().tolist()
-
-                sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
-                with eng.begin() as con:
-                    con.execute(sql_delete, {"pks": pks})
-
-                st.success(f"Deleted {len(pks):,} rows from the database.")
 
         except Exception as e:
             st.error(f"Delete failed: {e}")
