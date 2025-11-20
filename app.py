@@ -2242,12 +2242,15 @@ with st.sidebar:
     )
 
     # ====================================================
-    # 🧹 DELETE TOOL (NOW IN SIDEBAR)
+    # 🧹 DELETE TOOL (NOW IN SIDEBAR) — WITH STATUS LOG
     # ====================================================
     st.markdown("### 🧹 Delete Uploaded CSV From Database")
 
     if "delete_done" not in st.session_state:
         st.session_state["delete_done"] = False
+
+    # Real-time status log box
+    log_box = st.empty()
 
     delete_file = st.file_uploader(
         "Upload a CSV you want to DELETE from the events table",
@@ -2256,17 +2259,23 @@ with st.sidebar:
         help="Must match the CSV originally uploaded."
     )
 
+    # Only run once per file
     if delete_file is not None and not st.session_state["delete_done"]:
         try:
+            log_box.write("📄 **Loading CSV...**")
             df_del = pd.read_csv(delete_file)
+
+            log_box.write("🔎 **Normalizing column names...**")
             df_del = df_del.rename(columns={v: k for k, v in DEFAULT_COLMAP.items() if v in df_del.columns})
 
             required = ["datetime", "device", "user", "type"]
             if not all(c in df_del.columns for c in required):
                 st.error("❌ CSV missing required columns to rebuild PKs.")
             else:
+                log_box.write("⏳ **Parsing datetimes...**")
                 df_del["datetime"] = pd.to_datetime(df_del["datetime"], errors="coerce")
 
+                log_box.write("🧮 **Rebuilding PKs (this may take a moment)...**")
                 def compute_pk(row):
                     parts = [
                         str(row.get("datetime", "")),
@@ -2282,21 +2291,24 @@ with st.sidebar:
                 df_del["pk"] = df_del.apply(compute_pk, axis=1)
                 pks = df_del["pk"].dropna().unique().tolist()
 
+                log_box.write(f"🔢 **Built {len(pks):,} PKs**")
+
+                log_box.write("🗑 **Deleting matching rows from database...**")
                 sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
                 with eng.begin() as con:
                     con.execute(sql_delete, {"pks": pks})
 
-                st.success(f"🗑 Deleted {len(pks):,} rows.")
+                st.success(f"🗑 Deleted {len(pks):,} rows from the database.")
 
+                log_box.write("🧹 **Clearing cache...**")
                 st.session_state["delete_done"] = True
+
+                log_box.write("🔄 **Refreshing app...**")
                 st.cache_data.clear()
                 st.experimental_rerun()
 
         except Exception as e:
             st.error(f"Delete failed: {e}")
-
-    st.markdown("---")
-
 
 # ===================== LOAD HISTORY (needed early) =====================
 history = load_history_sql(colmap, eng)
