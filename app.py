@@ -2247,7 +2247,7 @@ if delete_file is not None:
         else:
             df_del["datetime"] = pd.to_datetime(df_del["datetime"], errors="coerce")
 
-            # Build PK using the same formula as ingestion
+            # Build PK using the same formula the ingestion uses
             def compute_pk(row):
                 parts = [
                     str(row.get("datetime", "")),
@@ -2268,29 +2268,14 @@ if delete_file is not None:
             with eng.begin() as con:
                 con.execute(sql_delete, {"pks": pks})
 
-            st.success(f"Deleted {len(pks):,} rows from the database.")
+            st.success(f"🗑 Deleted {len(pks):,} rows from the database.")
+
+            # 🔥 Critical: Clear cached ev_time and rerun app so drilldown updates
+            st.cache_data.clear()
+            st.rerun()
+
     except Exception as e:
         st.error(f"Delete failed: {e}")
-
-
-st.sidebar.header("Admin")
-if st.sidebar.button("🧹 Daily closeout (refresh & clear caches)"):
-    ok_mv, mv_msg = refresh_materialized_views(eng)
-    st.sidebar.success(mv_msg if ok_mv else mv_msg)
-    try:
-        st.cache_data.clear()
-        st.cache_resource.clear()
-    except Exception:
-        pass
-    st.sidebar.info("Caches cleared — rerunning app...")
-    st.rerun()
-
-if st.sidebar.button("🛠 Build/repair DB indexes"):
-    try:
-        ensure_indexes(eng)
-        st.sidebar.success("Index build/repair requested.")
-    except Exception as e:
-        st.sidebar.warning(f"Index maintenance skipped: {e}")
 
 # ===================== LOAD HISTORY (needed early) =====================
 history = load_history_sql(colmap, eng)
