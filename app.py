@@ -2966,9 +2966,7 @@ with tab13:
         ORDER BY ts DESC, device, drawer, pocket, med_id;
         """
 
-        
-
-        bad = pd.read_sql(sql_bad, eng)
+    bad = pd.read_sql(sql_bad, eng)
 
         if bad.empty:
             st.success("No obviously bad configs found based on these rules. 🎉")
