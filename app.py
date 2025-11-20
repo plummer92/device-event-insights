@@ -2008,11 +2008,17 @@ def upsert_activity_simple(eng, df_simple: pd.DataFrame) -> int:
 
     # Coerce/clean types expected by SQL
     df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+
+    # Required columns for PK
     df = df.dropna(subset=["ts", "device", "drawer", "pocket", "med_id"])
 
+    # Coerce numeric min/max qty
     for c in ("min_qty", "max_qty"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").round().astype("Int64")
+
+    # 🔥 CRITICAL FIX: Convert pd.NA / NaN → Python None for ALL columns
+    df = df.where(pd.notnull(df), None)
 
     # Shape rows for execute-many
     rows = df[[
