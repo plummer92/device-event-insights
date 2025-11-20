@@ -2238,7 +2238,6 @@ if delete_file is not None:
     try:
         df_del = pd.read_csv(delete_file)
 
-        # Normalize column names using DEFAULT_COLMAP
         df_del = df_del.rename(columns={v: k for k, v in DEFAULT_COLMAP.items() if v in df_del.columns})
 
         required = ["datetime", "device", "user", "type"]
@@ -2247,7 +2246,6 @@ if delete_file is not None:
         else:
             df_del["datetime"] = pd.to_datetime(df_del["datetime"], errors="coerce")
 
-            # Build PK using the same formula the ingestion uses
             def compute_pk(row):
                 parts = [
                     str(row.get("datetime", "")),
@@ -2261,7 +2259,6 @@ if delete_file is not None:
                 return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
 
             df_del["pk"] = df_del.apply(compute_pk, axis=1)
-
             pks = df_del["pk"].dropna().unique().tolist()
 
             sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
@@ -2270,12 +2267,16 @@ if delete_file is not None:
 
             st.success(f"🗑 Deleted {len(pks):,} rows from the database.")
 
-            # 🔥 Critical: Clear cached ev_time and rerun app so drilldown updates
+            # 🛑 STOP THE LOOP: Clear uploaded file from uploader memory
+            st.session_state["sidebar_delete_csv"] = None
+
+            # 🔥 Refresh data for the rest of the app
             st.cache_data.clear()
             st.rerun()
 
     except Exception as e:
         st.error(f"Delete failed: {e}")
+
 
 # ===================== LOAD HISTORY (needed early) =====================
 history = load_history_sql(colmap, eng)
