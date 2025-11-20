@@ -2748,10 +2748,6 @@ with tab10:
     st.subheader("Load / Unload Insights")
     build_load_unload_section(ev_time, colmap)
 
-
-        except Exception as e:
-            st.error(f"Delete failed: {e}")
-
 # ---------- TAB 11: REFILL EFFICIENCY ----------
 with tab11:
     st.subheader("Refill Efficiency")
