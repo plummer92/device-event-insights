@@ -2227,6 +2227,10 @@ idle_max = st.sidebar.number_input(
 # ---------- SIDEBAR DELETE TOOL ----------
 st.markdown("### 🧹 Delete Uploaded CSV From Database")
 
+# Use a session flag to avoid multiple deletions on rerun
+if "delete_done" not in st.session_state:
+    st.session_state["delete_done"] = False
+
 delete_file = st.file_uploader(
     "Upload a CSV you want to DELETE from the events table",
     type=["csv"],
@@ -2234,7 +2238,10 @@ delete_file = st.file_uploader(
     help="Must be the same CSV you uploaded originally."
 )
 
-if delete_file is not None:
+# Only run delete logic if:
+# 1. a file was uploaded
+# 2. AND we haven't already deleted this file on this cycle
+if delete_file is not None and not st.session_state["delete_done"]:
     try:
         df_del = pd.read_csv(delete_file)
 
@@ -2267,16 +2274,15 @@ if delete_file is not None:
 
             st.success(f"🗑 Deleted {len(pks):,} rows from the database.")
 
-            # 🛑 STOP THE LOOP: Clear uploaded file from uploader memory
-            st.session_state["sidebar_delete_csv"] = None
+            # 🔥 Mark deletion done so it doesn't rerun
+            st.session_state["delete_done"] = True
 
-            # 🔥 Refresh data for the rest of the app
+            # 🔄 Refresh app so all tabs reload DB
             st.cache_data.clear()
             st.rerun()
 
     except Exception as e:
         st.error(f"Delete failed: {e}")
-
 
 # ===================== LOAD HISTORY (needed early) =====================
 history = load_history_sql(colmap, eng)
