@@ -1974,9 +1974,13 @@ def refresh_materialized_views(eng):
     return True, "Materialized views refresh: skipped (none configured)."
 
 def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict]:
+    # 🔥 CRITICAL FIX: Convert all pandas NA/NaN to Python None
+    df = df.where(pd.notnull(df), None)
+
     ts, dev, usr, typ = colmap["datetime"], colmap["device"], colmap["user"], colmap["type"]
     get = lambda k: (colmap.get(k) in df.columns) if colmap.get(k) else False
     rows = []
+
     for _, r in df.iterrows():
         rows.append({
             "pk":    r["pk"],
@@ -1989,6 +1993,7 @@ def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict
             "medid":  r.get(colmap.get("medid",""), None) if get("medid") else None,
         })
     return rows
+
 
 def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[bool, str]:
     """UPSERT by pk into Postgres (chunked)."""
