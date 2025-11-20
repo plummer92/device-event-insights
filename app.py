@@ -990,15 +990,49 @@ def anomalies_top10(history: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,
     df_out.insert(0, "rank", np.arange(1, len(df_out)+1))
     return df_out.head(10)
 
-def outliers_iqr(df: pd.DataFrame, key_col: str, value_col: str) -> pd.DataFrame:
+def outliers_iqr(df: pd.DataFrame, key_col: str, value_col: str, *_, **__) -> pd.DataFrame:
     """
     Return rows where value_col is an outlier within each key_col group.
-    Uses IQR method.
+    Uses the standard IQR rule: outside [Q1 - 1.5*IQR, Q3 + 1.5*IQR].
+
+    Extra positional/keyword args are ignored so existing call sites with
+    4 arguments still work.
     """
     if df is None or df.empty:
         return pd.DataFrame()
 
     df = df.copy()
+
+    # Ensure value column is numeric
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    df = df.dropna(subset=[value_col, key_col])
+
+    # Compute per-group Q1 and Q3 for the value column
+    q = (
+        df.groupby(key_col, dropna=True, observed=True)[value_col]
+        .quantile([0.25, 0.75])
+        .unstack()  # index: key_col, columns: 0.25, 0.75
+    )
+    q.columns = ["q1", "q3"]
+
+    # IQR and bounds
+    q["iqr"] = q["q3"] - q["q1"]
+    q["lower"] = q["q1"] - 1.5 * q["iqr"]
+    q["upper"] = q["q3"] + 1.5 * q["iqr"]
+
+    # Join bounds back to original data on key_col
+    df2 = df.join(q[["lower", "upper"]], on=key_col, how="left")
+
+    # If a group has no spread (iqr=0) or NaNs, this will just not flag anything
+    mask = (df2[value_col] < df2["lower"]) | (df2[value_col] > df2["upper"])
+    out = df2[mask].drop(columns=["lower", "upper"])
+
+    # In case everything is in-range, return empty DataFrame with same columns
+    if out.empty:
+        return df.head(0)
+
+    return out
+
 
     # --- Helper: Flag outliers inside one group ---
     def _flag(g):
