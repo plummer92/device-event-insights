@@ -990,13 +990,14 @@ def anomalies_top10(history: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,
     df_out.insert(0, "rank", np.arange(1, len(df_out)+1))
     return df_out.head(10)
 
-def outliers_iqr(df: pd.DataFrame, key_col: str, value_col: str, *_, **__) -> pd.DataFrame:
+def outliers_iqr(df: pd.DataFrame, key_col: str, value_col: str, label=None) -> pd.DataFrame:
     """
     Return rows where value_col is an outlier within each key_col group.
     Uses the standard IQR rule: outside [Q1 - 1.5*IQR, Q3 + 1.5*IQR].
 
-    Extra positional/keyword args are ignored so existing call sites with
-    4 arguments still work.
+    `label` is accepted as a 4th argument so existing call sites like
+    outliers_iqr(df, key_col, value_col, "Walk gap (sec)") still work.
+    It is not used in the calculation.
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -1006,6 +1007,9 @@ def outliers_iqr(df: pd.DataFrame, key_col: str, value_col: str, *_, **__) -> pd
     # Ensure value column is numeric
     df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
     df = df.dropna(subset=[value_col, key_col])
+
+    if df.empty:
+        return pd.DataFrame(columns=df.columns)
 
     # Compute per-group Q1 and Q3 for the value column
     q = (
@@ -1023,16 +1027,15 @@ def outliers_iqr(df: pd.DataFrame, key_col: str, value_col: str, *_, **__) -> pd
     # Join bounds back to original data on key_col
     df2 = df.join(q[["lower", "upper"]], on=key_col, how="left")
 
-    # If a group has no spread (iqr=0) or NaNs, this will just not flag anything
+    # Flag outliers
     mask = (df2[value_col] < df2["lower"]) | (df2[value_col] > df2["upper"])
     out = df2[mask].drop(columns=["lower", "upper"])
 
-    # In case everything is in-range, return empty DataFrame with same columns
+    # If nothing is out-of-range, return an empty frame with the right columns
     if out.empty:
         return df.head(0)
 
     return out
-
 
     # --- Helper: Flag outliers inside one group ---
     def _flag(g):
