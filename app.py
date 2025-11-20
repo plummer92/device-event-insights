@@ -2699,6 +2699,7 @@ with tab9:
 with tab10:
     st.subheader("Load / Unload Insights")
     build_load_unload_section(ev_time, colmap)
+
     st.markdown("### 🧹 Delete Rows from Database Using a CSV")
 
     delete_file = st.file_uploader(
@@ -2708,27 +2709,37 @@ with tab10:
         help="This will delete rows from the `events` table using the PK column."
     )
 
+    # <-- THIS MUST BE 4 SPACES, NOT MORE
     if delete_file is not None:
         try:
             # Load CSV
             df_del = pd.read_csv(delete_file)
 
-            # Ensure same mapping logic (so pk matches exactly)
+            # Normalize columns using the same mapping as ingestion
             df_del = df_del.rename(columns={v: k for k, v in DEFAULT_COLMAP.items() if v in df_del.columns})
 
-            # Build PKs like the import pipeline
-            if "pk" not in df_del.columns and "datetime" in df_del and "device" in df_del and "user" in df_del and "type" in df_del:
-                df_del["datetime"] = pd.to_datetime(df_del["datetime"], errors="coerce")
-                df_del["pk"] = df_del.apply(
-                    lambda r: hashlib.sha1(
-                        f"{r['datetime']}_{r['device']}_{r['user']}_{r['type']}".encode("utf-8")
-                    ).hexdigest(),
-                    axis=1,
-                )
-
-            if "pk" not in df_del.columns:
-                st.error("Could not determine PKs for deletion. Upload must match an originally imported file.")
+            required = ["datetime", "device", "user", "type"]
+            if not all(c in df_del.columns for c in required):
+                st.error("This CSV does not contain the required columns to rebuild PKs.")
             else:
+                # Build datetime properly
+                df_del["datetime"] = pd.to_datetime(df_del["datetime"], errors="coerce")
+
+                # Build PK using the FULL PK formula (desc, qty, medid included)
+                def compute_pk(row):
+                    parts = [
+                        str(row.get("datetime", "")),
+                        str(row.get("device", "")),
+                        str(row.get("user", "")),
+                        str(row.get("type", "")),
+                        str(row.get("desc", "")),
+                        str(row.get("qty", "")),
+                        str(row.get("medid", "")),
+                    ]
+                    return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
+
+                df_del["pk"] = df_del.apply(compute_pk, axis=1)
+
                 pks = df_del["pk"].dropna().unique().tolist()
 
                 sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
@@ -2736,9 +2747,9 @@ with tab10:
                     con.execute(sql_delete, {"pks": pks})
 
                 st.success(f"Deleted {len(pks):,} rows from the database.")
+
         except Exception as e:
             st.error(f"Delete failed: {e}")
-
 
 # ---------- TAB 11: REFILL EFFICIENCY ----------
 with tab11:
