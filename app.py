@@ -2208,81 +2208,95 @@ ENGINE_SALT = st.secrets.get("ENGINE_SALT", "")
 eng = get_engine(DB_URL, ENGINE_SALT)
 
 # ================================ SIDEBAR ==============================
-st.sidebar.header("Data source")
-data_mode = st.sidebar.radio(
-    "Choose data source",
-    ["Upload files", "Database only"],
-    help="Use 'Database only' to analyze existing Postgres data without uploading new files."
-)
+with st.sidebar:
 
-idle_min = st.sidebar.number_input(
-    "Walk gap threshold min (seconds)",
-    min_value=5, max_value=900, value=DEFAULT_IDLE_MIN, step=5
-)
-idle_max = st.sidebar.number_input(
-    "Walk gap threshold max (seconds, 0 = unlimited)",
-    min_value=0, max_value=7200, value=1800, step=60,
-    help="Only count walk gaps ≤ this many seconds as walking. Set 0 to disable the cap."
-)
-# ---------- SIDEBAR DELETE TOOL ----------
-st.markdown("### 🧹 Delete Uploaded CSV From Database")
+    st.header("Data source")
 
-# Use a session flag to avoid multiple deletions on rerun
-if "delete_done" not in st.session_state:
-    st.session_state["delete_done"] = False
+    data_mode = st.radio(
+        "Choose data source",
+        ["Upload files", "Database only"],
+        help="Use 'Database only' to analyze existing Postgres data without uploading new files."
+    )
 
-delete_file = st.file_uploader(
-    "Upload a CSV you want to DELETE from the events table",
-    type=["csv"],
-    key="sidebar_delete_csv",
-    help="Must be the same CSV you uploaded originally."
-)
+    idle_min = st.number_input(
+        "Walk gap threshold min (seconds)",
+        min_value=5, max_value=900, value=DEFAULT_IDLE_MIN, step=5
+    )
 
-# Only run delete logic if:
-# 1. a file was uploaded
-# 2. AND we haven't already deleted this file on this cycle
-if delete_file is not None and not st.session_state["delete_done"]:
-    try:
-        df_del = pd.read_csv(delete_file)
+    idle_max = st.number_input(
+        "Walk gap threshold max (seconds, 0 = unlimited)",
+        min_value=0, max_value=7200, value=1800, step=5
+    )
 
-        df_del = df_del.rename(columns={v: k for k, v in DEFAULT_COLMAP.items() if v in df_del.columns})
+    st.markdown("---")
 
-        required = ["datetime", "device", "user", "type"]
-        if not all(c in df_del.columns for c in required):
-            st.error("❌ This CSV does not contain the required columns to rebuild PKs.")
-        else:
-            df_del["datetime"] = pd.to_datetime(df_del["datetime"], errors="coerce")
+    # ====================================================
+    # 1) Upload Daily Files
+    # ====================================================
+    st.subheader("1) Upload")
+    uploaded_files = st.file_uploader(
+        "Drag & drop daily XLSX/CSV (one or many)",
+        type=["csv", "xlsx"],
+        accept_multiple_files=True,
+        key="file_uploader"
+    )
 
-            def compute_pk(row):
-                parts = [
-                    str(row.get("datetime", "")),
-                    str(row.get("device", "")),
-                    str(row.get("user", "")),
-                    str(row.get("type", "")),
-                    str(row.get("desc", "")),
-                    str(row.get("qty", "")),
-                    str(row.get("medid", "")),
-                ]
-                return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
+    # ====================================================
+    # 🧹 DELETE TOOL (NOW IN SIDEBAR)
+    # ====================================================
+    st.markdown("### 🧹 Delete Uploaded CSV From Database")
 
-            df_del["pk"] = df_del.apply(compute_pk, axis=1)
-            pks = df_del["pk"].dropna().unique().tolist()
+    if "delete_done" not in st.session_state:
+        st.session_state["delete_done"] = False
 
-            sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
-            with eng.begin() as con:
-                con.execute(sql_delete, {"pks": pks})
+    delete_file = st.file_uploader(
+        "Upload a CSV you want to DELETE from the events table",
+        type=["csv"],
+        key="sidebar_delete_csv",
+        help="Must match the CSV originally uploaded."
+    )
 
-            st.success(f"🗑 Deleted {len(pks):,} rows from the database.")
+    if delete_file is not None and not st.session_state["delete_done"]:
+        try:
+            df_del = pd.read_csv(delete_file)
+            df_del = df_del.rename(columns={v: k for k, v in DEFAULT_COLMAP.items() if v in df_del.columns})
 
-            # 🔥 Mark deletion done so it doesn't rerun
-            st.session_state["delete_done"] = True
+            required = ["datetime", "device", "user", "type"]
+            if not all(c in df_del.columns for c in required):
+                st.error("❌ CSV missing required columns to rebuild PKs.")
+            else:
+                df_del["datetime"] = pd.to_datetime(df_del["datetime"], errors="coerce")
 
-            # 🔄 Refresh app so all tabs reload DB
-            st.cache_data.clear()
-            st.rerun()
+                def compute_pk(row):
+                    parts = [
+                        str(row.get("datetime", "")),
+                        str(row.get("device", "")),
+                        str(row.get("user", "")),
+                        str(row.get("type", "")),
+                        str(row.get("desc", "")),
+                        str(row.get("qty", "")),
+                        str(row.get("medid", "")),
+                    ]
+                    return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
 
-    except Exception as e:
-        st.error(f"Delete failed: {e}")
+                df_del["pk"] = df_del.apply(compute_pk, axis=1)
+                pks = df_del["pk"].dropna().unique().tolist()
+
+                sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
+                with eng.begin() as con:
+                    con.execute(sql_delete, {"pks": pks})
+
+                st.success(f"🗑 Deleted {len(pks):,} rows.")
+
+                st.session_state["delete_done"] = True
+                st.cache_data.clear()
+                st.experimental_rerun()
+
+        except Exception as e:
+            st.error(f"Delete failed: {e}")
+
+    st.markdown("---")
+
 
 # ===================== LOAD HISTORY (needed early) =====================
 history = load_history_sql(colmap, eng)
