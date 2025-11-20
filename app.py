@@ -2928,7 +2928,7 @@ with tab13:
     except Exception as e:
         st.error(f"Error loading slot config from database: {e}")
 
-    # 2) Bad configs (quick QA list)
+        # 2) Bad configs (quick QA list)
     st.markdown("### 🚨 Configs to Review")
 
     try:
@@ -2966,7 +2966,8 @@ with tab13:
         ORDER BY ts DESC, device, drawer, pocket, med_id;
         """
 
-    bad = pd.read_sql(sql_bad, eng)
+        # THIS MUST BE INDENTED INSIDE THE TRY:
+        bad = pd.read_sql(sql_bad, eng)
 
         if bad.empty:
             st.success("No obviously bad configs found based on these rules. 🎉")
@@ -2995,8 +2996,5 @@ with tab13:
                 height=320,
             )
 
-
     except Exception as e:
         st.error(f"Error loading QA list: {e}")
-
-
