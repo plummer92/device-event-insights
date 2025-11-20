@@ -990,28 +990,47 @@ def anomalies_top10(history: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,
     df_out.insert(0, "rank", np.arange(1, len(df_out)+1))
     return df_out.head(10)
 
-def outliers_iqr(data: pd.DataFrame, key_col: str, value_col: str, label: str) -> pd.DataFrame:
-    """IQR-based outlier detection per key_col on value_col."""
-    df = data[[key_col, value_col]].dropna().copy()
-    if df.empty:
-        return pd.DataFrame(columns=[key_col, value_col, "z_note"])
+def outliers_iqr(df: pd.DataFrame, key_col: str, value_col: str) -> pd.DataFrame:
+    """
+    Return rows where value_col is an outlier within each key_col group.
+    Uses IQR method.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
 
-    def _flag(group):
-        q1 = group[value_col].quantile(0.25)
-        q3 = group[value_col].quantile(0.75)
+    df = df.copy()
+
+    # --- Helper: Flag outliers inside one group ---
+    def _flag(g):
+        if g.empty:
+            return g  # nothing to flag
+
+        q1 = g[value_col].quantile(0.25)
+        q3 = g[value_col].quantile(0.75)
         iqr = q3 - q1
-        upper = q3 + (1.5 if iqr == 0 else 1.5 * iqr)
-        return group[group[value_col] > upper].assign(
-            z_note=f"{label}: > Q3+1.5*IQR (>{upper:.1f}s)"
-        )
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
 
-    oout = (
-    df.groupby(key_col, dropna=True, observed=True, group_keys=False)
-      .apply(lambda g: _flag(g.drop(columns=[key_col], errors="ignore")))
-      .reset_index(drop=False)
-        )
+        return g[(g[value_col] < lower) | (g[value_col] > upper)]
+
+    # --- New Pandas-safe groupby-apply without warnings ---
+    groups = df.groupby(key_col, dropna=True, observed=True, group_keys=False)
+
+    # Apply after dropping the group column from each chunk
+    out = groups.apply(
+        lambda g: _flag(g.drop(columns=[key_col], errors="ignore")),
+        include_groups=False,
+    )
+
+    # out might be empty, so always reset_index safely
+    if isinstance(out, pd.Series) or isinstance(out, pd.DataFrame):
+        out = out.reset_index()
+    else:
+        # Fall back to empty DataFrame if something unexpected happens
+        out = pd.DataFrame()
 
     return out
+
 
 def qa_answer(question: str, ev: pd.DataFrame, data: pd.DataFrame, colmap: Dict[str,str]) -> Tuple[str, pd.DataFrame]:
     q = question.strip().lower()
