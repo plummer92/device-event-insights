@@ -2886,7 +2886,7 @@ with tab13:
         if cfg.empty:
             st.info("No rows found in pyxis_activity_simple yet. Upload some configs in the Pended Loads tab first.")
         else:
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             with c1:
                 dev_filter = st.multiselect(
                     "Filter by device (optional)",
@@ -2897,18 +2897,26 @@ with tab13:
                     "Filter by Med ID (optional)",
                     sorted(cfg["med_id"].dropna().unique().tolist())
                 )
+            with c3:
+                user_filter = st.multiselect(
+                    "Filter by user (optional)",
+                    sorted(cfg["username"].dropna().unique().tolist())
+                )
 
             view_cfg = cfg.copy()
             if dev_filter:
                 view_cfg = view_cfg[view_cfg["device"].isin(dev_filter)]
             if med_filter:
                 view_cfg = view_cfg[view_cfg["med_id"].isin(med_filter)]
+            if user_filter:
+                view_cfg = view_cfg[view_cfg["username"].isin(user_filter)]
 
             st.dataframe(
                 view_cfg,
                 use_container_width=True,
                 height=420,
             )
+
 
             st.download_button(
                 "Download current slot config as CSV",
@@ -2960,17 +2968,35 @@ with tab13:
 
         bad = pd.read_sql(sql_bad, eng)
 
+                bad = pd.read_sql(sql_bad, eng)
+
         if bad.empty:
             st.success("No obviously bad configs found based on these rules. 🎉")
         else:
+            c1, c2 = st.columns(2)
+            with c1:
+                bad_user_filter = st.multiselect(
+                    "Filter bad configs by user (optional)",
+                    sorted(bad["username"].dropna().unique().tolist())
+                )
+            with c2:
+                bad_dev_filter = st.multiselect(
+                    "Filter bad configs by device (optional)",
+                    sorted(bad["device"].dropna().unique().tolist())
+                )
+
+            bad_view = bad.copy()
+            if bad_user_filter:
+                bad_view = bad_view[bad_view["username"].isin(bad_user_filter)]
+            if bad_dev_filter:
+                bad_view = bad_view[bad_view["device"].isin(bad_dev_filter)]
+
             st.dataframe(
-                bad,
+                bad_view,
                 use_container_width=True,
                 height=320,
             )
-            st.caption(
-                "These rows have min > max, negative values, or standard stock with missing min/max."
-            )
+
 
     except Exception as e:
         st.error(f"Error loading QA list: {e}")
