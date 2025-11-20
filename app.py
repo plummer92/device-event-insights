@@ -2242,6 +2242,36 @@ with st.sidebar:
     )
 
     # ====================================================
+    # 🔥 DANGER ZONE — DELETE ALL DATA
+    # ====================================================
+    st.markdown("### 🔥 Danger Zone")
+    st.markdown(
+        "**This will permanently delete ALL data in your database.**\n\n"
+        "Use this only if you want to restart completely from scratch."
+    )
+
+    confirm_reset = st.checkbox("YES, I understand this will delete ALL data")
+
+    if confirm_reset:
+        if st.button("💥 DELETE EVERYTHING (Factory Reset)"):
+            try:
+                # Delete all rows from both tables
+                with eng.begin() as con:
+                    con.execute(text("DELETE FROM events"))
+                    con.execute(text("DELETE FROM pyxis_activity_simple"))
+
+                # Let the user know
+                st.success("💥 All data deleted. Starting fresh!")
+
+                # Force full reload
+                st.cache_data.clear()
+                st.experimental_rerun()
+
+            except Exception as e:
+                st.error(f"Reset failed: {e}")
+
+
+    # ====================================================
     # 🧹 DELETE TOOL (NOW IN SIDEBAR) — WITH STATUS LOG
     # ====================================================
     st.markdown("### 🧹 Delete Uploaded CSV From Database")
