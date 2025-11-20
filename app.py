@@ -2699,6 +2699,46 @@ with tab9:
 with tab10:
     st.subheader("Load / Unload Insights")
     build_load_unload_section(ev_time, colmap)
+    st.markdown("### 🧹 Delete Rows from Database Using a CSV")
+
+    delete_file = st.file_uploader(
+        "Upload a CSV that you previously uploaded to REMOVE those rows from the database",
+        type=["csv"],
+        key="delete_csv_upload",
+        help="This will delete rows from the `events` table using the PK column."
+    )
+
+    if delete_file is not None:
+        try:
+            # Load CSV
+            df_del = pd.read_csv(delete_file)
+
+            # Ensure same mapping logic (so pk matches exactly)
+            df_del = df_del.rename(columns={v: k for k, v in DEFAULT_COLMAP.items() if v in df_del.columns})
+
+            # Build PKs like the import pipeline
+            if "pk" not in df_del.columns and "datetime" in df_del and "device" in df_del and "user" in df_del and "type" in df_del:
+                df_del["datetime"] = pd.to_datetime(df_del["datetime"], errors="coerce")
+                df_del["pk"] = df_del.apply(
+                    lambda r: hashlib.sha1(
+                        f"{r['datetime']}_{r['device']}_{r['user']}_{r['type']}".encode("utf-8")
+                    ).hexdigest(),
+                    axis=1,
+                )
+
+            if "pk" not in df_del.columns:
+                st.error("Could not determine PKs for deletion. Upload must match an originally imported file.")
+            else:
+                pks = df_del["pk"].dropna().unique().tolist()
+
+                sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
+                with eng.begin() as con:
+                    con.execute(sql_delete, {"pks": pks})
+
+                st.success(f"Deleted {len(pks):,} rows from the database.")
+        except Exception as e:
+            st.error(f"Delete failed: {e}")
+
 
 # ---------- TAB 11: REFILL EFFICIENCY ----------
 with tab11:
