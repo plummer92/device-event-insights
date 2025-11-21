@@ -1937,7 +1937,6 @@ def init_db(eng):
         PRIMARY KEY (ts, device, drawer, pocket, med_id)
     );
 
-
     CREATE TABLE IF NOT EXISTS pyxis_pends (
         ts               TIMESTAMP WITHOUT TIME ZONE NOT NULL,
         device           TEXT NOT NULL,
@@ -1965,6 +1964,22 @@ def init_db(eng):
         max_qty  INTEGER,
         CONSTRAINT pyxis_thresholds_pk PRIMARY KEY (med_id, device, drawer, pocket)
     );
+
+    -- ============================================
+    -- NEW: Carousel Transaction Table
+    -- ============================================
+    CREATE TABLE IF NOT EXISTS carousel_events (
+        pk TEXT PRIMARY KEY,
+        ts TIMESTAMP,
+        queue_id TEXT,
+        priority TEXT,
+        medid TEXT,
+        desc TEXT,
+        dest TEXT,
+        user_name TEXT,
+        qty NUMERIC,
+        raw_row JSONB
+    );
     """
     with eng.begin() as con:
         con.execute(text(ddl))
@@ -1974,8 +1989,8 @@ def refresh_materialized_views(eng):
     return True, "Materialized views refresh: skipped (none configured)."
 
 def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict]:
-    # 🔥 CRITICAL FIX: Convert all pandas NA/NaN to Python None
-    df = df.where(pd.notnull(df), None)
+    # 🔥 CRITICAL FIX: Convert pandas NA/NaN/NaT to Python None
+    df = df.where(df.notna(), None)
 
     ts, dev, usr, typ = colmap["datetime"], colmap["device"], colmap["user"], colmap["type"]
     get = lambda k: (colmap.get(k) in df.columns) if colmap.get(k) else False
@@ -1984,15 +1999,24 @@ def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict
     for _, r in df.iterrows():
         rows.append({
             "pk":    r["pk"],
-            "dt":    pd.to_datetime(r[ts]).to_pydatetime() if pd.notna(r[ts]) else None,
+
+            # safer datetime handling
+            "dt":    pd.to_datetime(r[ts], errors="coerce").to_pydatetime()
+                        if r[ts] is not None else None,
+
             "device": r.get(dev, None),
             "user":   r.get(usr, None),
             "type":   r.get(typ, None),
+
             "desc":   r.get(colmap.get("desc", ""), None) if get("desc") else None,
-            "qty":    float(r[colmap["qty"]]) if get("qty") and pd.notna(r[colmap["qty"]]) else None,
-            "medid":  r.get(colmap.get("medid",""), None) if get("medid") else None,
+
+            "qty":    float(r[colmap["qty"]]) if get("qty") and r[colmap["qty"]] is not None else None,
+
+            "medid":  r.get(colmap.get("medid", ""), None) if get("medid") else None,
         })
+
     return rows
+
 
 
 def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[bool, str]:
@@ -2028,6 +2052,66 @@ def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[boo
         return True, f"Saved to Postgres: {total:,} rows (upserted by pk)."
     except Exception as e:
         return False, f"DB save error: {e}"
+
+def upsert_carousel_events(eng, df: pd.DataFrame) -> int:
+    """
+    Clean + insert Carousel transaction data into carousel_events table.
+    """
+    if df is None or df.empty:
+        return 0
+
+    # Clean NA → None globally
+    df = df.where(pd.notnull(df), None)
+
+    # Column normalization
+    df = df.rename(columns={
+        "TranQueueID": "queue_id",
+        "Priority": "priority",
+        "Date / Time": "ts",
+        "Item ID": "medid",
+        "Description": "desc",
+        "Destination": "dest",
+        "User": "user_name",
+        "Quantity": "qty",
+    })
+
+    # Parse timestamp
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+
+    # Build PK
+    def make_pk(row):
+        parts = [
+            str(row.get("ts", "")),
+            str(row.get("queue_id", "")),
+            str(row.get("priority", "")),
+            str(row.get("medid", "")),
+            str(row.get("user_name", "")),
+            str(row.get("qty", "")),
+            str(row.get("dest", "")),
+            str(row.get("desc", "")),
+        ]
+        return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
+
+    df["pk"] = df.apply(make_pk, axis=1)
+
+    # Prepare rows for execute-many
+    rows = df[[
+        "pk", "ts", "queue_id", "priority", "medid",
+        "desc", "dest", "user_name", "qty"
+    ]].to_dict(orient="records")
+
+    sql = text("""
+        INSERT INTO carousel_events
+        (pk, ts, queue_id, priority, medid, desc, dest, user_name, qty)
+        VALUES
+        (:pk, :ts, :queue_id, :priority, :medid, :desc, :dest, :user_name, :qty)
+        ON CONFLICT (pk) DO NOTHING; 
+    """)
+
+    with eng.begin() as con:
+        con.execute(sql, rows)
+
+    return len(rows)
 
 
 def load_history_sql(colmap: Dict[str, str], eng) -> pd.DataFrame:
@@ -2563,7 +2647,7 @@ st.success(f"Loaded {len(data_f):,} events for analysis.")
 
 
 # =================== TABS ===================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13 = st.tabs(
+tab1, tab2, tab_carousel, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13 = st.tabs(
     [
         "📈 Overview",
         "🚶 Delivery Analytics",
@@ -2668,6 +2752,79 @@ with tab2:
         c2.plotly_chart(fig2, use_container_width=True)
 
     st.markdown("**Tip:** Use the *Drill-down* tab to inspect rows behind any long gaps.")
+with tab_carousel:
+    st.subheader("📦 Carousel Transactions")
+
+    st.markdown("Upload a Carousel Transaction Report (CSV):")
+
+    carousel_file = st.file_uploader(
+        "Upload Carousel CSV",
+        type=["csv"],
+        key="carousel_upload"
+    )
+
+    if carousel_file is not None:
+        try:
+            df_car = pd.read_csv(carousel_file)
+
+            # Preview
+            st.markdown("### Preview")
+            st.dataframe(df_car.head(20), use_container_width=True)
+
+            # Save to DB
+            count = upsert_carousel_events(eng, df_car)
+            st.success(f"Saved {count:,} carousel transaction rows.")
+
+            st.cache_data.clear()
+            st.experimental_rerun()
+
+        except Exception as e:
+            st.error(f"Carousel upload failed: {e}")
+
+    # === Load from DB ===
+    st.markdown("### 📊 Carousel Transaction Data (from database)")
+
+    try:
+        df_car_full = pd.read_sql("SELECT * FROM carousel_events ORDER BY ts DESC", eng)
+
+        # Filters
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            users = st.multiselect(
+                "Filter users",
+                sorted(df_car_full["user_name"].dropna().unique().tolist())
+            )
+        with c2:
+            meds = st.multiselect(
+                "Filter MedID",
+                sorted(df_car_full["medid"].dropna().unique().tolist())
+            )
+        with c3:
+            dests = st.multiselect(
+                "Filter destination",
+                sorted(df_car_full["dest"].dropna().unique().tolist())
+            )
+
+        df_view = df_car_full.copy()
+        if users:
+            df_view = df_view[df_view["user_name"].isin(users)]
+        if meds:
+            df_view = df_view[df_view["medid"].isin(meds)]
+        if dests:
+            df_view = df_view[df_view["dest"].isin(dests)]
+
+        st.dataframe(df_view, use_container_width=True, height=400)
+
+        st.download_button(
+            "Download Carousel Data",
+            df_view.to_csv(index=False).encode("utf-8"),
+            "carousel_export.csv",
+            "text/csv"
+        )
+
+    except Exception as e:
+        st.error(f"Could not load carousel data: {e}")
+
 
 # ---------- TAB 3: TECH COMPARISON ----------
 with tab3:
