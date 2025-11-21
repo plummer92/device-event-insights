@@ -644,7 +644,6 @@ try:
 
 except Exception as e:
     st.error(f"Error loading Carousel analytics: {e}")
-
 tab1, tab2, tab_carousel, tab_cross, tab_heatmap, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs(
     [
         "📈 Overview",
@@ -664,6 +663,7 @@ tab1, tab2, tab_carousel, tab_cross, tab_heatmap, tab3, tab4, tab5, tab6, tab7, 
         "🧷 Pended Loads",
     ]
 )
+
 
 # ============================================================
 # SECTION 8 — CROSS-SYSTEM ANALYTICS (Carousel + Pyxis)
