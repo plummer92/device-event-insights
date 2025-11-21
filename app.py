@@ -2651,6 +2651,7 @@ tab1, tab2, tab_carousel, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11
     [
         "📈 Overview",
         "🚶 Delivery Analytics",
+        "📦 Carousel Transactions",   # <-- NEW TAB (TAB 3)
         "🧑‍🔧 Tech Comparison",
         "📦 Devices",
         "⏱ Hourly",
@@ -2661,7 +2662,7 @@ tab1, tab2, tab_carousel, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11
         "📥 Load/Unload",
         "💊 Refill Efficiency",
         "🧷 Pended Loads",
-        "🧩 Slot Config (DB)",
+        "⚙️ Slot Config"
     ]
 )
 
