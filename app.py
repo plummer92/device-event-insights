@@ -1954,27 +1954,24 @@ def init_db(eng):
         CONSTRAINT pyxis_pends_pk PRIMARY KEY (ts, device, med_id, drawer, pocket)
     );
 
-    -- Refill thresholds/capacity, MED-FIRST with optional overrides
     CREATE TABLE IF NOT EXISTS pyxis_thresholds (
         med_id   TEXT NOT NULL,
-        device   TEXT NOT NULL DEFAULT '*',  -- '*' = applies to all devices
-        drawer   TEXT NOT NULL DEFAULT '',   -- ''  = any drawer
-        pocket   TEXT NOT NULL DEFAULT '',   -- ''  = any pocket
+        device   TEXT NOT NULL DEFAULT '*',
+        drawer   TEXT NOT NULL DEFAULT '',
+        pocket   TEXT NOT NULL DEFAULT '',
         min_qty  INTEGER,
         max_qty  INTEGER,
         CONSTRAINT pyxis_thresholds_pk PRIMARY KEY (med_id, device, drawer, pocket)
     );
 
-    -- ============================================
     -- NEW: Carousel Transaction Table
-    -- ============================================
     CREATE TABLE IF NOT EXISTS carousel_events (
         pk TEXT PRIMARY KEY,
         ts TIMESTAMP,
         queue_id TEXT,
         priority TEXT,
         medid TEXT,
-        desc TEXT,
+        "desc" TEXT,
         dest TEXT,
         user_name TEXT,
         qty NUMERIC,
@@ -1983,6 +1980,7 @@ def init_db(eng):
     """
     with eng.begin() as con:
         con.execute(text(ddl))
+
 
 def refresh_materialized_views(eng):
     # No MVs yet; placeholder
