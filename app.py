@@ -2019,35 +2019,52 @@ def refresh_materialized_views(eng):
     return True, "Materialized views refresh: skipped (none configured)."
 
 def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict]:
-    # 🔥 CRITICAL FIX: Convert pandas NA/NaN/NaT to Python None
-    df = df.where(df.notna(), None)
+    # Convert ALL pandas NA/NaN/NaT to proper Python None
+    df = df.where(pd.notnull(df), None)
 
-    ts, dev, usr, typ = colmap["datetime"], colmap["device"], colmap["user"], colmap["type"]
-    get = lambda k: (colmap.get(k) in df.columns) if colmap.get(k) else False
+    ts = colmap["datetime"]
+    dev = colmap["device"]
+    usr = colmap["user"]
+    typ = colmap["type"]
+
     rows = []
-
     for _, r in df.iterrows():
-        rows.append({
-            "pk":    r["pk"],
 
-            # safer datetime handling
-            "dt":    pd.to_datetime(r[ts], errors="coerce").to_pydatetime()
-                        if r[ts] is not None else None,
+        # Safe get function: always returns None instead of NAType
+        def safe(v):
+            return None if pd.isna(v) else v
 
-            "device": r.get(dev, None),
-            "user":   r.get(usr, None),
-            "type":   r.get(typ, None),
+        # Build each row dict
+        row = {
+            "pk": safe(r.get("pk")),
+            "dt": None,
+            "device": safe(r.get(dev)),
+            "user": safe(r.get(usr)),
+            "type": safe(r.get(typ)),
+            "desc": safe(r.get(colmap.get("desc", ""), None)),
+            "qty": None,
+            "medid": safe(r.get(colmap.get("medid", ""), None)),
+        }
 
-            "desc":   r.get(colmap.get("desc", ""), None) if get("desc") else None,
+        # dt
+        raw_dt = r.get(ts)
+        if raw_dt not in [None, "", float("nan")]:
+            try:
+                row["dt"] = pd.to_datetime(raw_dt).to_pydatetime()
+            except:
+                row["dt"] = None
 
-            "qty":    float(r[colmap["qty"]]) if get("qty") and r[colmap["qty"]] is not None else None,
+        # qty
+        raw_qty = r.get(colmap.get("qty", ""), None)
+        if raw_qty not in [None, "", float("nan")]:
+            try:
+                row["qty"] = float(raw_qty)
+            except:
+                row["qty"] = None
 
-            "medid":  r.get(colmap.get("medid", ""), None) if get("medid") else None,
-        })
+        rows.append(row)
 
     return rows
-
-
 
 def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[bool, str]:
     """UPSERT by pk into Postgres (chunked)."""
