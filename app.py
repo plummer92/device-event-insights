@@ -2814,29 +2814,147 @@ with tab2:
 
     st.markdown("**Tip:** Use the *Drill-down* tab to inspect rows behind any long gaps.")
 with tab_carousel:
-    st.subheader("📦 Carousel Transaction Upload")
+    st.header("📦 Carousel Analyzer")
 
+    # --------------------------
+    # Carousel File Upload
+    # --------------------------
     carousel_file = st.file_uploader(
-        "Upload Carousel Transaction CSV",
-        type=["csv"],
+        "Upload Carousel File",
+        type=["csv", "xlsx"],
         key="carousel_upload"
     )
 
-    if carousel_file is not None:
+    if carousel_file is None:
+        st.info("Upload a Carousel export to begin.")
+        st.stop()
+
+    # --------------------------
+    # Load and Clean Data
+    # --------------------------
+    try:
+        df_car = load_upload(carousel_file)
+    except Exception as e:
+        st.error(f"Failed to read Carousel file: {e}")
+        st.stop()
+
+    df_car = dedupe_columns(df_car)
+    df_car.columns = df_car.columns.str.strip()
+
+    # Standardize expected names if they exist
+    rename_map = {
+        "TransactionDateTime": "datetime",
+        "MedDescription": "med",
+        "UserName": "user",
+        "TransactionType": "type",
+        "Qty": "qty",
+        "Device": "device"
+    }
+    for old, new in rename_map.items():
+        if old in df_car.columns:
+            df_car.rename(columns={old: new}, inplace=True)
+
+    # --------------------------
+    # Carousel Summary Metrics
+    # --------------------------
+    st.subheader("📊 Summary Metrics")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", f"{len(df_car):,}")
+
+    if "type" in df_car.columns:
+        c2.metric("Dispenses", (df_car["type"] == "Dispense").sum())
+        c3.metric("Refills", (df_car["type"] == "Refill").sum())
+    else:
+        c2.metric("Dispenses", "N/A")
+        c3.metric("Refills", "N/A")
+
+    if "qty" in df_car.columns:
+        c4.metric("Total Qty", f"{df_car['qty'].sum():,}")
+    else:
+        c4.metric("Total Qty", "N/A")
+
+    st.markdown("---")
+
+    # --------------------------
+    # Top Medications
+    # --------------------------
+    st.subheader("🏆 Top Medications")
+
+    if "med" in df_car.columns and "qty" in df_car.columns:
+        top_meds = (
+            df_car.groupby("med")["qty"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(20)
+        )
+        st.bar_chart(top_meds)
+    else:
+        st.info("Missing required columns for medication analysis.")
+
+    st.markdown("---")
+
+    # --------------------------
+    # Hourly Activity
+    # --------------------------
+    st.subheader("⏱ Hourly Activity")
+
+    if "datetime" in df_car.columns:
         try:
-            df_raw = pd.read_csv(carousel_file)
-            df_car = process_carousel_csv(df_raw)
+            df_car["hour"] = pd.to_datetime(df_car["datetime"]).dt.hour
+            hourly_counts = df_car["hour"].value_counts().sort_index()
+            st.line_chart(hourly_counts)
+        except:
+            st.info("Could not parse datetime column.")
+    else:
+        st.info("No datetime column found.")
 
-            count = upsert_carousel_events(eng, df_car)
+    st.markdown("---")
 
-            st.success(f"Uploaded {count:,} carousel transactions into the database.")
+    # --------------------------
+    # Top Users
+    # --------------------------
+    st.subheader("👤 Top Users")
 
-            st.dataframe(df_car.head(50), use_container_width=True)
+    if "user" in df_car.columns:
+        top_users = df_car["user"].value_counts().head(20)
+        st.bar_chart(top_users)
+    else:
+        st.info("No User column found.")
 
-        except Exception as e:
-            st.error(f"Carousel upload failed: {e}")
+    st.markdown("---")
 
+    # --------------------------
+    # Failure / Error Detection
+    # --------------------------
+    st.subheader("⚠️ Potential Issues / Alerts")
 
+    issues = []
+
+    # Example checks:
+    if "qty" in df_car.columns:
+        too_large = df_car[df_car["qty"] > 50]
+        if len(too_large):
+            issues.append(f"Unusually large qty transactions: {len(too_large)} rows")
+
+    if "type" in df_car.columns:
+        weird_types = set(df_car["type"]) - {"Dispense", "Refill"}
+        if weird_types:
+            issues.append(f"Unexpected transaction types: {', '.join(weird_types)}")
+
+    if len(issues) == 0:
+        st.success("No obvious issues detected.")
+    else:
+        for issue in issues:
+            st.warning(issue)
+
+    st.markdown("---")
+
+    # --------------------------
+    # Drill-Down Table
+    # --------------------------
+    st.subheader("🔍 Drill-down Table")
+    st.dataframe(df_car, use_container_width=True, height=450)
 
 # ---------- TAB 3: TECH COMPARISON ----------
 with tab3:
