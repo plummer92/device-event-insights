@@ -2336,6 +2336,9 @@ eng = get_engine(DB_URL, ENGINE_SALT)
 # ================================ SIDEBAR ==============================
 with st.sidebar:
 
+    # ===========================================
+    # DATA SOURCE
+    # ===========================================
     st.header("Data source")
 
     data_mode = st.radio(
@@ -2356,20 +2359,26 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ====================================================
-    # 1) Upload Daily Files
-    # ====================================================
-    st.subheader("1) Upload")
+    # ===========================================
+    # 1) MAIN UPLOADER — DAILY PYXIS FILES
+    # ===========================================
+    st.subheader("1) Upload Daily Pyxis Files")
+
     uploaded_files = st.file_uploader(
         "Drag & drop daily XLSX/CSV (one or many)",
         type=["csv", "xlsx"],
         accept_multiple_files=True,
-        key="file_uploader"
+        key="daily_pyxis_upload"
     )
 
-    # ====================================================
+    # This is the ONLY uploader in the sidebar.
+    # All your main upload logic should reference "uploaded_files".
+
+    st.markdown("---")
+
+    # ===========================================
     # 🔥 DANGER ZONE — DELETE ALL DATA
-    # ====================================================
+    # ===========================================
     st.markdown("### 🔥 Danger Zone")
     st.markdown(
         "**This will permanently delete ALL data in your database.**\n\n"
@@ -2381,41 +2390,37 @@ with st.sidebar:
     if confirm_reset:
         if st.button("💥 DELETE EVERYTHING (Factory Reset)"):
             try:
-                # Delete all rows from both tables
                 with eng.begin() as con:
                     con.execute(text("DELETE FROM events"))
                     con.execute(text("DELETE FROM pyxis_activity_simple"))
 
-                # Let the user know
                 st.success("💥 All data deleted. Starting fresh!")
 
-                # Force full reload
                 st.cache_data.clear()
                 st.experimental_rerun()
 
             except Exception as e:
                 st.error(f"Reset failed: {e}")
 
+    st.markdown("---")
 
-    # ====================================================
-    # 🧹 DELETE TOOL (NOW IN SIDEBAR) — WITH STATUS LOG
-    # ====================================================
-    st.markdown("### 🧹 Delete Uploaded CSV From Database")
+    # ===========================================
+    # 🧹 DELETE TOOL — REMOVE SPECIFIC UPLOAD
+    # ===========================================
+    st.markdown("### 🧹 Delete a Previously Uploaded CSV")
 
     if "delete_done" not in st.session_state:
         st.session_state["delete_done"] = False
 
-    # Real-time status log box
     log_box = st.empty()
 
     delete_file = st.file_uploader(
-        "Upload a CSV you want to DELETE from the events table",
+        "Upload the SAME CSV you want removed from the DB",
         type=["csv"],
-        key="sidebar_delete_csv",
-        help="Must match the CSV originally uploaded."
+        key="delete_specific_upload",
+        help="Must be the original CSV you want removed."
     )
 
-    # Only run once per file
     if delete_file is not None and not st.session_state["delete_done"]:
         try:
             log_box.write("📄 **Loading CSV...**")
@@ -2431,7 +2436,7 @@ with st.sidebar:
                 log_box.write("⏳ **Parsing datetimes...**")
                 df_del["datetime"] = pd.to_datetime(df_del["datetime"], errors="coerce")
 
-                log_box.write("🧮 **Rebuilding PKs (this may take a moment)...**")
+                log_box.write("🧮 **Rebuilding PKs...**")
                 def compute_pk(row):
                     parts = [
                         str(row.get("datetime", "")),
@@ -2449,22 +2454,20 @@ with st.sidebar:
 
                 log_box.write(f"🔢 **Built {len(pks):,} PKs**")
 
-                log_box.write("🗑 **Deleting matching rows from database...**")
+                log_box.write("🗑 **Deleting rows from database...**")
                 sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
                 with eng.begin() as con:
                     con.execute(sql_delete, {"pks": pks})
 
                 st.success(f"🗑 Deleted {len(pks):,} rows from the database.")
-
-                log_box.write("🧹 **Clearing cache...**")
                 st.session_state["delete_done"] = True
 
-                log_box.write("🔄 **Refreshing app...**")
                 st.cache_data.clear()
                 st.experimental_rerun()
 
         except Exception as e:
             st.error(f"Delete failed: {e}")
+
 
 # ===================== LOAD HISTORY (needed early) =====================
 history = load_history_sql(colmap, eng)
