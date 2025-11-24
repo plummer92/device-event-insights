@@ -2469,14 +2469,15 @@ with st.sidebar:
 # ===================== LOAD HISTORY (needed early) =====================
 history = load_history_sql(colmap, eng)
 
-# =================================== DATA INPUT ===================================
+# ======================== UPLOAD SECTION =========================
 uploads = []
 if data_mode == "Upload files":
     st.sidebar.header("1) Upload")
     uploads = st.sidebar.file_uploader(
         "Drag & drop daily XLSX/CSV (one or many)",
         type=["xlsx", "csv"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        key="upload_files"
     )
     if not uploads and history.empty:
         st.info("Upload daily files or switch to 'Database only' mode.")
@@ -2486,13 +2487,19 @@ else:
         st.warning("No records in database yet. Switch to 'Upload files' to seed data.")
         st.stop()
 
-# Column mapping UI (only when we have an upload to inspect)
+
+# ====================== COLUMN MAPPING UI ========================
 if uploads:
-    # Peek first file to build mapping options
+
+    # 🔥 FIX #1: Prevent rerun from wiping uploads before mapping
+    if "upload_ready" not in st.session_state:
+        st.session_state["upload_ready"] = True
+        st.experimental_rerun()
+
     sample_df = load_upload(uploads[0])
     sample_df = dedupe_columns(sample_df)
     st.sidebar.header("2) Map columns")
-    # Start from defaults but allow override
+
     for k, default in DEFAULT_COLMAP.items():
         opts = list(sample_df.columns)
         sel = st.sidebar.selectbox(
@@ -2504,15 +2511,22 @@ if uploads:
         )
         colmap[k] = sel
 
-    # Guard: no duplicated mappings
+    # Duplicate-check
     _selected = [v for v in colmap.values() if v]
     _dups = sorted({c for c in _selected if _selected.count(c) > 1})
     if _dups:
         st.error("You mapped the same column to multiple fields: " + ", ".join(_dups))
         st.stop()
 
+
 # ============================ PROCESS UPLOADS ============================
+# 🔥 FIX #2: prevent second rerun before save step
+if uploads and "processed_ready" not in st.session_state:
+    st.session_state["processed_ready"] = True
+    st.experimental_rerun()
+
 if uploads:
+
     new_files = []
     for up in uploads:
         try:
@@ -2530,32 +2544,39 @@ if uploads:
         st.stop()
 
     new_ev = pd.concat(new_files, ignore_index=True)
-    # Build pk for upload rows (needed for UPSERT)
+
+    # Build PK
     new_ev["pk"] = build_pk(new_ev, colmap)
     new_ev = new_ev.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
 
-    # Merge with DB history
+    # Merge with database history for full view
     frames = [history, new_ev] if not history.empty else [new_ev]
-    ev_all = pd.concat([f for f in frames if not f.empty], ignore_index=True)
-    ev_all = ev_all.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
+    ev_all = (
+        pd.concat(frames, ignore_index=True)
+          .drop_duplicates(subset=["pk"])
+          .sort_values(colmap["datetime"])
+    )
 
-    # Upload summary
+    # ===== Summary =====
     new_pks = set(new_ev["pk"])
     old_pks = set(history["pk"]) if not history.empty and "pk" in history.columns else set()
     num_new = len(new_pks - old_pks)
     num_dup = len(new_pks & old_pks)
-    earliest = pd.to_datetime(ev_all[colmap["datetime"]].min())
-    latest   = pd.to_datetime(ev_all[colmap["datetime"]].max())
 
     with st.expander("📥 Upload summary", expanded=True):
         st.write(f"**Rows in this upload:** {len(new_ev):,}")
-        st.write(f"- New rows vs DB: **{num_new:,}**")
-        st.write(f"- Already existed (upserts): **{num_dup:,}**")
-        st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
+        st.write(f"**New rows vs DB:** {num_new:,}")
+        st.write(f"**Already existed (upserts):** {num_dup:,}")
 
-# --- SAVE (uploads only) ---
-if uploads:
-    # Save only new rows (huge speedup; avoids hammering indexes)
+        try:
+            earliest = pd.to_datetime(ev_all[colmap["datetime"]].min())
+            latest   = pd.to_datetime(ev_all[colmap["datetime"]].max())
+            st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
+        except:
+            st.write("Could not compute time range.")
+
+
+    # ============================ SAVE TO DB ============================
     if history.empty or "pk" not in history.columns:
         to_save = new_ev
     else:
@@ -2567,9 +2588,11 @@ if uploads:
     else:
         ok, msg = save_history_sql(to_save, colmap, eng)
         (st.sidebar.success if ok else st.sidebar.error)(msg)
+
 else:
-    # Database-only mode; nothing to write
-    pass
+    # No uploads → just use DB
+    ev_all = history.copy()
+
 
 # =================== TIME RANGE FILTER ===================
 # ============================ MERGE & SAVE ============================
