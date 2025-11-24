@@ -2544,8 +2544,13 @@ if uploads:
 
     st.sidebar.header("2) Map columns")
 
-    for k, default in DEFAULT_COLMAP.items():
+    # Only map the fields that actually exist in All Device Event reports
+    PYXIS_FIELDS = ["datetime", "device", "user", "type", "desc", "qty"]
+
+    for k in PYXIS_FIELDS:
+        default = DEFAULT_COLMAP[k]
         opts = list(sample_df.columns)
+
         sel = st.sidebar.selectbox(
             f"{k.capitalize()} column",
             options=opts,
@@ -2553,14 +2558,16 @@ if uploads:
             key=f"map_{k}",
             help="Pick the matching column from your export",
         )
+
         colmap[k] = sel
 
-    # Save mapping for persistence
+    # Save mapping for future reruns
     st.session_state["colmap"] = colmap
 
     # Check for duplicate mappings
-    picked = list(colmap.values())
+    picked = [colmap[k] for k in PYXIS_FIELDS]
     dupes = sorted({c for c in picked if picked.count(c) > 1})
+
     if dupes:
         st.error("Duplicate mappings: " + ", ".join(dupes))
         st.stop()
