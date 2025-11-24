@@ -59,6 +59,21 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
     return df
 
+# ===========================================
+# FILE-TYPE AUTO-DETECTION
+# ===========================================
+
+def is_pyxis_file(df):
+    """Detects Pyxis All Device Event Report."""
+    required = {"TransactionDateTime", "Device", "UserName", "TransactionType", "MedDescription"}
+    return any(col in df.columns for col in required)
+
+def is_carousel_file(df):
+    """Detects Carousel Transaction Detail Report."""
+    required = {"Qty", "TransactionType", "TransactionDateTime", "MedDescription", "UserName"}
+    return any(col in df.columns for col in required)
+
+
 # ---------- SIMPLE EXTRACTOR FOR DEVICE ACTIVITY LOG ----------
 
 A_MIN  = r"Inventory\s*Refill\s*Point\s*Min\s*Quantity"
@@ -2476,17 +2491,22 @@ else:
     colmap = DEFAULT_COLMAP.copy()
 
 
-# ============================================================
-# DAILY PYXIS UPLOAD PIPELINE (USES MAIN SIDEBAR UPLOADER)
-# ============================================================
+# ===========================================
+# DAILY PYXIS UPLOAD (MAIN SIDEBAR)
+# ===========================================
 uploads = uploaded_files
 
-if data_mode == "Database only":
-    uploads = None
-    ev_all = history.copy()
-else:
-    if not uploads and history.empty:
-        st.info("Upload daily files or switch to 'Database only' mode.")
+if uploads:
+    # Load first file for detection
+    test_df = load_upload(uploads[0])
+
+    # DETECT WRONG FILE TYPE
+    if is_carousel_file(test_df):
+        st.sidebar.error("❌ This file is a **Carousel Transaction Detail Report**. Upload it inside the Carousel tab.")
+        st.stop()
+
+    if not is_pyxis_file(test_df):
+        st.sidebar.error("❌ File does not match the expected **Pyxis All Device Event Report** format.")
         st.stop()
 
 
@@ -2838,11 +2858,11 @@ with tab2:
 with tab_carousel:
     st.header("📦 Carousel Analyzer")
 
-    # --------------------------
-    # Carousel File Upload
-    # --------------------------
+    # ===========================================
+    # CAROUSEL UPLOADER WITH FILE VALIDATION
+    # ===========================================
     carousel_file = st.file_uploader(
-        "Upload Carousel File",
+        "Upload Carousel Transaction Detail Report",
         type=["csv", "xlsx"],
         key="carousel_upload"
     )
@@ -2851,19 +2871,30 @@ with tab_carousel:
         st.info("Upload a Carousel export to begin.")
         st.stop()
 
-    # --------------------------
-    # Load and Clean Data
-    # --------------------------
+    # Load file
     try:
         df_car = load_upload(carousel_file)
     except Exception as e:
-        st.error(f"Failed to read Carousel file: {e}")
+        st.error(f"Failed to read file: {e}")
         st.stop()
 
+    # ===========================================
+    # FILE-TYPE DETECTION (REJECT WRONG FILES)
+    # ===========================================
+    if is_pyxis_file(df_car):
+        st.error("❌ This is a Pyxis All Device Event Report. Upload it using the main sidebar uploader.")
+        st.stop()
+
+    if not is_carousel_file(df_car):
+        st.error("❌ This file does not match a known Carousel Transaction Detail Report format.")
+        st.stop()
+
+    # ===========================================
+    # LOAD + CLEAN CAROUSEL DATA
+    # ===========================================
     df_car = dedupe_columns(df_car)
     df_car.columns = df_car.columns.str.strip()
 
-    # Standardize expected names if they exist
     rename_map = {
         "TransactionDateTime": "datetime",
         "MedDescription": "med",
@@ -2876,9 +2907,9 @@ with tab_carousel:
         if old in df_car.columns:
             df_car.rename(columns={old: new}, inplace=True)
 
-    # --------------------------
-    # Carousel Summary Metrics
-    # --------------------------
+    # ===========================================
+    # SUMMARY METRICS
+    # ===========================================
     st.subheader("📊 Summary Metrics")
 
     c1, c2, c3, c4 = st.columns(4)
@@ -2898,9 +2929,9 @@ with tab_carousel:
 
     st.markdown("---")
 
-    # --------------------------
-    # Top Medications
-    # --------------------------
+    # ===========================================
+    # TOP MEDICATIONS
+    # ===========================================
     st.subheader("🏆 Top Medications")
 
     if "med" in df_car.columns and "qty" in df_car.columns:
@@ -2916,9 +2947,9 @@ with tab_carousel:
 
     st.markdown("---")
 
-    # --------------------------
-    # Hourly Activity
-    # --------------------------
+    # ===========================================
+    # HOURLY ACTIVITY
+    # ===========================================
     st.subheader("⏱ Hourly Activity")
 
     if "datetime" in df_car.columns:
@@ -2933,9 +2964,9 @@ with tab_carousel:
 
     st.markdown("---")
 
-    # --------------------------
-    # Top Users
-    # --------------------------
+    # ===========================================
+    # TOP USERS
+    # ===========================================
     st.subheader("👤 Top Users")
 
     if "user" in df_car.columns:
@@ -2946,14 +2977,13 @@ with tab_carousel:
 
     st.markdown("---")
 
-    # --------------------------
-    # Failure / Error Detection
-    # --------------------------
+    # ===========================================
+    # FAILURE / ERROR DETECTION
+    # ===========================================
     st.subheader("⚠️ Potential Issues / Alerts")
 
     issues = []
 
-    # Example checks:
     if "qty" in df_car.columns:
         too_large = df_car[df_car["qty"] > 50]
         if len(too_large):
@@ -2972,11 +3002,12 @@ with tab_carousel:
 
     st.markdown("---")
 
-    # --------------------------
-    # Drill-Down Table
-    # --------------------------
+    # ===========================================
+    # DRILL-DOWN TABLE
+    # ===========================================
     st.subheader("🔍 Drill-down Table")
     st.dataframe(df_car, use_container_width=True, height=450)
+
 
 # ---------- TAB 3: TECH COMPARISON ----------
 with tab3:
