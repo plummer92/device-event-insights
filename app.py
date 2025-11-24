@@ -64,13 +64,21 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ===========================================
 
 def is_pyxis_file(df):
-    """Detect Pyxis All Device Event Reports (ADE)."""
-    required = {"TransactionDateTime", "TransactionType", "Quantity", "MedDescription"}
-    return required.issubset(set(df.columns))
+    """Detect Pyxis All Device Event Reports."""
+    required = {
+        "TransactionDateTime",
+        "TransactionType",
+        "Quantity",
+        "MedDescription",
+        "UserName",
+        "Device",
+    }
+    return required.issubset(df.columns)
+
 
 def is_carousel_file(df):
     """Detect Carousel Transaction Detail Reports."""
-    # Carousel uses "Qty" instead of "Quantity"
+    # Carousel uses EXACT 'Qty', but Pyxis uses 'Quantity' and 'QtyUOM'.
     return "Qty" in df.columns and "Quantity" not in df.columns
 
 
