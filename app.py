@@ -2466,34 +2466,50 @@ with st.sidebar:
             st.error(f"Delete failed: {e}")
 
 
-# ===================== LOAD HISTORY EARLY =====================
-history = load_history_sql(colmap, eng)
+# ===================== LOAD HISTORY (stable, reboot-safe) =====================
+history = load_history_sql(DEFAULT_COLMAP, eng)
+
+# Restore mapping if user saved one
+if "colmap" in st.session_state:
+    colmap = st.session_state["colmap"]
+else:
+    colmap = DEFAULT_COLMAP.copy()
 
 
 # ============================================================
 # DAILY PYXIS UPLOAD PIPELINE (USES MAIN SIDEBAR UPLOADER)
 # ============================================================
-
-uploads = uploaded_files  # ✔ use the correct single uploader
+uploads = uploaded_files
 
 if data_mode == "Database only":
     uploads = None
     ev_all = history.copy()
-
 else:
     if not uploads and history.empty:
         st.info("Upload daily files or switch to 'Database only' mode.")
         st.stop()
 
 
-# ====================== COLUMN MAPPING UI ========================
+# ============================================================
+# SAFE RERUN FLAGS (must be BEFORE mapping and processing)
+# ============================================================
+pending_rerun = False
+
+# FIX 1: preserve uploads during first rerun
+if uploads and "upload_ready" not in st.session_state:
+    st.session_state["upload_ready"] = True
+    pending_rerun = True
+
+# FIX 2: preserve uploads before saving
+if uploads and "processed_ready" not in st.session_state:
+    st.session_state["processed_ready"] = True
+    pending_rerun = True
+
+
+# ============================================================
+# COLUMN MAPPING UI
+# ============================================================
 if uploads:
-
-    # 🔥 FIX 1 — preserve uploads during rerun
-    if "upload_ready" not in st.session_state:
-        st.session_state["upload_ready"] = True
-        st.rerun()
-
 
     sample_df = load_upload(uploads[0])
     sample_df = dedupe_columns(sample_df)
@@ -2511,7 +2527,10 @@ if uploads:
         )
         colmap[k] = sel
 
-    # prevent duplicate mappings
+    # Save mapping for persistence
+    st.session_state["colmap"] = colmap
+
+    # Check for duplicate mappings
     picked = list(colmap.values())
     dupes = sorted({c for c in picked if picked.count(c) > 1})
     if dupes:
@@ -2519,13 +2538,9 @@ if uploads:
         st.stop()
 
 
-# ============================ PROCESS UPLOADS ============================
-# 🔥 FIX 2 — preserve uploads before save
-if uploads and "processed_ready" not in st.session_state:
-    st.session_state["processed_ready"] = True
-    st.rerun()
-
-
+# ============================================================
+# PROCESS UPLOADS
+# ============================================================
 if uploads:
 
     new_files = []
@@ -2546,7 +2561,7 @@ if uploads:
 
     new_ev = pd.concat(new_files, ignore_index=True)
 
-    # Build PK and remove duplicates
+    # Build PK
     new_ev["pk"] = build_pk(new_ev, colmap)
     new_ev = new_ev.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
 
@@ -2558,16 +2573,16 @@ if uploads:
         .sort_values(colmap["datetime"])
     )
 
-    # Summary
+    # Upload summary
     new_pks = set(new_ev["pk"])
-    old_pks = set(history["pk"]) if not history.empty else set()
+    old_pks = set(history["pk"]) if "pk" in history.columns else set()
 
     num_new = len(new_pks - old_pks)
     num_dup = len(new_pks & old_pks)
 
     with st.expander("📥 Upload Summary", expanded=True):
         st.write(f"**Rows in this upload:** {len(new_ev):,}")
-        st.write(f"**New rows added:** {num_new:,}")
+        st.write(f"**New rows:** {num_new:,}")
         st.write(f"**Already existed:** {num_dup:,}")
 
         try:
@@ -2577,8 +2592,7 @@ if uploads:
         except:
             st.write("Could not compute history range.")
 
-
-    # ============================ SAVE TO DB ============================
+    # SAVE TO DB
     if history.empty or "pk" not in history.columns:
         to_save = new_ev
     else:
@@ -2592,6 +2606,14 @@ if uploads:
 
 else:
     ev_all = history.copy()
+
+
+# ============================================================
+# FINAL SAFE RERUN (must be at bottom of section)
+# ============================================================
+if pending_rerun:
+    st.rerun()
+
 
 
 # =================== TIME RANGE FILTER ===================
