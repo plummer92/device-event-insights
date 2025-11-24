@@ -2765,24 +2765,21 @@ st.success(f"Loaded {len(data_f):,} events for analysis.")
 
 
 # =================== TABS ===================
-tab1, tab2, tab_carousel, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13 = st.tabs(
-    [
-        "📈 Overview",
-        "🚶 Delivery Analytics",
-        "📦 Carousel Transactions",   # <-- NEW TAB (TAB 3)
-        "🧑‍🔧 Tech Comparison",
-        "📦 Devices",
-        "⏱ Hourly",
-        "🧪 Drill-down",
-        "🔟 Weekly Top 10",
-        "🚨 Outliers",
-        "❓ Ask the data",
-        "📥 Load/Unload",
-        "💊 Refill Efficiency",
-        "🧷 Pended Loads",
-        "⚙️ Slot Config"
-    ]
-)
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab_dbcheck = st.tabs([
+    "📈 Overview",
+    "🚶 Delivery Analytics",
+    "🧑‍🔧 Tech Comparison",
+    "📦 Devices",
+    "⏱ Hourly",
+    "🧪 Drill-down",
+    "🔟 Weekly Top 10",
+    "🚨 Outliers",
+    "❓ Ask the data",
+    "📥 Load/Unload",
+    "💊 Refill Efficiency",
+    "🧷 Pended Loads",
+    "🗄 DB Check"
+])
 
 
 # ---------- TAB 1: OVERVIEW ----------
@@ -3455,3 +3452,54 @@ with tab13:
 
     except Exception as e:
         st.error(f"Error loading QA list: {e}")
+
+with tab_dbcheck:
+    st.header("🗄 Database Check")
+
+    st.markdown("This tab shows what is **actually stored** in your Neon Postgres database.")
+
+    # Load directly from the DB using your DEFAULT_COLMAP
+    df_db = load_history_sql(DEFAULT_COLMAP, eng)
+
+    if df_db.empty:
+        st.error("❌ Database is currently empty.")
+        st.stop()
+
+    st.success(f"Database contains **{len(df_db):,} rows**")
+
+    # Show date range
+    try:
+        earliest = pd.to_datetime(df_db["datetime"]).min()
+        latest   = pd.to_datetime(df_db["datetime"]).max()
+
+        st.metric("Earliest Timestamp", earliest.strftime("%Y-%m-%d %H:%M"))
+        st.metric("Latest Timestamp", latest.strftime("%Y-%m-%d %H:%M"))
+    except:
+        st.warning("Could not compute date range — check column mapping.")
+
+    st.markdown("---")
+
+    # Count by device
+    st.subheader("📦 Rows by Device")
+    if "device" in df_db.columns:
+        dev_counts = df_db["device"].value_counts().head(30)
+        st.bar_chart(dev_counts)
+    else:
+        st.info("Device column not found.")
+
+    st.markdown("---")
+
+    # Count by user
+    st.subheader("👤 Rows by User")
+    if "user" in df_db.columns:
+        user_counts = df_db["user"].value_counts().head(30)
+        st.bar_chart(user_counts)
+    else:
+        st.info("User column not found.")
+
+    st.markdown("---")
+
+    # Optional raw table preview
+    with st.expander("🔍 Raw Data Preview", expanded=False):
+        st.dataframe(df_db.head(2000), use_container_width=True)
+
