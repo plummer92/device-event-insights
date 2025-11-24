@@ -2535,7 +2535,7 @@ if uploads and "processed_ready" not in st.session_state:
 
 
 # ============================================================
-# COLUMN MAPPING UI
+# COLUMN MAPPING UI (with safe MedID)
 # ============================================================
 if uploads:
 
@@ -2544,8 +2544,11 @@ if uploads:
 
     st.sidebar.header("2) Map columns")
 
-    # Only map the fields that actually exist in All Device Event reports
     PYXIS_FIELDS = ["datetime", "device", "user", "type", "desc", "qty"]
+
+    # Add medid ONLY if file contains the MedID column
+    if "MedID" in sample_df.columns or "Item ID" in sample_df.columns:
+        PYXIS_FIELDS.append("medid")
 
     for k in PYXIS_FIELDS:
         default = DEFAULT_COLMAP[k]
@@ -2561,17 +2564,15 @@ if uploads:
 
         colmap[k] = sel
 
-    # Save mapping for future reruns
+    # Save mapping
     st.session_state["colmap"] = colmap
 
-    # Check for duplicate mappings
+    # Duplicate-check only over mapped fields
     picked = [colmap[k] for k in PYXIS_FIELDS]
     dupes = sorted({c for c in picked if picked.count(c) > 1})
-
     if dupes:
         st.error("Duplicate mappings: " + ", ".join(dupes))
         st.stop()
-
 
 # ============================================================
 # PROCESS UPLOADS
