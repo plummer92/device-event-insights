@@ -64,14 +64,14 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ===========================================
 
 def is_pyxis_file(df):
-    """Detects Pyxis All Device Event Report."""
-    required = {"TransactionDateTime", "Device", "UserName", "TransactionType", "MedDescription"}
-    return any(col in df.columns for col in required)
+    """Detect Pyxis All Device Event Reports (ADE)."""
+    required = {"TransactionDateTime", "TransactionType", "Quantity", "MedDescription"}
+    return required.issubset(set(df.columns))
 
 def is_carousel_file(df):
-    """Detects Carousel Transaction Detail Report."""
-    required = {"Qty", "TransactionType", "TransactionDateTime", "MedDescription", "UserName"}
-    return any(col in df.columns for col in required)
+    """Detect Carousel Transaction Detail Reports."""
+    # Carousel uses "Qty" instead of "Quantity"
+    return "Qty" in df.columns and "Quantity" not in df.columns
 
 
 # ---------- SIMPLE EXTRACTOR FOR DEVICE ACTIVITY LOG ----------
