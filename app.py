@@ -2492,7 +2492,8 @@ if uploads:
     # 🔥 FIX 1 — preserve uploads during rerun
     if "upload_ready" not in st.session_state:
         st.session_state["upload_ready"] = True
-        st.experimental_rerun()
+        st.rerun()
+
 
     sample_df = load_upload(uploads[0])
     sample_df = dedupe_columns(sample_df)
@@ -2522,7 +2523,8 @@ if uploads:
 # 🔥 FIX 2 — preserve uploads before save
 if uploads and "processed_ready" not in st.session_state:
     st.session_state["processed_ready"] = True
-    st.experimental_rerun()
+    st.rerun()
+
 
 if uploads:
 
