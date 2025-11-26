@@ -2507,40 +2507,76 @@ if delete_file is not None and not st.session_state["delete_done"]:
     except Exception as e:
         st.error(f"Delete failed: {e}")
 
-# ======================================================
-# MAIN INGESTION BLOCK — SAFE VERSION WITH RERUN LOCK
-# ======================================================
-if data_mode == "Upload files" and uploaded_files:
+# ===========================================
+# DAILY PYXIS UPLOAD (MAIN SIDEBAR)
+# ===========================================
+uploads = uploaded_files
 
-    if st.session_state.get("saving_in_progress", False):
-        st.warning("⏳ Save already in progress… do NOT refresh or switch tabs.")
+if uploads:
+
+    # Load first file for validation
+    test_df = load_upload(uploads[0])
+
+    # DETECT WRONG FILE TYPE
+    if is_carousel_file(test_df):
+        st.sidebar.error("❌ This file is a **Carousel Transaction Detail Report**. Upload it inside the Carousel tab.")
         st.stop()
 
-    st.session_state["saving_in_progress"] = True
-    st.info("⏳ Upload is processing… PLEASE WAIT. Do NOT touch anything.")
+    if not is_pyxis_file(test_df):
+        st.sidebar.error("❌ File does not match the expected **Pyxis All Device Event Report** format.")
+        st.stop()
 
-    for f in uploaded_files:
-        try:
-            # LOAD + PARSE FILE
-            ext = os.path.splitext(f.name)[1].lower()
-            df = pd.read_csv(f, low_memory=False) if ext == ".csv" else pd.read_excel(f)
+    # Load current DB history for PK comparison
+    history = load_history_sql(DEFAULT_COLMAP, eng)
 
-            df = dedupe_columns(df)
-            new_ev = preprocess_upload(df, colmap)
+    for up in uploads:
+        df = load_upload(up)
+        df = dedupe_columns(df)  
 
-            # SAFE UPSERT
-            success, msg = save_history_sql(new_ev, colmap, eng)
-            st.success(msg)
+        # 🧹 Your REAL normalization pipeline
+        df = apply_column_mapping(df, colmap)
+        df = canonicalize_device(df)
+        df = canonicalize_user(df)
+        df = canonicalize_type(df)
+        df = normalize_desc(df)
+        df = normalize_qty(df)
+        df = normalize_medid(df)
 
-        except Exception as e:
-            st.error(f"❌ DB save error: {e}")
-            break
+        # Build PK
+        new_ev = build_pk(df, colmap)
 
-        finally:
-            st.session_state["saving_in_progress"] = False
+        # Determine new rows compared to DB
+        if history.empty or "pk" not in history.columns:
+            to_save = new_ev
+        else:
+            to_save = new_ev[~new_ev["pk"].isin(history["pk"])]
 
+        st.sidebar.write(f"📄 `{up.name}` → {len(to_save):,} new rows")
 
+        # ----------------------------------------------------
+        # 🔒 SAFE UPSERT WITH RERUN PROTECTION
+        # ----------------------------------------------------
+        if to_save.empty:
+            st.sidebar.info("No new rows to save.")
+        else:
+            if st.session_state.get("saving_in_progress", False):
+                st.sidebar.warning("⏳ Save already in progress… please wait.")
+                st.stop()
 
+            st.session_state["saving_in_progress"] = True
+            try:
+                ok, msg = save_history_sql(to_save, colmap, eng)
+                (st.sidebar.success if ok else st.sidebar.error)(msg)
+
+                # Update history so the next file in the SAME batch compares correctly
+                history = pd.concat([history, to_save], ignore_index=True)
+
+            except Exception as e:
+                st.sidebar.error(f"DB save error: {e}")
+                st.stop()
+
+            finally:
+                st.session_state["saving_in_progress"] = False
 
 
 # ===================== LOAD HISTORY (stable, reboot-safe) =====================
