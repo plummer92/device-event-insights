@@ -2071,9 +2071,8 @@ def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict
     return rows
 
 
-
 def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[bool, str]:
-    """UPSERT by pk into Postgres (chunked)."""
+    """UPSERT by pk into Postgres using very small chunks to prevent Neon timeouts."""
     try:
         init_db(eng)
         rows = _df_to_rows_canonical(df, colmap)
@@ -2093,16 +2092,32 @@ def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[boo
                 medid  = EXCLUDED.medid;
         """)
 
-        CHUNK = 1000  # smaller batch
+        # 🔥 much smaller batch size to avoid Neon index timeout
+        CHUNK = 50
+
         total = 0
+        total_rows = len(rows)
+
+        # Optional Streamlit progress
+        progress = st.progress(0.0, text="Saving to database...")
+
         with eng.begin() as con:
+            # Increase timeout and reduce disk sync cost
             con.execute(text("SET LOCAL statement_timeout = '120s'"))
             con.execute(text("SET LOCAL synchronous_commit = OFF"))
-            for i in range(0, len(rows), CHUNK):
+
+            for i in range(0, total_rows, CHUNK):
                 batch = rows[i:i+CHUNK]
                 con.execute(upsert_sql, batch)
                 total += len(batch)
+
+                # Update progress bar
+                progress.progress(total / total_rows, text=f"Saved {total:,}/{total_rows:,} rows...")
+
+        progress.progress(1.0, text="Done saving!")
+
         return True, f"Saved to Postgres: {total:,} rows (upserted by pk)."
+
     except Exception as e:
         return False, f"DB save error: {e}"
 
