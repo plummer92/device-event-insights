@@ -3310,11 +3310,21 @@ with tab_dbcheck:
     # Load directly from the DB using your DEFAULT_COLMAP
     df_db = load_history_sql(DEFAULT_COLMAP, eng)
 
-    if df_db.empty:
-        st.error("❌ Database is currently empty.")
-        st.stop()
+# 🔧 APPLY COLUMN MAPPING FIX HERE
+rename_map = {
+    DEFAULT_COLMAP["device"]: "device",
+    DEFAULT_COLMAP["user"]: "user",
+    DEFAULT_COLMAP["datetime"]: "datetime",
+    DEFAULT_COLMAP["type"]: "type",
+}
 
-    st.success(f"Database contains **{len(df_db):,} rows**")
+# Optional mapped fields
+for opt in ["desc", "qty", "medid"]:
+    if opt in DEFAULT_COLMAP and DEFAULT_COLMAP[opt] in df_db.columns:
+        rename_map[DEFAULT_COLMAP[opt]] = opt
+
+df_db = df_db.rename(columns=rename_map)
+# 🔧 END FIX
 
     # Show date range
     try:
