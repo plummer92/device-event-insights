@@ -2534,7 +2534,7 @@ if uploads:
         df = dedupe_columns(df)  
 
         # 🧹 Your REAL normalization pipeline
-        df = apply_column_mapping(df, colmap)
+        df = apply_colmap(df, colmap)
         df = canonicalize_device(df)
         df = canonicalize_user(df)
         df = canonicalize_type(df)
