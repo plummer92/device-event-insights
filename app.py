@@ -2583,6 +2583,11 @@ if delete_file is not None and not st.session_state["delete_done"]:
     except Exception as e:
         st.error(f"Delete failed: {e}")
 
+# Safety: auto-clear stuck flag on fresh run
+if st.session_state.get("saving_in_progress") and not uploads:
+    st.session_state["saving_in_progress"] = False
+
+
 # ===========================================
 # DAILY PYXIS UPLOAD (MAIN SIDEBAR)
 # ===========================================
