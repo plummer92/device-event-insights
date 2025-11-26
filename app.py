@@ -2620,153 +2620,119 @@ if delete_file is not None and not st.session_state["delete_done"]:
         st.error(f"Delete failed: {e}")
 
 # ============================================================
-# INGESTION ENGINE — FINAL VERSION
+# INGESTION ENGINE — CLEAN, SAFE, FINAL VERSION
 # ============================================================
-# ----------------------------------------------------
-# SANITIZE ROWS BEFORE DB UPSERT
-# ----------------------------------------------------
-# Replace pandas NA with Python None
-to_save = to_save.replace({pd.NA: None})
 
-# Ensure required optional columns never contain NAType
-for c in ["medid", "desc", "device", "type"]:
-    if c in to_save.columns:
-        to_save[c] = to_save[c].astype("object").where(to_save[c].notna(), None)
+ev_all = None  # final dataframe used for analytics
 
-# Qty must be a float or int, NEVER <NA>
-qty_col = colmap.get("qty")
-if qty_col in to_save.columns:
-    to_save[qty_col] = pd.to_numeric(to_save[qty_col], errors="coerce").fillna(0)
 
-uploads = uploaded_files
+# ============================================================
+# 1) DELETE MODE
+# ============================================================
+# The delete block should ONLY run when the user uploads a file
+# into the delete area. It should NOT affect upload mode or DB-only mode.
+if data_mode == "Upload files" and "df_del" in locals():
+    try:
+        if df_del is not None and isinstance(df_del, pd.DataFrame) and len(df_del) > 0:
+            log_box.write("🧮 **Computing PKs for deletion...**")
 
-# Reset lock if no uploads
-if st.session_state.get("saving_in_progress") and not uploads:
-    st.session_state["saving_in_progress"] = False
+            def compute_pk(row):
+                parts = [
+                    str(row.get("datetime", "")),
+                    str(row.get("device", "")),
+                    str(row.get("user", "")),
+                    str(row.get("type", "")),
+                    str(row.get("desc", "")),
+                    str(row.get("qty", "")),
+                    str(row.get("medid", "")),
+                ]
+                return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
 
-# Load DB history now (safe version)
-history = safe_history(eng)
+            df_del["pk"] = df_del.apply(compute_pk, axis=1)
+            pks = df_del["pk"].dropna().unique().tolist()
 
-if uploads:
+            log_box.write(f"🔢 **Built {len(pks):,} PKs to delete**")
 
-    # ========== PREVALIDATE FIRST FILE ==========
-    sample = load_upload(uploads[0])
-    sample = dedupe_columns(sample)
+            if len(pks) > 0:
+                log_box.write("🗑 **Deleting rows from database...**")
 
-    if is_carousel_file(sample):
-        st.sidebar.error("❌ This file is a Carousel report. Upload it inside the Carousel tab.")
-        st.stop()
+                sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
+                with eng.begin() as con:
+                    con.execute(sql_delete, {"pks": pks})
 
-    if not is_pyxis_file(sample):
-        st.sidebar.error("❌ This file is NOT an All Device Event Report.")
-        st.stop()
+                st.success(f"🗑 Successfully deleted {len(pks):,} rows.")
+                st.session_state["delete_done"] = True
 
-    # ========== REMAP COLUMNS ==========
-    st.sidebar.header("2) Map columns")
+                # Clear cache + reload DB into ev_all
+                st.cache_data.clear()
+                ev_all = load_history_sql(colmap, eng)
+                st.experimental_rerun()
+        else:
+            st.info("No valid delete dataset detected.")
 
-    PYXIS_FIELDS = ["datetime", "device", "user", "type", "desc", "qty"]
-    if "MedID" in sample.columns or "Item ID" in sample.columns:
-        PYXIS_FIELDS.append("medid")
+    except Exception as e:
+        st.error(f"Delete failed: {e}")
 
-    for k in PYXIS_FIELDS:
-        default = DEFAULT_COLMAP[k]
-        opts = list(sample.columns)
 
-        colmap[k] = st.sidebar.selectbox(
-            f"{k}",
-            options=opts,
-            index=opts.index(default) if default in opts else 0,
-            key=f"map_{k}"
+# ============================================================
+# 2) UPLOAD MODE — CLEAN & UPSERT
+# ============================================================
+if data_mode == "Upload files" and "to_save" in locals() and isinstance(to_save, pd.DataFrame):
+
+    # -------------------------------------------
+    # SANITIZE VALUES
+    # -------------------------------------------
+    to_save = to_save.replace({pd.NA: None})
+    to_save = to_save.where(pd.notna(to_save), None)
+
+    # Strings
+    for c in ["device", "user", "type", "desc", "medid"]:
+        if c in to_save.columns:
+            to_save[c] = to_save[c].astype("object").where(~to_save[c].isna(), None)
+
+    # Quantities
+    if "qty" in to_save.columns:
+        to_save["qty"] = pd.to_numeric(to_save["qty"], errors="coerce")
+        to_save["qty"] = to_save["qty"].where(~to_save["qty"].isna(), None)
+
+    # Date/Time
+    dtcol = colmap["datetime"]
+    if dtcol in to_save.columns:
+        to_save[dtcol] = pd.to_datetime(to_save[dtcol], errors="coerce")
+        to_save[dtcol] = to_save[dtcol].apply(
+            lambda x: x.to_pydatetime() if not pd.isna(x) else None
         )
 
-    st.session_state["colmap"] = colmap
-
-    # Duplicate mappings?
-    picked = [colmap[k] for k in PYXIS_FIELDS]
-    dupes = sorted({c for c in picked if picked.count(c) > 1})
-    if dupes:
-        st.sidebar.error("Duplicate mappings: " + ", ".join(dupes))
-        st.stop()
-
-    # ========== PROCESS EACH FILE ==========
-    all_new = []
-
-    for up in uploads:
-        try:
-            df = load_upload(up)
-            df = full_clean(df, colmap)
-            df = build_pk_once(df, colmap)
-
-            df = df.dropna(subset=["pk"])
-            df = df.drop_duplicates(subset=["pk"])
-            df = df.sort_values(colmap["datetime"])
-
-            all_new.append(df)
-
-        except Exception as e:
-            st.sidebar.error(f"Failed to read {up.name}: {e}")
-            st.stop()
-
-    if not all_new:
-        st.warning("No usable rows found.")
-        st.stop()
-
-    # Combine all cleaned files
-    new_ev = pd.concat(all_new, ignore_index=True)
-
-    # ========== MERGE WITH HISTORY ==========
-    old_pks = set(history["pk"])
-    new_pks = set(new_ev["pk"])
-
-    unique_new = new_ev[~new_ev["pk"].isin(old_pks)].copy()
-
-    # ========== SUMMARY ==========
-    with st.expander("📥 Upload Summary", expanded=True):
-        st.write(f"**Rows this upload:** {len(new_ev):,}")
-        st.write(f"**New rows:** {len(unique_new):,}")
-        st.write(f"**Already existed:** {len(new_pks & old_pks):,}")
-
-        try:
-            st.write(f"**Range:** {new_ev[colmap['datetime']].min()} → {new_ev[colmap['datetime']].max()}")
-        except:
-            st.write("Unable to compute date range.")
-
-    # 🔧 FIX: sanitize NAType before DB insert
-    to_save = to_save.replace({pd.NA: None})
-    to_save = to_save.fillna({"medid": None, "desc": None, "device": None, "type": None})
-    # qty must be numeric, convert safely
-    to_save[colmap["qty"]] = pd.to_numeric(to_save[colmap["qty"]], errors="coerce").fillna(0)
-
-
-    # ========== UPSERT ==========
-    if unique_new.empty:
+    # -------------------------------------------
+    # UPSERT INTO DATABASE
+    # -------------------------------------------
+    if to_save.empty:
         st.sidebar.info("No new rows to save.")
     else:
-        if st.session_state.get("saving_in_progress", False):
-            st.sidebar.warning("⏳ Save already in progress…")
-            st.stop()
+        ok, msg = save_history_sql(to_save, colmap, eng)
+        (st.sidebar.success if ok else st.sidebar.error)(msg)
 
-        st.session_state["saving_in_progress"] = True
-        try:
-            ok, msg = save_history_sql(unique_new, colmap, eng)
-            (st.sidebar.success if ok else st.sidebar.error)(msg)
-        except Exception as e:
-            st.sidebar.error(f"DB save error: {e}")
-        finally:
-            st.session_state["saving_in_progress"] = False
+    # Load full DB history into ev_all
+    ev_all = load_history_sql(colmap, eng)
 
-    # ========== FINAL MERGED VIEW ==========
-    ev_all = (
-        pd.concat([history, new_ev], ignore_index=True)
-          .drop_duplicates(subset=["pk"])
-          .sort_values(colmap["datetime"])
-    )
 
-else:
-    # No uploads → DB only mode
-    ev_all = history.copy()
+# ============================================================
+# 3) DATABASE-ONLY MODE
+# ============================================================
+if data_mode == "Database only":
+    ev_all = load_history_sql(colmap, eng)
 
-# =================== TIME RANGE FILTER ===================
+
+# ============================================================
+# FINAL GUARD
+# ============================================================
+if ev_all is None or not isinstance(ev_all, pd.DataFrame) or ev_all.empty:
+    st.warning("No events available. Upload data or check your database.")
+    st.stop()
+
+
+
+
 # ============================ MERGE & SAVE ============================
 if uploads:
     # new_ev was already created above from uploaded files
