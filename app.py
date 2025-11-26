@@ -24,6 +24,11 @@ from sqlalchemy import create_engine, text
 import matplotlib.pyplot as plt  # needed for pandas Styler gradients
 from pandas.api.types import DatetimeTZDtype
 
+# Prevent Streamlit from rerunning during long DB saves
+if "saving_in_progress" not in st.session_state:
+    st.session_state["saving_in_progress"] = False
+
+
 
 
 # ----------------------------- CONFIG ---------------------------------
@@ -2397,19 +2402,42 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ===========================================
-    # 1) MAIN UPLOADER — DAILY PYXIS FILES
-    # ===========================================
-    st.subheader("1) Upload Daily Pyxis Files")
+# ======================================================
+# MAIN INGESTION BLOCK — SAFE VERSION WITH RERUN LOCK
+# ======================================================
+if data_mode == "Upload files" and uploaded_files:
 
-    uploaded_files = st.file_uploader(
-        "Drag & drop daily XLSX/CSV (one or many)",
-        type=["csv", "xlsx"],
-        accept_multiple_files=True,
-        key="daily_pyxis_upload"
-    )
+    # 🛑 Prevent mid-ingest rerun
+    if st.session_state.get("saving_in_progress", False):
+        st.warning("⏳ Save already in progress… do NOT refresh, click, or switch tabs.")
+        st.stop()
 
-    st.markdown("---")
+    # 🔒 Lock ingest session
+    st.session_state["saving_in_progress"] = True
+    st.info("⏳ Upload is processing… PLEASE WAIT. Do NOT refresh, click, or switch tabs.")
+
+    # Loop through files
+    for f in uploaded_files:
+        try:
+            # --------------------------
+            # LOAD + PARSE THE FILE HERE
+            # (your existing logic stays here)
+            # --------------------------
+
+            # ---------------------------------------
+            # 🔥 CRITICAL PART: SAFE DB INSERT
+            # ---------------------------------------
+            success, msg = save_history_sql(new_ev, colmap, eng)
+            st.success(msg)
+
+        except Exception as e:
+            st.error(f"❌ DB save error: {e}")
+            break  # stop processing more files
+
+        finally:
+            # ALWAYS release lock
+            st.session_state["saving_in_progress"] = False
+
 
     # ===========================================
     # 🔥 DANGER ZONE — DELETE ALL DATA
@@ -3122,8 +3150,6 @@ with tab11:
                 use_container_width=True,
             )
 
-
-# ---------- TAB 12: PENDED / THRESHOLD ACTIVITY ----------
 # ---------- TAB 12: PENDED / THRESHOLD ACTIVITY ----------
 with tab12:
     st.subheader("Pended / Threshold Activity (simple view)")
