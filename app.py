@@ -2415,28 +2415,6 @@ def normalize_medid(df):
         df["medid"] = df["medid"].astype(str).str.strip()
     return df
 
-
-def build_pk(df: pd.DataFrame, colmap: Dict[str,str]) -> pd.DataFrame:
-    """Build SHA1 pk using canonical columns."""
-    out = df.copy()
-
-    def make(row):
-        parts = [
-            str(row.get("datetime", "")),
-            str(row.get("device", "")),
-            str(row.get("user", "")),
-            str(row.get("type", "")),
-            str(row.get("desc", "")),
-            str(row.get("qty", "")),
-            str(row.get("medid", "")),
-        ]
-        return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
-
-    out["pk"] = out.apply(make, axis=1)
-    return out
-
-# ------------------------------------------------------------------------------------
-
 # ----------------------------- UI ------------------------------------
 st.title("All Device Event Insights — Pro")
 
