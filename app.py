@@ -2402,42 +2402,15 @@ with st.sidebar:
 
     st.markdown("---")
 
-# ======================================================
-# MAIN INGESTION BLOCK — SAFE VERSION WITH RERUN LOCK
-# ======================================================
-if data_mode == "Upload files" and uploaded_files:
+    # Uploader must remain INSIDE sidebar
+    uploaded_files = st.file_uploader(
+        "Drag & drop daily XLSX/CSV (one or many)",
+        type=["csv", "xlsx"],
+        accept_multiple_files=True,
+        key="daily_pyxis_upload"
+    )
 
-    # 🛑 Prevent mid-ingest rerun
-    if st.session_state.get("saving_in_progress", False):
-        st.warning("⏳ Save already in progress… do NOT refresh, click, or switch tabs.")
-        st.stop()
-
-    # 🔒 Lock ingest session
-    st.session_state["saving_in_progress"] = True
-    st.info("⏳ Upload is processing… PLEASE WAIT. Do NOT refresh, click, or switch tabs.")
-
-    # Loop through files
-    for f in uploaded_files:
-        try:
-            # --------------------------
-            # LOAD + PARSE THE FILE HERE
-            # (your existing logic stays here)
-            # --------------------------
-
-            # ---------------------------------------
-            # 🔥 CRITICAL PART: SAFE DB INSERT
-            # ---------------------------------------
-            success, msg = save_history_sql(new_ev, colmap, eng)
-            st.success(msg)
-
-        except Exception as e:
-            st.error(f"❌ DB save error: {e}")
-            break  # stop processing more files
-
-        finally:
-            # ALWAYS release lock
-            st.session_state["saving_in_progress"] = False
-
+    st.markdown("---")
 
     # ===========================================
     # 🔥 DANGER ZONE — DELETE ALL DATA
@@ -2484,52 +2457,90 @@ if data_mode == "Upload files" and uploaded_files:
         help="Must be the original CSV you want removed."
     )
 
-    if delete_file is not None and not st.session_state["delete_done"]:
+# ======================================================
+# DELETE TOOL LOGIC (must be OUTSIDE the ingest block)
+# ======================================================
+if delete_file is not None and not st.session_state["delete_done"]:
+    try:
+        log_box.write("📄 **Loading CSV...**")
+        df_del = pd.read_csv(delete_file)
+
+        log_box.write("🔎 **Normalizing column names...**")
+        df_del = df_del.rename(columns={v: k for k, v in DEFAULT_COLMAP.items() if v in df_del.columns})
+
+        required = ["datetime", "device", "user", "type"]
+        if not all(c in df_del.columns for c in required):
+            st.error("❌ CSV missing required columns to rebuild PKs.")
+        else:
+            log_box.write("⏳ **Parsing datetimes...**")
+            df_del["datetime"] = pd.to_datetime(df_del["datetime"], errors="coerce")
+
+            log_box.write("🧮 **Rebuilding PKs...**")
+            def compute_pk(row):
+                parts = [
+                    str(row.get("datetime", "")),
+                    str(row.get("device", "")),
+                    str(row.get("user", "")),
+                    str(row.get("type", "")),
+                    str(row.get("desc", "")),
+                    str(row.get("qty", "")),
+                    str(row.get("medid", "")),
+                ]
+                return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
+
+            df_del["pk"] = df_del.apply(compute_pk, axis=1)
+            pks = df_del["pk"].dropna().unique().tolist()
+
+            log_box.write(f"🔢 **Built {len(pks):,} PKs**")
+
+            log_box.write("🗑 **Deleting rows from database...**")
+            sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
+            with eng.begin() as con:
+                con.execute(sql_delete, {"pks": pks})
+
+            st.success(f"🗑 Deleted {len(pks):,} rows from the database.")
+            st.session_state["delete_done"] = True
+
+            st.cache_data.clear()
+            st.experimental_rerun()
+
+    except Exception as e:
+        st.error(f"Delete failed: {e}")
+
+# ======================================================
+# MAIN INGESTION BLOCK — SAFE VERSION WITH RERUN LOCK
+# ======================================================
+if data_mode == "Upload files" and uploaded_files:
+
+    if st.session_state.get("saving_in_progress", False):
+        st.warning("⏳ Save already in progress… do NOT refresh or switch tabs.")
+        st.stop()
+
+    st.session_state["saving_in_progress"] = True
+    st.info("⏳ Upload is processing… PLEASE WAIT. Do NOT touch anything.")
+
+    for f in uploaded_files:
         try:
-            log_box.write("📄 **Loading CSV...**")
-            df_del = pd.read_csv(delete_file)
+            # LOAD + PARSE FILE
+            ext = os.path.splitext(f.name)[1].lower()
+            df = pd.read_csv(f, low_memory=False) if ext == ".csv" else pd.read_excel(f)
 
-            log_box.write("🔎 **Normalizing column names...**")
-            df_del = df_del.rename(columns={v: k for k, v in DEFAULT_COLMAP.items() if v in df_del.columns})
+            df = dedupe_columns(df)
+            new_ev = preprocess_upload(df, colmap)
 
-            required = ["datetime", "device", "user", "type"]
-            if not all(c in df_del.columns for c in required):
-                st.error("❌ CSV missing required columns to rebuild PKs.")
-            else:
-                log_box.write("⏳ **Parsing datetimes...**")
-                df_del["datetime"] = pd.to_datetime(df_del["datetime"], errors="coerce")
-
-                log_box.write("🧮 **Rebuilding PKs...**")
-                def compute_pk(row):
-                    parts = [
-                        str(row.get("datetime", "")),
-                        str(row.get("device", "")),
-                        str(row.get("user", "")),
-                        str(row.get("type", "")),
-                        str(row.get("desc", "")),
-                        str(row.get("qty", "")),
-                        str(row.get("medid", "")),
-                    ]
-                    return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
-
-                df_del["pk"] = df_del.apply(compute_pk, axis=1)
-                pks = df_del["pk"].dropna().unique().tolist()
-
-                log_box.write(f"🔢 **Built {len(pks):,} PKs**")
-
-                log_box.write("🗑 **Deleting rows from database...**")
-                sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
-                with eng.begin() as con:
-                    con.execute(sql_delete, {"pks": pks})
-
-                st.success(f"🗑 Deleted {len(pks):,} rows from the database.")
-                st.session_state["delete_done"] = True
-
-                st.cache_data.clear()
-                st.experimental_rerun()
+            # SAFE UPSERT
+            success, msg = save_history_sql(new_ev, colmap, eng)
+            st.success(msg)
 
         except Exception as e:
-            st.error(f"Delete failed: {e}")
+            st.error(f"❌ DB save error: {e}")
+            break
+
+        finally:
+            st.session_state["saving_in_progress"] = False
+
+
+
 
 
 # ===================== LOAD HISTORY (stable, reboot-safe) =====================
