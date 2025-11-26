@@ -2764,7 +2764,8 @@ if uploads:
     new_ev = pd.concat(new_files, ignore_index=True)
 
     # Build PK
-    new_ev["pk"] = build_pk(new_ev, colmap)
+    new_ev = build_pk(new_ev, colmap)
+
     new_ev = new_ev.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
 
     # Merge with DB history
