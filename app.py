@@ -2619,34 +2619,6 @@ if delete_file is not None and not st.session_state["delete_done"]:
     except Exception as e:
         st.error(f"Delete failed: {e}")
 
-# ============================================================
-# INGESTION ENGINE — FINAL VERSION
-# ============================================================
-# ----------------------------------------------------
-# SANITIZE ROWS BEFORE DB UPSERT
-# ----------------------------------------------------
-# Replace pandas NA with Python None
-to_save = to_save.replace({pd.NA: None})
-
-# Ensure required optional columns never contain NAType
-for c in ["medid", "desc", "device", "type"]:
-    if c in to_save.columns:
-        to_save[c] = to_save[c].astype("object").where(to_save[c].notna(), None)
-
-# Qty must be a float or int, NEVER <NA>
-qty_col = colmap.get("qty")
-if qty_col in to_save.columns:
-    to_save[qty_col] = pd.to_numeric(to_save[qty_col], errors="coerce").fillna(0)
-
-uploads = uploaded_files
-
-# Reset lock if no uploads
-if st.session_state.get("saving_in_progress") and not uploads:
-    st.session_state["saving_in_progress"] = False
-
-# Load DB history now (safe version)
-history = safe_history(eng)
-
 if uploads:
 
     # ========== PREVALIDATE FIRST FILE ==========
