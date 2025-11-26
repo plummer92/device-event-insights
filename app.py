@@ -2150,25 +2150,26 @@ new_ev = build_pk(new_ev, colmap)
 # Remove duplicates
 new_ev = new_ev.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
 
-# Determine rows to save
+# Compute existing PKs from history
+old_pks = set(history["pk"]) if (isinstance(history, pd.DataFrame) and "pk" in history.columns) else set()
+
+# Determine new rows
 if history.empty or "pk" not in history.columns:
     to_save = new_ev.copy()
 else:
-    to_save = new_ev[~new_ev["pk"].isin(history["pk"])].copy()
+    to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
 
-# 🔧 FIX: Convert NAType → None for SQL
-for c in ["medid", "desc", "device", "user", "type"]:
-    if c in to_save.columns:
-        to_save[c] = to_save[c].astype(object).where(to_save[c].notna(), None)
+# SAFELY CLEAN NA VALUES (fixes NAType errors)
+to_save = to_save.replace({pd.NA: None})
+to_save = to_save.where(pd.notna(to_save), None)
 
-# -------------------------------
-# SAVE TO DATABASE
-# -------------------------------
+# Save to database
 if to_save.empty:
     st.sidebar.info("No new rows to save.")
 else:
     ok, msg = save_history_sql(to_save, colmap, eng)
     (st.sidebar.success if ok else st.sidebar.error)(msg)
+
 
 
 
