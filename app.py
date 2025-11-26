@@ -85,17 +85,7 @@ def is_pyxis_file(df):
 # ============================================================
 # ----------------------------------------------------
 # SANITIZE ROWS BEFORE DB UPSERT
-# ----------------------------------------------------
-
-# Ensure required optional columns never contain NAType
-for c in ["medid", "desc", "device", "type"]:
-    if c in to_save.columns:
-        to_save[c] = to_save[c].astype("object").where(to_save[c].notna(), None)
-
-# Qty must be a float or int, NEVER <NA>
-qty_col = colmap.get("qty")
-if qty_col in to_save.columns:
-    to_save[qty_col] = pd.to_numeric(to_save[qty_col], errors="coerce").fillna(0)
+# ---------------------------------------------------
 
 def safe_history(eng):
     """Load DB history and guarantee pk column exists."""
