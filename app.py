@@ -276,17 +276,25 @@ def safe_unique(df: pd.DataFrame, col: str) -> List[str]:
         return []
     return sorted([x for x in df[col].dropna().astype(str).unique()])
 
-def build_pk(df: pd.DataFrame, colmap: Dict[str, str]) -> pd.Series:
-    cols = []
-    for k in ["datetime","device","user","type","desc","qty","medid"]:
-        c = colmap.get(k)
-        if c and c in df.columns:
-            cols.append(df[c].astype(str))
-        else:
-            cols.append(pd.Series([""], index=df.index, dtype="string"))
-    arr = np.vstack([c.values for c in cols]).T
-    out = [hashlib.sha1("|".join(row).encode("utf-8")).hexdigest() for row in arr]
-    return pd.Series(out, index=df.index, dtype="string")
+def build_pk(df: pd.DataFrame, colmap: Dict[str,str]) -> pd.DataFrame:
+    """Build SHA1 pk into the SAME DataFrame and return it."""
+    out = df.copy()
+
+    def make(row):
+        parts = [
+            str(row.get("datetime", "")),
+            str(row.get("device", "")),
+            str(row.get("user", "")),
+            str(row.get("type", "")),
+            str(row.get("desc", "")),
+            str(row.get("qty", "")),
+            str(row.get("medid", "")),
+        ]
+        return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
+
+    out["pk"] = out.apply(make, axis=1)
+    return out
+
 
 def weekly_summary(ev: pd.DataFrame, colmap: Dict[str, str]) -> pd.DataFrame:
     ts, dev, usr, typ = colmap["datetime"], colmap["device"], colmap["user"], colmap["type"]
