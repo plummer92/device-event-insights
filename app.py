@@ -3310,21 +3310,21 @@ with tab_dbcheck:
     # Load directly from the DB using your DEFAULT_COLMAP
     df_db = load_history_sql(DEFAULT_COLMAP, eng)
 
-# 🔧 APPLY COLUMN MAPPING FIX HERE
-rename_map = {
-    DEFAULT_COLMAP["device"]: "device",
-    DEFAULT_COLMAP["user"]: "user",
-    DEFAULT_COLMAP["datetime"]: "datetime",
-    DEFAULT_COLMAP["type"]: "type",
-}
+    # 🔧 APPLY COLUMN MAPPING FIX HERE
+    rename_map = {
+        DEFAULT_COLMAP["device"]: "device",
+        DEFAULT_COLMAP["user"]: "user",
+        DEFAULT_COLMAP["datetime"]: "datetime",
+        DEFAULT_COLMAP["type"]: "type",
+    }
 
-# Optional mapped fields
-for opt in ["desc", "qty", "medid"]:
-    if opt in DEFAULT_COLMAP and DEFAULT_COLMAP[opt] in df_db.columns:
-        rename_map[DEFAULT_COLMAP[opt]] = opt
+    # Optional mapped fields
+    for opt in ["desc", "qty", "medid"]:
+        if DEFAULT_COLMAP.get(opt) in df_db.columns:
+            rename_map[DEFAULT_COLMAP[opt]] = opt
 
-df_db = df_db.rename(columns=rename_map)
-# 🔧 END FIX
+    df_db = df_db.rename(columns=rename_map)
+    # 🔧 END FIX
 
     # Show date range
     try:
@@ -3361,4 +3361,3 @@ df_db = df_db.rename(columns=rename_map)
     # Optional raw table preview
     with st.expander("🔍 Raw Data Preview", expanded=False):
         st.dataframe(df_db.head(2000), use_container_width=True)
-
