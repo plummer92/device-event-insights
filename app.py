@@ -2134,47 +2134,6 @@ def _df_to_rows_canonical(df: pd.DataFrame, colmap: Dict[str, str]) -> list[dict
 
     return rows
 
-# Build PK
-new_ev = build_pk(new_ev, colmap)
-
-# Remove duplicates
-new_ev = new_ev.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
-
-# Determine new rows
-if history.empty or "pk" not in history.columns:
-    to_save = new_ev
-else:
-    to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
-
-# ----------------------------------------------------
-# SAFE CLEAN OF ALL NA/NaT/Pandas NA BEFORE DB INSERT
-# ----------------------------------------------------
-to_save = to_save.replace({pd.NA: None})
-to_save = to_save.where(pd.notna(to_save), None)
-
-for c in ["device", "user", "type", "desc", "medid"]:
-    if c in to_save.columns:
-        to_save[c] = to_save[c].astype("object").where(~to_save[c].isna(), None)
-
-if "qty" in to_save.columns:
-    to_save["qty"] = pd.to_numeric(to_save["qty"], errors="coerce")
-    to_save["qty"] = to_save["qty"].where(~to_save["qty"].isna(), None)
-
-if colmap["datetime"] in to_save.columns:
-    col_dt = colmap["datetime"]
-    to_save[col_dt] = pd.to_datetime(to_save[col_dt], errors="coerce")
-    to_save[col_dt] = to_save[col_dt].apply(lambda x: x.to_pydatetime() if not pd.isna(x) else None)
-
-# Save to DB
-if to_save.empty:
-    st.sidebar.info("No new rows to save.")
-else:
-    ok, msg = save_history_sql(to_save, colmap, eng)
-    (st.sidebar.success if ok else st.sidebar.error)(msg)
-
-
-
-
 def save_history_sql(df: pd.DataFrame, colmap: Dict[str, str], eng) -> tuple[bool, str]:
     """UPSERT by pk into Postgres using very small chunks to prevent Neon timeouts."""
     try:
