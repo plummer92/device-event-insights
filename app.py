@@ -2366,6 +2366,75 @@ def ensure_indexes(eng, timeout_sec: int = 15):
                 con.execute(text(s))
             except Exception:
                 pass
+
+# ===========================================
+# COLUMN MAPPING + NORMALIZATION PIPELINE
+# ===========================================
+
+def apply_column_mapping(df: pd.DataFrame, colmap: Dict[str,str]) -> pd.DataFrame:
+    """Map raw upload → canonical internal cols: datetime, device, user, type, desc, qty, medid"""
+    out = df.copy()
+
+    for canon, source in colmap.items():
+        if source and source in out.columns:
+            out[canon] = out[source]
+        else:
+            out[canon] = None  # ensure col exists
+
+    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+    return out
+
+
+def canonicalize_device(df):
+    if "device" in df.columns:
+        df["device"] = df["device"].astype(str).str.strip().str.upper()
+    return df
+
+def canonicalize_user(df):
+    if "user" in df.columns:
+        df["user"] = df["user"].astype(str).str.strip()
+    return df
+
+def canonicalize_type(df):
+    if "type" in df.columns:
+        df["type"] = df["type"].astype(str).str.strip().str.upper()
+    return df
+
+def normalize_desc(df):
+    if "desc" in df.columns:
+        df["desc"] = df["desc"].astype(str).str.strip()
+    return df
+
+def normalize_qty(df):
+    if "qty" in df.columns:
+        df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
+    return df
+
+def normalize_medid(df):
+    if "medid" in df.columns:
+        df["medid"] = df["medid"].astype(str).str.strip()
+    return df
+
+
+def build_pk(df: pd.DataFrame, colmap: Dict[str,str]) -> pd.DataFrame:
+    """Build SHA1 pk using canonical columns."""
+    out = df.copy()
+
+    def make(row):
+        parts = [
+            str(row.get("datetime", "")),
+            str(row.get("device", "")),
+            str(row.get("user", "")),
+            str(row.get("type", "")),
+            str(row.get("desc", "")),
+            str(row.get("qty", "")),
+            str(row.get("medid", "")),
+        ]
+        return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
+
+    out["pk"] = out.apply(make, axis=1)
+    return out
+
 # ------------------------------------------------------------------------------------
 
 # ----------------------------- UI ------------------------------------
@@ -2375,6 +2444,13 @@ st.title("All Device Event Insights — Pro")
 DB_URL = st.secrets["DB_URL"]
 ENGINE_SALT = st.secrets.get("ENGINE_SALT", "")
 eng = get_engine(DB_URL, ENGINE_SALT)
+
+# Restore or initialize column mapping
+if "colmap" in st.session_state:
+    colmap = st.session_state["colmap"]
+else:
+    colmap = DEFAULT_COLMAP.copy()
+
 
 # ================================ SIDEBAR ==============================
 with st.sidebar:
@@ -2534,7 +2610,7 @@ if uploads:
         df = dedupe_columns(df)  
 
         # 🧹 Your REAL normalization pipeline
-        df = apply_colmap(df, colmap)
+        df = apply_column_mapping(df, colmap)
         df = canonicalize_device(df)
         df = canonicalize_user(df)
         df = canonicalize_type(df)
