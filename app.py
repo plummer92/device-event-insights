@@ -2730,23 +2730,6 @@ if ev_all is None or not isinstance(ev_all, pd.DataFrame) or ev_all.empty:
     st.warning("No events available. Upload data or check your database.")
     st.stop()
 
-
-
-
-# ============================ MERGE & SAVE ============================
-if uploads:
-    # new_ev was already created above from uploaded files
-    frames = []
-    if isinstance(history, pd.DataFrame) and not history.empty:
-        frames.append(history)
-    frames.append(new_ev)
-
-    ev_all = (
-        pd.concat(frames, ignore_index=True)
-          .drop_duplicates(subset=["pk"])
-          .sort_values(colmap["datetime"])
-    )
-
     # Upload summary
     new_pks = set(new_ev["pk"])
     old_pks = set(history["pk"]) if (isinstance(history, pd.DataFrame) and "pk" in history.columns) else set()
