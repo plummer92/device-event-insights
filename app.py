@@ -2767,86 +2767,177 @@ else:
     ev_all = history.copy()
 
 # =================== TIME RANGE FILTER ===================
-# ============================ MERGE & SAVE ============================
-if uploads:
-    # new_ev was already created above from uploaded files
-    frames = []
-    if isinstance(history, pd.DataFrame) and not history.empty:
-        frames.append(history)
-    frames.append(new_ev)
 
-    ev_all = (
-        pd.concat(frames, ignore_index=True)
-          .drop_duplicates(subset=["pk"])
-          .sort_values(colmap["datetime"])
-    )
+# ============================================================
+# INGESTION ENGINE — CLEAN, SAFE, FINAL VERSION
+# ============================================================
 
-    # Upload summary
-    new_pks = set(new_ev["pk"])
-    old_pks = set(history["pk"]) if (isinstance(history, pd.DataFrame) and "pk" in history.columns) else set()
-    num_new = len(new_pks - old_pks)
-    num_dup = len(new_pks & old_pks)
-    earliest = pd.to_datetime(ev_all[colmap["datetime"]].min())
-    latest   = pd.to_datetime(ev_all[colmap["datetime"]].max())
+ev_all = None  # final dataframe used for analytics
 
-    with st.expander("📥 Upload summary", expanded=True):
-        st.write(f"**Rows in this upload:** {len(new_ev):,}")
-        st.write(f"- New rows vs DB: **{num_new:,}**")
-        st.write(f"- Already existed (upserts): **{num_dup:,}**")
-        st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
+# ------------------------------------------------------------
+# 1) DELETE MODE
+# ------------------------------------------------------------
+if data_mode == "Upload files" and "df_del" in locals():
+    try:
+        if df_del is not None and isinstance(df_del, pd.DataFrame) and len(df_del) > 0:
+            def compute_pk(row):
+                parts = [
+                    str(row.get("datetime", "")),
+                    str(row.get("device", "")),
+                    str(row.get("user", "")),
+                    str(row.get("type", "")),
+                    str(row.get("desc", "")),
+                    str(row.get("qty", "")),
+                    str(row.get("medid", "")),
+                ]
+                return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
 
-    # 🔧 FIX: sanitize NAType before DB insert
+            df_del["pk"] = df_del.apply(compute_pk, axis=1)
+            pks = df_del["pk"].dropna().unique().tolist()
+
+            if len(pks) > 0:
+                sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
+                with eng.begin() as con:
+                    con.execute(sql_delete, {"pks": pks})
+
+                st.success(f"Deleted {len(pks):,} rows.")
+                st.session_state["delete_done"] = True
+
+                st.cache_data.clear()
+                ev_all = load_history_sql(colmap, eng)
+                st.experimental_rerun()
+    except Exception as e:
+        st.error(f"Delete failed: {e}")
+
+# ------------------------------------------------------------
+# 2) UPLOAD MODE
+# ------------------------------------------------------------
+if data_mode == "Upload files" and "to_save" in locals() and isinstance(to_save, pd.DataFrame):
     to_save = to_save.replace({pd.NA: None})
-    to_save = to_save.fillna({"medid": None, "desc": None, "device": None, "type": None})
-    # qty must be numeric, convert safely
-    to_save[colmap["qty"]] = pd.to_numeric(to_save[colmap["qty"]], errors="coerce").fillna(0)
+    to_save = to_save.where(pd.notna(to_save), None)
 
-# --- SAVE (uploads only): write only the delta ---
-to_save = new_ev if not old_pks else new_ev[~new_ev["pk"].isin(old_pks)].copy()
+    for c in ["device", "user", "type", "desc", "medid"]:
+        if c in to_save.columns:
+            to_save[c] = to_save[c].astype("object").where(~to_save[c].isna(), None)
+
+    if "qty" in to_save.columns:
+        to_save["qty"] = pd.to_numeric(to_save["qty"], errors="coerce")
+        to_save["qty"] = to_save["qty"].where(~to_save["qty"].isna(), None)
+
+    dtcol = colmap["datetime"]
+    if dtcol in to_save.columns:
+        to_save[dtcol] = pd.to_datetime(to_save[dtcol], errors="coerce")
+        to_save[dtcol] = to_save[dtcol].apply(lambda x: x.to_pydatetime() if not pd.isna(x) else None)
+
+    if not to_save.empty:
+        ok, msg = save_history_sql(to_save, colmap, eng)
+        (st.sidebar.success if ok else st.sidebar.error)(msg)
+    else:
+        st.sidebar.info("No new rows to save.")
+
+    ev_all = load_history_sql(colmap, eng)
+
+# ------------------------------------------------------------
+# 3) DATABASE ONLY MODE
+# ------------------------------------------------------------
+if data_mode == "Database only":
+    ev_all = load_history_sql(colmap, eng)
+
+# ------------------------------------------------------------
+# FINAL GUARD
+# ------------------------------------------------------------
+if ev_all is None or not isinstance(ev_all, pd.DataFrame) or ev_all.empty:
+    st.warning("No events available. Upload data or check database.")
+    st.stop()
+
 
 # ============================================================
 # CLEAN + SAVE (runs ONLY after to_save is computed)
 # ============================================================
 
-# Fix NA/NAT values before DB insert
-to_save = to_save.replace({pd.NA: None})
-to_save = to_save.where(pd.notna(to_save), None)
 
-# Ensure optional string columns never contain NAType
-for c in ["device", "user", "type", "desc", "medid"]:
-    if c in to_save.columns:
-        to_save[c] = to_save[c].astype("object").where(~to_save[c].isna(), None)
+# ============================================================
+# INGESTION ENGINE — CLEAN, SAFE, FINAL VERSION
+# ============================================================
 
-# Ensure qty is numeric or None
-if "qty" in to_save.columns:
-    to_save["qty"] = pd.to_numeric(to_save["qty"], errors="coerce")
-    to_save["qty"] = to_save["qty"].where(~to_save["qty"].isna(), None)
+ev_all = None  # final dataframe used for analytics
 
-# Convert datetime to Python datetime or None
-dtcol = colmap["datetime"]
-if dtcol in to_save.columns:
-    to_save[dtcol] = pd.to_datetime(to_save[dtcol], errors="coerce")
-    to_save[dtcol] = to_save[dtcol].apply(
-        lambda x: x.to_pydatetime() if not pd.isna(x) else None
-    )
+# ------------------------------------------------------------
+# 1) DELETE MODE
+# ------------------------------------------------------------
+if data_mode == "Upload files" and "df_del" in locals():
+    try:
+        if df_del is not None and isinstance(df_del, pd.DataFrame) and len(df_del) > 0:
+            def compute_pk(row):
+                parts = [
+                    str(row.get("datetime", "")),
+                    str(row.get("device", "")),
+                    str(row.get("user", "")),
+                    str(row.get("type", "")),
+                    str(row.get("desc", "")),
+                    str(row.get("qty", "")),
+                    str(row.get("medid", "")),
+                ]
+                return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
 
-# Save to DB
-if to_save.empty:
-    st.sidebar.info("No new rows to save.")
-else:
-    ok, msg = save_history_sql(to_save, colmap, eng)
-    (st.sidebar.success if ok else st.sidebar.error)(msg)
+            df_del["pk"] = df_del.apply(compute_pk, axis=1)
+            pks = df_del["pk"].dropna().unique().tolist()
 
-# Database-only mode
+            if len(pks) > 0:
+                sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
+                with eng.begin() as con:
+                    con.execute(sql_delete, {"pks": pks})
+
+                st.success(f"Deleted {len(pks):,} rows.")
+                st.session_state["delete_done"] = True
+
+                st.cache_data.clear()
+                ev_all = load_history_sql(colmap, eng)
+                st.experimental_rerun()
+    except Exception as e:
+        st.error(f"Delete failed: {e}")
+
+# ------------------------------------------------------------
+# 2) UPLOAD MODE
+# ------------------------------------------------------------
+if data_mode == "Upload files" and "to_save" in locals() and isinstance(to_save, pd.DataFrame):
+    to_save = to_save.replace({pd.NA: None})
+    to_save = to_save.where(pd.notna(to_save), None)
+
+    for c in ["device", "user", "type", "desc", "medid"]:
+        if c in to_save.columns:
+            to_save[c] = to_save[c].astype("object").where(~to_save[c].isna(), None)
+
+    if "qty" in to_save.columns:
+        to_save["qty"] = pd.to_numeric(to_save["qty"], errors="coerce")
+        to_save["qty"] = to_save["qty"].where(~to_save["qty"].isna(), None)
+
+    dtcol = colmap["datetime"]
+    if dtcol in to_save.columns:
+        to_save[dtcol] = pd.to_datetime(to_save[dtcol], errors="coerce")
+        to_save[dtcol] = to_save[dtcol].apply(lambda x: x.to_pydatetime() if not pd.isna(x) else None)
+
+    if not to_save.empty:
+        ok, msg = save_history_sql(to_save, colmap, eng)
+        (st.sidebar.success if ok else st.sidebar.error)(msg)
+    else:
+        st.sidebar.info("No new rows to save.")
+
+    ev_all = load_history_sql(colmap, eng)
+
+# ------------------------------------------------------------
+# 3) DATABASE ONLY MODE
+# ------------------------------------------------------------
 if data_mode == "Database only":
-    ev_all = history.copy()
-else:
-    ev_all = history.copy()  # If upload mode was used earlier, ev_all already comes from history
+    ev_all = load_history_sql(colmap, eng)
 
-# Guard: stop early if nothing to analyze
-if not isinstance(ev_all, pd.DataFrame) or ev_all.empty:
-    st.warning("No events available yet. Upload files or verify your DB.")
+# ------------------------------------------------------------
+# FINAL GUARD
+# ------------------------------------------------------------
+if ev_all is None or not isinstance(ev_all, pd.DataFrame) or ev_all.empty:
+    st.warning("No events available. Upload data or check database.")
     st.stop()
+
 
 # =================== TIME RANGE FILTER ===================
 _min = pd.to_datetime(ev_all[colmap["datetime"]].min())
@@ -3051,6 +3142,464 @@ with tab4:
             x=colmap["device"],
             y="events",
             title="Top devices by event volume",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+# ---------- TAB 5: HOURLY ----------
+with tab5:
+    st.subheader("Hourly cadence")
+    st.dataframe(hourly_f, use_container_width=True)
+    if not hourly_f.empty:
+        fig = px.line(hourly_f, x="hour", y="events", markers=True, title="Events by hour")
+        st.plotly_chart(fig, use_container_width=True)
+
+# ---------- TAB 6: DRILL-DOWN ----------
+with tab6:
+    st.subheader("Drill-down (exportable)")
+    show_cols = [
+        colmap["datetime"],
+        colmap["user"],
+        colmap["device"],
+        colmap["type"],
+        "gap_hms",
+        "walk_gap_hms",
+        "dwell_hms",
+        "visit_hms",
+        "__gap_s",
+        "__walk_gap_s",
+        "__dwell_s",
+        "visit_duration_s",
+        "__device_change",
+    ]
+    for opt in ["desc", "qty", "medid"]:
+        c = colmap.get(opt)
+        if c and c in data_f.columns:
+            show_cols.insert(4, c)  # keep details near the left
+    show_cols = [c for c in show_cols if c in data_f.columns]
+
+    table = data_f[show_cols].copy()
+    st.dataframe(table, use_container_width=True, height=520)
+
+    st.download_button(
+        "Download current drill-down as CSV",
+        data=table.to_csv(index=False).encode("utf-8"),
+        file_name="drilldown.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("### Per-visit summary (continuous time at a device)")
+    ts, dev, usr = colmap["datetime"], colmap["device"], colmap["user"]
+    visit_show = visit_f[[usr, dev, "start", "end", "visit_duration_s"]].copy()
+    visit_show["visit_hms"] = visit_show["visit_duration_s"].map(fmt_hms)
+    st.dataframe(
+        visit_show[[usr, dev, "start", "end", "visit_hms", "visit_duration_s"]],
+        use_container_width=True,
+        height=360,
+    )
+
+# ---------- TAB 7: WEEKLY TOP 10 ----------
+with tab7:
+    st.subheader("Weekly Top 10 (signals)")
+    digest = anomalies_top10(ev_all, data_f, colmap)
+    if digest.empty:
+        st.info("No notable anomalies in the last 7 days window.")
+    else:
+        st.dataframe(digest, use_container_width=True)
+
+# ---------- TAB 8: OUTLIERS ----------
+with tab8:
+    st.subheader("Outliers")
+    ow = outliers_iqr(
+        data_f.dropna(subset=["__walk_gap_s"]),
+        colmap["user"],
+        "__walk_gap_s",
+        "Walk gap",
+    )
+    od = outliers_iqr(
+        data_f.dropna(subset=["__dwell_s"]),
+        colmap["device"],
+        "__dwell_s",
+        "Dwell",
+    )
+    c1, c2 = st.columns(2)
+    c1.write("By user (walk gap):")
+    c1.dataframe(ow, use_container_width=True, height=320)
+    c2.write("By device (dwell):")
+    c2.dataframe(od, use_container_width=True, height=320)
+
+# ---------- TAB 9: ASK THE DATA ----------
+with tab9:
+    st.subheader("Ask the data ❓")
+    q = st.text_input(
+        "Try e.g. 'top devices', 'longest dwell devices', 'median walk gap for Melissa', 'busiest hour'"
+    )
+    if q:
+        ans, tbl = qa_answer(q, ev_time, data_f, colmap)
+        st.write(ans)
+        if not tbl.empty:
+            st.dataframe(tbl, use_container_width=True)
+
+# ---------- TAB 10: LOAD / UNLOAD ----------
+with tab10:
+    st.subheader("Load / Unload Insights")
+    build_load_unload_section(ev_time, colmap)
+
+# ---------- TAB 11: REFILL EFFICIENCY ----------
+with tab11:
+    st.subheader("Refill Efficiency")
+    build_refill_efficiency_section(ev_time, data_f, colmap)
+
+    st.markdown("---")
+    st.subheader("Refill Audit – High Volume & Short Dwell")
+
+    # ✅ use data_f, which has dwell_sec
+    refill_audit = build_refill_audit(data_f, colmap)
+
+
+    if refill_audit.empty:
+        st.info("No refill dwell-time data available for this period.")
+    else:
+        # Threshold controls
+        c1, c2 = st.columns(2)
+
+        with c1:
+            min_refills = st.slider(
+                "Minimum refills in selected period",
+                min_value=int(refill_audit["refill_count"].min()),
+                max_value=int(refill_audit["refill_count"].max()),
+                value=int(refill_audit["refill_count"].quantile(0.5)),  # default ~median
+                step=1,
+            )
+
+        with c2:
+            max_median_dwell = st.slider(
+                "Max median dwell (seconds)",
+                min_value=int(refill_audit["median_dwell_sec"].min()),
+                max_value=int(refill_audit["median_dwell_sec"].max()),
+                value=int(refill_audit["median_dwell_sec"].quantile(0.25)),  # fast quartile
+                step=5,
+            )
+
+        # Filter likely “rushing” users
+        candidates = refill_audit[
+            (refill_audit["refill_count"] >= min_refills)
+            & (refill_audit["median_dwell_sec"] <= max_median_dwell)
+        ].copy()
+
+        st.markdown("### 📋 Audit candidates")
+        st.dataframe(
+            candidates,
+            use_container_width=True,
+        )
+
+        # Drill-down to “what they refilled”
+        if not candidates.empty:
+            st.markdown("### 🔍 Drill-down: refills to audit")
+
+            user_col = colmap.get("user", "UserName")
+            type_col = colmap.get("type", "TransactionType")
+            dt_col = colmap.get("datetime", "TransactionDateTime")
+            device_col = colmap.get("device", "Device")
+            desc_col = colmap.get("desc", "MedDescription")
+            qty_col = colmap.get("qty", "Quantity")
+            medid_col = colmap.get("medid", "MedID")
+
+            selected_user = st.selectbox(
+                "Choose a colleague to review",
+                options=candidates["user"].tolist(),
+            )
+
+            REFILL_TYPES = {
+                "REFILL",
+                "REFILL-LOAD",
+                "REFILL LOAD",
+                "LOAD",
+                "REFILL RETURN",
+            }
+
+            df_user = ev_time.copy()
+
+            # Filter to this user's refill transactions
+            df_user = df_user[
+                (df_user[user_col] == selected_user)
+                & (df_user[type_col].isin(REFILL_TYPES))
+            ].copy()
+
+            # Sort newest first if datetime present
+            if dt_col in df_user.columns:
+                df_user = df_user.sort_values(dt_col, ascending=False)
+
+            dwell_col = "dwell_sec" if "dwell_sec" in df_user.columns else None
+
+            cols_to_show = [
+                c for c in [
+                    dt_col,
+                    device_col,
+                    medid_col,
+                    desc_col,
+                    qty_col,
+                    dwell_col,
+                ]
+                if c is not None and c in df_user.columns
+            ]
+
+            st.dataframe(
+                df_user[cols_to_show],
+                use_container_width=True,
+            )
+
+# ---------- TAB 12: PENDED / THRESHOLD ACTIVITY ----------
+with tab12:
+    st.subheader("Pended / Threshold Activity (simple view)")
+
+    up = st.file_uploader("Upload DeviceActivityLog CSV", type=["csv", "xlsx"])
+    if not up:
+        st.info("Upload your DeviceActivityLog and I’ll show the parsed view.")
+    else:
+        raw = (
+            pd.read_excel(up)
+            if up.name.lower().endswith(".xlsx")
+            else pd.read_csv(up, low_memory=False)
+        )
+        raw = dedupe_columns(raw)
+
+        view = build_simple_activity_view(raw)
+        if view.empty:
+            st.warning("No parsable rows found (check column names).")
+        else:
+            st.dataframe(view.head(300), use_container_width=True, height=480)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button(
+                    "💾 Save parsed snapshot to Postgres", type="primary", key="save_simple"
+                ):
+                    try:
+                        init_db(eng)  # ensures table exists
+                        n = upsert_activity_simple(eng, view)
+                        st.success(f"Saved {n:,} rows into pyxis_activity_simple (UPSERT).")
+                    except Exception as e:
+                        st.error(f"Save failed: {e}")
+
+            with c2:
+                st.download_button(
+                    "Download parsed sheet (CSV)",
+                    data=view.to_csv(index=False).encode("utf-8"),
+                    file_name="device_activity_parsed.csv",
+                    mime="text/csv",
+                )
+
+# ---------- TAB 13: SLOT CONFIG (DB VIEW) ----------
+with tab13:
+    st.subheader("Slot Configuration from Database")
+
+    # 1) Current config (latest row per slot)
+    st.markdown("### 📌 Current Min/Max by Slot")
+
+    try:
+        init_db(eng)  # safe to call again
+
+        sql_current = """
+        WITH latest AS (
+          SELECT *,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY device, drawer, pocket, med_id
+                   ORDER BY ts DESC
+                 ) AS rn
+          FROM pyxis_activity_simple
+        )
+        SELECT
+            ts,
+            device,
+            drawer,
+            pocket,
+            med_id,
+            min_qty,
+            max_qty,
+            is_standard_stock,
+            username
+        FROM latest
+        WHERE rn = 1
+        ORDER BY device, drawer, pocket, med_id;
+        """
+
+        cfg = pd.read_sql(sql_current, eng)
+
+        if cfg.empty:
+            st.info("No rows found in pyxis_activity_simple yet. Upload some configs in the Pended Loads tab first.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                dev_filter = st.multiselect(
+                    "Filter by device (optional)",
+                    sorted(cfg["device"].dropna().unique().tolist())
+                )
+            with c2:
+                med_filter = st.multiselect(
+                    "Filter by Med ID (optional)",
+                    sorted(cfg["med_id"].dropna().unique().tolist())
+                )
+            with c3:
+                user_filter = st.multiselect(
+                    "Filter by user (optional)",
+                    sorted(cfg["username"].dropna().unique().tolist())
+                )
+
+            view_cfg = cfg.copy()
+            if dev_filter:
+                view_cfg = view_cfg[view_cfg["device"].isin(dev_filter)]
+            if med_filter:
+                view_cfg = view_cfg[view_cfg["med_id"].isin(med_filter)]
+            if user_filter:
+                view_cfg = view_cfg[view_cfg["username"].isin(user_filter)]
+
+            st.dataframe(
+                view_cfg,
+                use_container_width=True,
+                height=420,
+            )
+
+
+            st.download_button(
+                "Download current slot config as CSV",
+                data=view_cfg.to_csv(index=False).encode("utf-8"),
+                file_name="pyxis_slot_config_current.csv",
+                mime="text/csv",
+            )
+
+    except Exception as e:
+        st.error(f"Error loading slot config from database: {e}")
+
+        # 2) Bad configs (quick QA list)
+    st.markdown("### 🚨 Configs to Review")
+
+    try:
+        sql_bad = """
+        WITH cur AS (
+          SELECT *
+          FROM (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY device, drawer, pocket, med_id
+                     ORDER BY ts DESC
+                   ) AS rn
+            FROM pyxis_activity_simple
+          ) x
+          WHERE rn = 1
+        )
+        SELECT
+            ts,
+            device,
+            drawer,
+            pocket,
+            med_id,
+            min_qty,
+            max_qty,
+            is_standard_stock,
+            username
+        FROM cur
+        WHERE
+            -- min > max
+            (min_qty IS NOT NULL AND max_qty IS NOT NULL AND min_qty > max_qty)
+         OR -- negative or obviously bad values
+            (COALESCE(min_qty, 0) < 0 OR COALESCE(max_qty, 0) < 0)
+         OR -- standard stock but missing caps
+            (is_standard_stock IS TRUE AND (min_qty IS NULL OR max_qty IS NULL))
+        ORDER BY ts DESC, device, drawer, pocket, med_id;
+        """
+
+        # THIS MUST BE INDENTED INSIDE THE TRY:
+        bad = pd.read_sql(sql_bad, eng)
+
+        if bad.empty:
+            st.success("No obviously bad configs found based on these rules. 🎉")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                bad_user_filter = st.multiselect(
+                    "Filter bad configs by user (optional)",
+                    sorted(bad["username"].dropna().unique().tolist())
+                )
+            with c2:
+                bad_dev_filter = st.multiselect(
+                    "Filter bad configs by device (optional)",
+                    sorted(bad["device"].dropna().unique().tolist())
+                )
+
+            bad_view = bad.copy()
+            if bad_user_filter:
+                bad_view = bad_view[bad_view["username"].isin(bad_user_filter)]
+            if bad_dev_filter:
+                bad_view = bad_view[bad_view["device"].isin(bad_dev_filter)]
+
+            st.dataframe(
+                bad_view,
+                use_container_width=True,
+                height=320,
+            )
+
+    except Exception as e:
+        st.error(f"Error loading QA list: {e}")
+
+with tab_dbcheck:
+    st.header("🗄 Database Check")
+
+    st.markdown("This tab shows what is **actually stored** in your Neon Postgres database.")
+
+    # Load directly from the DB using your DEFAULT_COLMAP
+    df_db = load_history_sql(DEFAULT_COLMAP, eng)
+
+    # 🔧 APPLY COLUMN MAPPING FIX HERE
+    rename_map = {
+        DEFAULT_COLMAP["device"]: "device",
+        DEFAULT_COLMAP["user"]: "user",
+        DEFAULT_COLMAP["datetime"]: "datetime",
+        DEFAULT_COLMAP["type"]: "type",
+    }
+
+    # Optional mapped fields
+    for opt in ["desc", "qty", "medid"]:
+        if DEFAULT_COLMAP.get(opt) in df_db.columns:
+            rename_map[DEFAULT_COLMAP[opt]] = opt
+
+    df_db = df_db.rename(columns=rename_map)
+    # 🔧 END FIX
+
+    # Show date range
+    try:
+        earliest = pd.to_datetime(df_db["datetime"]).min()
+        latest   = pd.to_datetime(df_db["datetime"]).max()
+
+        st.metric("Earliest Timestamp", earliest.strftime("%Y-%m-%d %H:%M"))
+        st.metric("Latest Timestamp", latest.strftime("%Y-%m-%d %H:%M"))
+    except:
+        st.warning("Could not compute date range — check column mapping.")
+
+    st.markdown("---")
+
+    # Count by device
+    st.subheader("📦 Rows by Device")
+    if "device" in df_db.columns:
+        dev_counts = df_db["device"].value_counts().head(30)
+        st.bar_chart(dev_counts)
+    else:
+        st.info("Device column not found.")
+
+    st.markdown("---")
+
+    # Count by user
+    st.subheader("👤 Rows by User")
+    if "user" in df_db.columns:
+        user_counts = df_db["user"].value_counts().head(30)
+        st.bar_chart(user_counts)
+    else:
+        st.info("User column not found.")
+
+    st.markdown("---")
+
+    # Optional raw table preview
+    with st.expander("🔍 Raw Data Preview", expanded=False):
+        st.dataframe(df_db.head(2000), use_container_width=True)            title="Top devices by event volume",
         )
         st.plotly_chart(fig, use_container_width=True)
 
