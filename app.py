@@ -2750,13 +2750,6 @@ if ev_all is None or not isinstance(ev_all, pd.DataFrame) or ev_all.empty:
     # qty must be numeric, convert safely
     to_save[colmap["qty"]] = pd.to_numeric(to_save[colmap["qty"]], errors="coerce").fillna(0)
 
-# --- SAVE (uploads only): write only the delta ---
-to_save = new_ev if not old_pks else new_ev[~new_ev["pk"].isin(old_pks)].copy()
-
-# ============================================================
-# CLEAN + SAVE (runs ONLY after to_save is computed)
-# ============================================================
-
 # Fix NA/NAT values before DB insert
 to_save = to_save.replace({pd.NA: None})
 to_save = to_save.where(pd.notna(to_save), None)
