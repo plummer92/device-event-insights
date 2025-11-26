@@ -3597,11 +3597,9 @@ with tab_dbcheck:
 
     st.markdown("---")
 
-    # Optional raw table preview
-    with st.expander("🔍 Raw Data Preview", expanded=False):
-        st.dataframe(df_db.head(2000), use_container_width=True)            title="Top devices by event volume",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+ # Optional raw table preview
+with st.expander("🔍 Raw Data Preview", expanded=False):
+    st.dataframe(df_db.head(2000), use_container_width=True)
 
 # ---------- TAB 5: HOURLY ----------
 with tab5:
