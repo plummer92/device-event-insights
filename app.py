@@ -2837,9 +2837,11 @@ else:
     ok, msg = save_history_sql(to_save, colmap, eng)
     (st.sidebar.success if ok else st.sidebar.error)(msg)
 
-else:
-    # Database-only mode; analyze what’s already in Postgres
+# Database-only mode
+if data_mode == "Database only":
     ev_all = history.copy()
+else:
+    ev_all = history.copy()  # If upload mode was used earlier, ev_all already comes from history
 
 # Guard: stop early if nothing to analyze
 if not isinstance(ev_all, pd.DataFrame) or ev_all.empty:
