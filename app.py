@@ -83,6 +83,22 @@ def is_pyxis_file(df):
 # ============================================================
 # INGESTION HELPERS
 # ============================================================
+# ----------------------------------------------------
+# SANITIZE ROWS BEFORE DB UPSERT
+# ----------------------------------------------------
+# Replace pandas NA with Python None
+to_save = to_save.replace({pd.NA: None})
+
+# Ensure required optional columns never contain NAType
+for c in ["medid", "desc", "device", "type"]:
+    if c in to_save.columns:
+        to_save[c] = to_save[c].astype("object").where(to_save[c].notna(), None)
+
+# Qty must be a float or int, NEVER <NA>
+qty_col = colmap.get("qty")
+if qty_col in to_save.columns:
+    to_save[qty_col] = pd.to_numeric(to_save[qty_col], errors="coerce").fillna(0)
+
 def safe_history(eng):
     """Load DB history and guarantee pk column exists."""
     hist = load_history_sql(DEFAULT_COLMAP, eng)
@@ -2619,6 +2635,21 @@ if delete_file is not None and not st.session_state["delete_done"]:
 # ============================================================
 # INGESTION ENGINE — FINAL VERSION
 # ============================================================
+# ----------------------------------------------------
+# SANITIZE ROWS BEFORE DB UPSERT
+# ----------------------------------------------------
+# Replace pandas NA with Python None
+to_save = to_save.replace({pd.NA: None})
+
+# Ensure required optional columns never contain NAType
+for c in ["medid", "desc", "device", "type"]:
+    if c in to_save.columns:
+        to_save[c] = to_save[c].astype("object").where(to_save[c].notna(), None)
+
+# Qty must be a float or int, NEVER <NA>
+qty_col = colmap.get("qty")
+if qty_col in to_save.columns:
+    to_save[qty_col] = pd.to_numeric(to_save[qty_col], errors="coerce").fillna(0)
 
 uploads = uploaded_files
 
@@ -2713,6 +2744,13 @@ if uploads:
         except:
             st.write("Unable to compute date range.")
 
+    # 🔧 FIX: sanitize NAType before DB insert
+    to_save = to_save.replace({pd.NA: None})
+    to_save = to_save.fillna({"medid": None, "desc": None, "device": None, "type": None})
+    # qty must be numeric, convert safely
+    to_save[colmap["qty"]] = pd.to_numeric(to_save[colmap["qty"]], errors="coerce").fillna(0)
+
+
     # ========== UPSERT ==========
     if unique_new.empty:
         st.sidebar.info("No new rows to save.")
@@ -2769,6 +2807,13 @@ if uploads:
         st.write(f"- New rows vs DB: **{num_new:,}**")
         st.write(f"- Already existed (upserts): **{num_dup:,}**")
         st.write(f"**History time range:** {earliest:%Y-%m-%d %H:%M} → {latest:%Y-%m-%d %H:%M}")
+
+    # 🔧 FIX: sanitize NAType before DB insert
+    to_save = to_save.replace({pd.NA: None})
+    to_save = to_save.fillna({"medid": None, "desc": None, "device": None, "type": None})
+    # qty must be numeric, convert safely
+    to_save[colmap["qty"]] = pd.to_numeric(to_save[colmap["qty"]], errors="coerce").fillna(0)
+
 
     # --- SAVE (uploads only): write only the delta ---
     to_save = new_ev if not old_pks else new_ev[~new_ev["pk"].isin(old_pks)].copy()
