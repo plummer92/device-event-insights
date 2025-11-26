@@ -80,6 +80,53 @@ def is_pyxis_file(df):
     }
     return required.issubset(df.columns)
 
+# ============================================================
+# INGESTION HELPERS
+# ============================================================
+def safe_history(eng):
+    """Load DB history and guarantee pk column exists."""
+    hist = load_history_sql(DEFAULT_COLMAP, eng)
+    if isinstance(hist, pd.DataFrame) and not hist.empty:
+        if "pk" not in hist.columns:
+            hist["pk"] = pd.Series(dtype="string")
+        return hist
+    return pd.DataFrame({"pk": pd.Series(dtype="string")})
+
+
+def full_clean(df, colmap):
+    """Run the EXACT same transformations every upload uses."""
+    df = dedupe_columns(df)
+    df = apply_column_mapping(df, colmap)
+    df = canonicalize_device(df)
+    df = canonicalize_user(df)
+    df = canonicalize_type(df)
+    df = normalize_desc(df)
+    df = normalize_qty(df)
+    df = normalize_medid(df)
+    df = base_clean(df, colmap)
+    return df
+
+
+def build_pk_once(df, colmap):
+    """Build PK once on the *final cleaned* dataframe."""
+    out = df.copy()
+
+    def make(row):
+        parts = [
+            str(row.get("datetime", "")),
+            str(row.get("device", "")),
+            str(row.get("user", "")),
+            str(row.get("type", "")),
+            str(row.get("desc", "")),
+            str(row.get("qty", "")),
+            str(row.get("medid", "")),
+        ]
+        return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
+
+    out["pk"] = out.apply(make, axis=1)
+    return out
+
+
 
 def is_carousel_file(df):
     """Detect Carousel Transaction Detail Reports."""
@@ -2569,245 +2616,130 @@ if delete_file is not None and not st.session_state["delete_done"]:
     except Exception as e:
         st.error(f"Delete failed: {e}")
 
-# ===========================================
-# DAILY PYXIS UPLOAD (MAIN SIDEBAR)
-# ===========================================
+# ============================================================
+# INGESTION ENGINE — FINAL VERSION
+# ============================================================
+
 uploads = uploaded_files
 
-# Safety: auto-clear stuck flag on fresh run
+# Reset lock if no uploads
 if st.session_state.get("saving_in_progress") and not uploads:
     st.session_state["saving_in_progress"] = False
 
-if uploads:
-
-    # Load first file for validation
-    test_df = load_upload(uploads[0])
-
-    # DETECT WRONG FILE TYPE
-    if is_carousel_file(test_df):
-        st.sidebar.error("❌ This file is a **Carousel Transaction Detail Report**. Upload it inside the Carousel tab.")
-        st.stop()
-
-    if not is_pyxis_file(test_df):
-        st.sidebar.error("❌ File does not match the expected **Pyxis All Device Event Report** format.")
-        st.stop()
-
-    # Load current DB history for PK comparison
-    history = load_history_sql(DEFAULT_COLMAP, eng)
-
-    for up in uploads:
-        df = load_upload(up)
-        df = dedupe_columns(df)  
-
-        # 🧹 Your REAL normalization pipeline
-        df = apply_column_mapping(df, colmap)
-        df = canonicalize_device(df)
-        df = canonicalize_user(df)
-        df = canonicalize_type(df)
-        df = normalize_desc(df)
-        df = normalize_qty(df)
-        df = normalize_medid(df)
-
-        # Build PK
-        new_ev = build_pk(df, colmap)
-
-        # Determine new rows compared to DB
-        if history.empty or "pk" not in history.columns:
-            to_save = new_ev
-        else:
-            to_save = new_ev[~new_ev["pk"].isin(history["pk"])]
-
-        st.sidebar.write(f"📄 `{up.name}` → {len(to_save):,} new rows")
-
-        # ----------------------------------------------------
-        # 🔒 SAFE UPSERT WITH RERUN PROTECTION
-        # ----------------------------------------------------
-        if to_save.empty:
-            st.sidebar.info("No new rows to save.")
-        else:
-            if st.session_state.get("saving_in_progress", False):
-                st.sidebar.warning("⏳ Save already in progress… please wait.")
-                st.stop()
-
-            st.session_state["saving_in_progress"] = True
-            try:
-                ok, msg = save_history_sql(to_save, colmap, eng)
-                (st.sidebar.success if ok else st.sidebar.error)(msg)
-
-                # Update history so the next file in the SAME batch compares correctly
-                history = pd.concat([history, to_save], ignore_index=True)
-
-            except Exception as e:
-                st.sidebar.error(f"DB save error: {e}")
-                st.stop()
-
-            finally:
-                st.session_state["saving_in_progress"] = False
-
-
-# ===================== LOAD HISTORY (stable, reboot-safe) =====================
-history = load_history_sql(DEFAULT_COLMAP, eng)
-
-# Restore mapping if user saved one
-if "colmap" in st.session_state:
-    colmap = st.session_state["colmap"]
-else:
-    colmap = DEFAULT_COLMAP.copy()
-
-
-# ===========================================
-# DAILY PYXIS UPLOAD (MAIN SIDEBAR)
-# ===========================================
-uploads = uploaded_files
+# Load DB history now (safe version)
+history = safe_history(eng)
 
 if uploads:
-    # Load first file for detection
-    test_df = load_upload(uploads[0])
 
-    # DETECT WRONG FILE TYPE
-    if is_carousel_file(test_df):
-        st.sidebar.error("❌ This file is a **Carousel Transaction Detail Report**. Upload it inside the Carousel tab.")
+    # ========== PREVALIDATE FIRST FILE ==========
+    sample = load_upload(uploads[0])
+    sample = dedupe_columns(sample)
+
+    if is_carousel_file(sample):
+        st.sidebar.error("❌ This file is a Carousel report. Upload it inside the Carousel tab.")
         st.stop()
 
-    if not is_pyxis_file(test_df):
-        st.sidebar.error("❌ File does not match the expected **Pyxis All Device Event Report** format.")
+    if not is_pyxis_file(sample):
+        st.sidebar.error("❌ This file is NOT an All Device Event Report.")
         st.stop()
 
-
-# ============================================================
-# SAFE RERUN FLAGS (must be BEFORE mapping and processing)
-# ============================================================
-pending_rerun = False
-
-# FIX 1: preserve uploads during first rerun
-if uploads and "upload_ready" not in st.session_state:
-    st.session_state["upload_ready"] = True
-    pending_rerun = True
-
-# FIX 2: preserve uploads before saving
-if uploads and "processed_ready" not in st.session_state:
-    st.session_state["processed_ready"] = True
-    pending_rerun = True
-
-
-# ============================================================
-# COLUMN MAPPING UI (with safe MedID)
-# ============================================================
-if uploads:
-
-    sample_df = load_upload(uploads[0])
-    sample_df = dedupe_columns(sample_df)
-
+    # ========== REMAP COLUMNS ==========
     st.sidebar.header("2) Map columns")
 
     PYXIS_FIELDS = ["datetime", "device", "user", "type", "desc", "qty"]
-
-    # Add medid ONLY if file contains the MedID column
-    if "MedID" in sample_df.columns or "Item ID" in sample_df.columns:
+    if "MedID" in sample.columns or "Item ID" in sample.columns:
         PYXIS_FIELDS.append("medid")
 
     for k in PYXIS_FIELDS:
         default = DEFAULT_COLMAP[k]
-        opts = list(sample_df.columns)
+        opts = list(sample.columns)
 
-        sel = st.sidebar.selectbox(
-            f"{k.capitalize()} column",
+        colmap[k] = st.sidebar.selectbox(
+            f"{k}",
             options=opts,
             index=opts.index(default) if default in opts else 0,
-            key=f"map_{k}",
-            help="Pick the matching column from your export",
+            key=f"map_{k}"
         )
 
-        colmap[k] = sel
-
-    # Save mapping
     st.session_state["colmap"] = colmap
 
-    # Duplicate-check only over mapped fields
+    # Duplicate mappings?
     picked = [colmap[k] for k in PYXIS_FIELDS]
     dupes = sorted({c for c in picked if picked.count(c) > 1})
     if dupes:
-        st.error("Duplicate mappings: " + ", ".join(dupes))
+        st.sidebar.error("Duplicate mappings: " + ", ".join(dupes))
         st.stop()
 
-# ============================================================
-# PROCESS UPLOADS
-# ============================================================
-if uploads:
+    # ========== PROCESS EACH FILE ==========
+    all_new = []
 
-    new_files = []
     for up in uploads:
         try:
-            raw = load_upload(up)
-            cleaned = base_clean(raw, colmap)
-            if cleaned.empty:
-                st.warning(f"{up.name}: no valid rows.")
-                continue
-            new_files.append(cleaned)
-        except Exception as e:
-            st.error(f"Failed to read {up.name}: {e}")
+            df = load_upload(up)
+            df = full_clean(df, colmap)
+            df = build_pk_once(df, colmap)
 
-    if not new_files:
+            df = df.dropna(subset=["pk"])
+            df = df.drop_duplicates(subset=["pk"])
+            df = df.sort_values(colmap["datetime"])
+
+            all_new.append(df)
+
+        except Exception as e:
+            st.sidebar.error(f"Failed to read {up.name}: {e}")
+            st.stop()
+
+    if not all_new:
         st.warning("No usable rows found.")
         st.stop()
 
-    new_ev = pd.concat(new_files, ignore_index=True)
+    # Combine all cleaned files
+    new_ev = pd.concat(all_new, ignore_index=True)
 
-    # Build PK
-    new_ev = build_pk(new_ev, colmap)
-
-    new_ev = new_ev.drop_duplicates(subset=["pk"]).sort_values(colmap["datetime"])
-
-    # Merge with DB history
-    frames = [history, new_ev] if not history.empty else [new_ev]
-    ev_all = (
-        pd.concat(frames, ignore_index=True)
-        .drop_duplicates(subset=["pk"])
-        .sort_values(colmap["datetime"])
-    )
-
-    # Upload summary
+    # ========== MERGE WITH HISTORY ==========
+    old_pks = set(history["pk"])
     new_pks = set(new_ev["pk"])
-    old_pks = set(history["pk"]) if "pk" in history.columns else set()
 
-    num_new = len(new_pks - old_pks)
-    num_dup = len(new_pks & old_pks)
+    unique_new = new_ev[~new_ev["pk"].isin(old_pks)].copy()
 
+    # ========== SUMMARY ==========
     with st.expander("📥 Upload Summary", expanded=True):
-        st.write(f"**Rows in this upload:** {len(new_ev):,}")
-        st.write(f"**New rows:** {num_new:,}")
-        st.write(f"**Already existed:** {num_dup:,}")
+        st.write(f"**Rows this upload:** {len(new_ev):,}")
+        st.write(f"**New rows:** {len(unique_new):,}")
+        st.write(f"**Already existed:** {len(new_pks & old_pks):,}")
 
         try:
-            earliest = pd.to_datetime(ev_all[colmap["datetime"]].min())
-            latest   = pd.to_datetime(ev_all[colmap["datetime"]].max())
-            st.write(f"**History range:** {earliest} → {latest}")
+            st.write(f"**Range:** {new_ev[colmap['datetime']].min()} → {new_ev[colmap['datetime']].max()}")
         except:
-            st.write("Could not compute history range.")
+            st.write("Unable to compute date range.")
 
-    # SAVE TO DB
-    if history.empty or "pk" not in history.columns:
-        to_save = new_ev
-    else:
-        to_save = new_ev[~new_ev["pk"].isin(old_pks)].copy()
-
-    if to_save.empty:
+    # ========== UPSERT ==========
+    if unique_new.empty:
         st.sidebar.info("No new rows to save.")
     else:
-        ok, msg = save_history_sql(to_save, colmap, eng)
-        (st.sidebar.success if ok else st.sidebar.error)(msg)
+        if st.session_state.get("saving_in_progress", False):
+            st.sidebar.warning("⏳ Save already in progress…")
+            st.stop()
+
+        st.session_state["saving_in_progress"] = True
+        try:
+            ok, msg = save_history_sql(unique_new, colmap, eng)
+            (st.sidebar.success if ok else st.sidebar.error)(msg)
+        except Exception as e:
+            st.sidebar.error(f"DB save error: {e}")
+        finally:
+            st.session_state["saving_in_progress"] = False
+
+    # ========== FINAL MERGED VIEW ==========
+    ev_all = (
+        pd.concat([history, new_ev], ignore_index=True)
+          .drop_duplicates(subset=["pk"])
+          .sort_values(colmap["datetime"])
+    )
 
 else:
+    # No uploads → DB only mode
     ev_all = history.copy()
-
-
-# ============================================================
-# FINAL SAFE RERUN (must be at bottom of section)
-# ============================================================
-if pending_rerun:
-    st.rerun()
-
-
 
 # =================== TIME RANGE FILTER ===================
 # ============================ MERGE & SAVE ============================
