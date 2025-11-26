@@ -2801,14 +2801,41 @@ if uploads:
     # qty must be numeric, convert safely
     to_save[colmap["qty"]] = pd.to_numeric(to_save[colmap["qty"]], errors="coerce").fillna(0)
 
+# --- SAVE (uploads only): write only the delta ---
+to_save = new_ev if not old_pks else new_ev[~new_ev["pk"].isin(old_pks)].copy()
 
-    # --- SAVE (uploads only): write only the delta ---
-    to_save = new_ev if not old_pks else new_ev[~new_ev["pk"].isin(old_pks)].copy()
-    if to_save.empty:
-        st.sidebar.info("No new rows to save.")
-    else:
-        ok, msg = save_history_sql(to_save, colmap, eng)
-        (st.sidebar.success if ok else st.sidebar.error)(msg)
+# ============================================================
+# CLEAN + SAVE (runs ONLY after to_save is computed)
+# ============================================================
+
+# Fix NA/NAT values before DB insert
+to_save = to_save.replace({pd.NA: None})
+to_save = to_save.where(pd.notna(to_save), None)
+
+# Ensure optional string columns never contain NAType
+for c in ["device", "user", "type", "desc", "medid"]:
+    if c in to_save.columns:
+        to_save[c] = to_save[c].astype("object").where(~to_save[c].isna(), None)
+
+# Ensure qty is numeric or None
+if "qty" in to_save.columns:
+    to_save["qty"] = pd.to_numeric(to_save["qty"], errors="coerce")
+    to_save["qty"] = to_save["qty"].where(~to_save["qty"].isna(), None)
+
+# Convert datetime to Python datetime or None
+dtcol = colmap["datetime"]
+if dtcol in to_save.columns:
+    to_save[dtcol] = pd.to_datetime(to_save[dtcol], errors="coerce")
+    to_save[dtcol] = to_save[dtcol].apply(
+        lambda x: x.to_pydatetime() if not pd.isna(x) else None
+    )
+
+# Save to DB
+if to_save.empty:
+    st.sidebar.info("No new rows to save.")
+else:
+    ok, msg = save_history_sql(to_save, colmap, eng)
+    (st.sidebar.success if ok else st.sidebar.error)(msg)
 
 else:
     # Database-only mode; analyze what’s already in Postgres
