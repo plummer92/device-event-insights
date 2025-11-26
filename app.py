@@ -2764,8 +2764,7 @@ run_stats_f    = run_stats[run_stats[colmap["user"]].isin(data_f[colmap["user"]]
 st.success(f"Loaded {len(data_f):,} events for analysis.")
 
 
-# =================== TABS ===================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab_dbcheck = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab_dbcheck = st.tabs([
     "📈 Overview",
     "🚶 Delivery Analytics",
     "🧑‍🔧 Tech Comparison",
@@ -2778,8 +2777,10 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab_d
     "📥 Load/Unload",
     "💊 Refill Efficiency",
     "🧷 Pended Loads",
-    "🗄 DB Check"
+    "📋 Slot Config",          # ← Tab 13
+    "🗄 DB Check"              # ← Tab 14
 ])
+
 
 
 # ---------- TAB 1: OVERVIEW ----------
