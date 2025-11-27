@@ -26,50 +26,74 @@ def generate_pk(row):
 def clean_dataframe(df):
     df = df.copy()
 
-    # Normalize column names
+    # Normalize columns
     df.columns = df.columns.str.strip().str.lower()
 
-    # Rename columns to match DB schema
+    # Map all possible source column names → your final schema
     colmap = {
-        "datetime": "dt",
-        "time": "dt",
-        "device": "device",
-        "user": "user_name",
         "username": "user_name",
+        "user": "user_name",
         "employee": "user_name",
+
+        "device": "device",
+
+        "medid": "med_id",
+        "med id": "med_id",
+        "medication id": "med_id",
+
+        "description": "med_desc",
+        "desc": "med_desc",
+        "med description": "med_desc",
+
         "type": "event_type",
-        "event type": "event_type",
-        "desc": "description",
-        "description": "description",
+        "transaction type": "event_type",
+
+        "datetime": "dt",
+        "date": "dt",
+        "time": "dt",
+        "transaction date": "dt",
+        "transaction time": "dt",
+
         "qty": "qty",
         "quantity": "qty",
-        "medid": "medid",
-        "med id": "medid"
+
+        "beginning": "beginning_qty",
+        "begin": "beginning_qty",
+        "beginning qty": "beginning_qty",
+
+        "end": "ending_qty",
+        "ending": "ending_qty",
+        "end qty": "ending_qty"
     }
+
     df = df.rename(columns=colmap)
 
     # Ensure required columns exist
     required_cols = [
-        "dt",
-        "device",
         "user_name",
+        "device",
+        "med_id",
+        "med_desc",
         "event_type",
-        "description",
+        "dt",
         "qty",
-        "medid"
+        "beginning_qty",
+        "ending_qty"
     ]
+
     for col in required_cols:
         if col not in df.columns:
             df[col] = None
 
-    # Convert dt → TEXT
-    if "dt" in df.columns:
-        df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
-        df["dt"] = df["dt"].astype(str).where(df["dt"].notna(), None)
-    else:
-        df["dt"] = None
+    # Convert dt to TEXT safely
+    df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
+    df["dt"] = df["dt"].astype(str).where(df["dt"].notna(), None)
 
-    # Replace remaining NaN with None
+    # Convert numeric fields safely
+    for c in ["qty", "beginning_qty", "ending_qty"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Replace NaN with None
     df = df.where(pd.notna(df), None)
 
     # Generate PK
@@ -77,14 +101,35 @@ def clean_dataframe(df):
 
     return df
 
-
 def insert_batch(df):
     conn = get_conn()
     cur = conn.cursor()
 
     sql = """
-        INSERT INTO events (pk, dt, device, user_name, event_type, description, qty, medid)
-        VALUES (%(pk)s, %(dt)s, %(device)s, %(user_name)s, %(event_type)s, %(description)s, %(qty)s, %(medid)s)
+        INSERT INTO events (
+            pk,
+            user_name,
+            device,
+            med_id,
+            med_desc,
+            event_type,
+            dt,
+            qty,
+            beginning_qty,
+            ending_qty
+        )
+        VALUES (
+            %(pk)s,
+            %(user_name)s,
+            %(device)s,
+            %(med_id)s,
+            %(med_desc)s,
+            %(event_type)s,
+            %(dt)s,
+            %(qty)s,
+            %(beginning_qty)s,
+            %(ending_qty)s
+        )
         ON CONFLICT (pk) DO NOTHING;
     """
 
