@@ -12,9 +12,6 @@ st.set_page_config(page_title="Device Event Loader", layout="wide")
 DB_URL = st.secrets["neon"]["db_url"]
 
 def get_conn():
-    """
-    Returns a psycopg2 connection to Neon.
-    """
     return psycopg2.connect(DB_URL)
 
 
@@ -22,9 +19,6 @@ def get_conn():
 # UTILITIES
 # -------------------------------------------------------
 def generate_pk(row):
-    """
-    Generate a stable unique hash for deduplication.
-    """
     row_string = "|".join(str(v) for v in row.values)
     return hashlib.sha256(row_string.encode()).hexdigest()
 
@@ -68,15 +62,14 @@ def clean_dataframe(df):
         if col not in df.columns:
             df[col] = None
 
-# Convert dt to string consistently
-if "dt" in df.columns:
-    df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
-    df["dt"] = df["dt"].astype(str).where(df["dt"].notna(), None)
-else:
-    df["dt"] = None
+    # Convert dt → TEXT
+    if "dt" in df.columns:
+        df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
+        df["dt"] = df["dt"].astype(str).where(df["dt"].notna(), None)
+    else:
+        df["dt"] = None
 
-
-    # Replace remaining NaNs with None
+    # Replace remaining NaN with None
     df = df.where(pd.notna(df), None)
 
     # Generate PK
@@ -85,11 +78,7 @@ else:
     return df
 
 
-
 def insert_batch(df):
-    """
-    Insert rows into Neon in safe batches.
-    """
     conn = get_conn()
     cur = conn.cursor()
 
@@ -100,7 +89,7 @@ def insert_batch(df):
     """
 
     rows = df.to_dict("records")
-    batch_size = 5000  # safe for paid Neon plans
+    batch_size = 5000
 
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
@@ -121,7 +110,7 @@ uploaded = st.file_uploader("Upload Device Event Report (CSV or Excel)", type=["
 if uploaded:
     st.success("File uploaded successfully!")
 
-    # Load file
+    # Load raw file
     if uploaded.name.endswith(".xlsx"):
         df_raw = pd.read_excel(uploaded)
     else:
@@ -129,25 +118,18 @@ if uploaded:
 
     st.write(f"**Raw rows:** {len(df_raw):,}")
 
-    # Clean
+    # Clean data
     df_clean = clean_dataframe(df_raw)
     st.write(f"**Cleaned rows:** {len(df_clean):,}")
-    if uploaded:
-    ...
-    df_clean = clean_dataframe(df_raw)
-    ...
-    
-    # Debug dt values
-    st.write("Example dt values:", df_clean["dt"].head(20).tolist())
-    st.write("DT dtype:", str(df_clean["dt"].dtype))
-    st.write("Rows with invalid dt:", df_clean[df_clean["dt"].isna()].head(20))
 
-    st.dataframe(df_clean.head(20))
+    # Debug dt values (now in correct location)
+    st.write("Example dt values:", df_clean["dt"].head(10).tolist())
+    st.write("DT dtype:", str(df_clean["dt"].dtype))
+    st.write("Rows with dt = None:", df_clean[df_clean["dt"].isna()].head(10))
 
     # Preview
     st.dataframe(df_clean.head(20), use_container_width=True)
 
-    # Save button
     if st.button("🚀 Save to Neon Database"):
         with st.spinner("Saving rows to Neon…"):
             insert_batch(df_clean)
