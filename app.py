@@ -88,7 +88,7 @@ else:
 
     df["pk"] = df.apply(lambda r: generate_pk(r), axis=1)
 
-    return df
+return df
 
 
 def insert_batch(df):
