@@ -9,6 +9,74 @@
 # - FutureWarning-safe (observed=True; no categoricals)
 from __future__ import annotations
 
+# ============================================================
+# INGESTION ENGINE — CLEAN, SAFE, FINAL VERSION
+# ============================================================
+
+ev_all = None  # final dataframe used for analytics
+
+# DELETE MODE
+if data_mode == "Upload files" and "df_del" in locals():
+    try:
+        if isinstance(df_del, pd.DataFrame) and not df_del.empty:
+            def compute_pk(row):
+                parts = [
+                    str(row.get("datetime","")),
+                    str(row.get("device","")),
+                    str(row.get("user","")),
+                    str(row.get("type","")),
+                    str(row.get("desc","")),
+                    str(row.get("qty","")),
+                    str(row.get("medid","")),
+                ]
+                return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
+
+            df_del["pk"] = df_del.apply(compute_pk, axis=1)
+            pks = df_del["pk"].dropna().unique().tolist()
+
+            if pks:
+                sql_delete = text("DELETE FROM events WHERE pk = ANY(:pks)")
+                with eng.begin() as con:
+                    con.execute(sql_delete, {"pks": pks})
+
+                st.success(f"Deleted {len(pks):,} rows.")
+                st.cache_data.clear()
+                ev_all = load_history_sql(colmap, eng)
+                st.experimental_rerun()
+    except Exception as e:
+        st.error(f"Delete failed: {e}")
+
+# UPLOAD MODE
+if data_mode == "Upload files" and "to_save" in locals() and isinstance(to_save, pd.DataFrame):
+    to_save = to_save.replace({pd.NA: None}).where(pd.notna(to_save), None)
+    for c in ["device","user","type","desc","medid"]:
+        if c in to_save.columns:
+            to_save[c] = to_save[c].astype("object").where(~to_save[c].isna(), None)
+    if colmap.get("qty") in to_save.columns:
+        q = colmap["qty"]
+        to_save[q] = pd.to_numeric(to_save[q], errors="coerce").where(lambda x: ~x.isna(), None)
+    dt = colmap["datetime"]
+    if dt in to_save.columns:
+        to_save[dt] = pd.to_datetime(to_save[dt], errors="coerce").apply(lambda x: x.to_pydatetime() if not pd.isna(x) else None)
+
+    if not to_save.empty:
+        ok, msg = save_history_sql(to_save, colmap, eng)
+        (st.sidebar.success if ok else st.sidebar.error)(msg)
+
+    ev_all = load_history_sql(colmap, eng)
+
+# DATABASE ONLY
+if data_mode == "Database only":
+    ev_all = load_history_sql(colmap, eng)
+
+# FINAL GUARD
+if ev_all is None or ev_all.empty:
+    st.warning("No events available. Upload data or check database.")
+    st.stop()
+
+
+
+
 import hashlib
 import io
 import os
@@ -87,58 +155,6 @@ def is_pyxis_file(df):
 # SANITIZE ROWS BEFORE DB UPSERT
 # ---------------------------------------------------
 
-def safe_history(eng):
-    """Load DB history and guarantee pk column exists."""
-    hist = load_history_sql(DEFAULT_COLMAP, eng)
-    if isinstance(hist, pd.DataFrame) and not hist.empty:
-        if "pk" not in hist.columns:
-            hist["pk"] = pd.Series(dtype="string")
-        return hist
-    return pd.DataFrame({"pk": pd.Series(dtype="string")})
-
-
-def full_clean(df, colmap):
-    """Run the EXACT same transformations every upload uses."""
-    df = dedupe_columns(df)
-    df = apply_column_mapping(df, colmap)
-    df = canonicalize_device(df)
-    df = canonicalize_user(df)
-    df = canonicalize_type(df)
-    df = normalize_desc(df)
-    df = normalize_qty(df)
-    df = normalize_medid(df)
-    df = base_clean(df, colmap)
-    return df
-
-
-def build_pk_once(df, colmap):
-    """Build PK once on the *final cleaned* dataframe."""
-    out = df.copy()
-
-    def make(row):
-        parts = [
-            str(row.get("datetime", "")),
-            str(row.get("device", "")),
-            str(row.get("user", "")),
-            str(row.get("type", "")),
-            str(row.get("desc", "")),
-            str(row.get("qty", "")),
-            str(row.get("medid", "")),
-        ]
-        return hashlib.sha1("_".join(parts).encode("utf-8")).hexdigest()
-
-    out["pk"] = out.apply(make, axis=1)
-    return out
-
-
-
-def is_carousel_file(df):
-    """Detect Carousel Transaction Detail Reports."""
-    # Carousel uses EXACT 'Qty', but Pyxis uses 'Quantity' and 'QtyUOM'.
-    return "Qty" in df.columns and "Quantity" not in df.columns
-
-
-# ---------- SIMPLE EXTRACTOR FOR DEVICE ACTIVITY LOG ----------
 
 A_MIN  = r"Inventory\s*Refill\s*Point\s*Min\s*Quantity"
 A_MAX  = r"Inventory\s*Par\s*Max\s*Quantity"
@@ -2666,31 +2682,6 @@ if data_mode == "Upload files" and "df_del" in locals():
 # 2) UPLOAD MODE
 # ------------------------------------------------------------
 if data_mode == "Upload files" and "to_save" in locals() and isinstance(to_save, pd.DataFrame):
-    to_save = to_save.replace({pd.NA: None})
-    to_save = to_save.where(pd.notna(to_save), None)
-
-    for c in ["device", "user", "type", "desc", "medid"]:
-        if c in to_save.columns:
-            to_save[c] = to_save[c].astype("object").where(~to_save[c].isna(), None)
-
-    if "qty" in to_save.columns:
-        to_save["qty"] = pd.to_numeric(to_save["qty"], errors="coerce")
-        to_save["qty"] = to_save["qty"].where(~to_save["qty"].isna(), None)
-
-    dtcol = colmap["datetime"]
-    if dtcol in to_save.columns:
-        to_save[dtcol] = pd.to_datetime(to_save[dtcol], errors="coerce")
-        to_save[dtcol] = to_save[dtcol].apply(lambda x: x.to_pydatetime() if not pd.isna(x) else None)
-
-    if not to_save.empty:
-        ok, msg = save_history_sql(to_save, colmap, eng)
-        (st.sidebar.success if ok else st.sidebar.error)(msg)
-    else:
-        st.sidebar.info("No new rows to save.")
-
-    ev_all = load_history_sql(colmap, eng)
-
-# ------------------------------------------------------------
 # 3) DATABASE ONLY MODE
 # ------------------------------------------------------------
 if data_mode == "Database only":
@@ -2754,31 +2745,6 @@ if data_mode == "Upload files" and "df_del" in locals():
 # 2) UPLOAD MODE
 # ------------------------------------------------------------
 if data_mode == "Upload files" and "to_save" in locals() and isinstance(to_save, pd.DataFrame):
-    to_save = to_save.replace({pd.NA: None})
-    to_save = to_save.where(pd.notna(to_save), None)
-
-    for c in ["device", "user", "type", "desc", "medid"]:
-        if c in to_save.columns:
-            to_save[c] = to_save[c].astype("object").where(~to_save[c].isna(), None)
-
-    if "qty" in to_save.columns:
-        to_save["qty"] = pd.to_numeric(to_save["qty"], errors="coerce")
-        to_save["qty"] = to_save["qty"].where(~to_save["qty"].isna(), None)
-
-    dtcol = colmap["datetime"]
-    if dtcol in to_save.columns:
-        to_save[dtcol] = pd.to_datetime(to_save[dtcol], errors="coerce")
-        to_save[dtcol] = to_save[dtcol].apply(lambda x: x.to_pydatetime() if not pd.isna(x) else None)
-
-    if not to_save.empty:
-        ok, msg = save_history_sql(to_save, colmap, eng)
-        (st.sidebar.success if ok else st.sidebar.error)(msg)
-    else:
-        st.sidebar.info("No new rows to save.")
-
-    ev_all = load_history_sql(colmap, eng)
-
-# ------------------------------------------------------------
 # 3) DATABASE ONLY MODE
 # ------------------------------------------------------------
 if data_mode == "Database only":
