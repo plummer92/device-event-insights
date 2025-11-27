@@ -34,8 +34,9 @@ def generate_pk(row):
 
 
 def clean_dataframe(df):
-    """Normalize uploaded file → final schema that matches DB."""
     df = df.copy()
+
+    # Normalize columns
     df.columns = df.columns.str.strip().str.lower()
 
     colmap = {
@@ -48,51 +49,51 @@ def clean_dataframe(df):
         "medid": "med_id",
         "med id": "med_id",
 
+        "meddescription": "med_desc",
+        "med description": "med_desc",
         "description": "med_desc",
         "desc": "med_desc",
 
+        "transactiontype": "event_type",
         "type": "event_type",
-        "transaction type": "event_type",
 
-        "datetime": "dt",
-        "transaction datetime": "dt",
-        "transaction date and time": "dt",
+        # Correct datetime column in your file
+        "transactiondatetime": "dt",
 
         "quantity": "qty",
         "qty": "qty",
 
         "beg": "beginning_qty",
         "beginning": "beginning_qty",
-        "begin": "beginning_qty",
 
         "end": "ending_qty",
-        "ending": "ending_qty"
     }
 
     df = df.rename(columns=colmap)
 
-    required = [
+    required_cols = [
         "user_name", "device", "med_id", "med_desc",
-        "event_type", "dt", "qty", "beginning_qty", "ending_qty"
+        "event_type", "dt", "qty",
+        "beginning_qty", "ending_qty"
     ]
 
-    for c in required:
-        if c not in df.columns:
-            df[c] = None
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = None
 
-    # Datetime handling
+    # Parse dt
     df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
     df["dt"] = df["dt"].astype(str).where(df["dt"].notna(), None)
 
-    # Numeric cleanup
+    # Numeric conversion
     for c in ["qty", "beginning_qty", "ending_qty"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df = df.where(pd.notna(df), None)
+
     df["pk"] = df.apply(lambda r: generate_pk(r), axis=1)
 
     return df
-
 
 ###########################################################
 #                 INSERT INTO DATABASE
