@@ -2782,10 +2782,10 @@ if data_mode == "Upload files" and "df_del" in locals():
 # 2) UPLOAD MODE
 # ------------------------------------------------------------
 if data_mode == "Upload files" and "to_save" in locals() and isinstance(to_save, pd.DataFrame):
-# 3) DATABASE ONLY MODE
+    # 3) DATABASE ONLY MODE
 # ------------------------------------------------------------
-if data_mode == "Database only":
-    ev_all = load_history_sql(colmap, eng)
+    if data_mode == "Database only":
+        ev_all = load_history_sql(colmap, eng)
 
 # ------------------------------------------------------------
 # FINAL GUARD
