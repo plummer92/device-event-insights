@@ -255,7 +255,6 @@ def process_events(df_raw):
 ###########################################################
 
 def load_events_from_db(start_date, end_date):
-    """Query Neon for events in date range."""
     conn = get_conn()
     cur = conn.cursor()
 
@@ -263,9 +262,15 @@ def load_events_from_db(start_date, end_date):
         SELECT pk, user_name, device, med_id, med_desc,
                event_type, dt, qty, beginning_qty, ending_qty
         FROM events
-        WHERE dt::date BETWEEN %s AND %s
+        WHERE
+            CASE
+                WHEN dt IS NULL THEN NULL
+                WHEN dt ~ '^\d{4}-\d{2}-\d{2}' THEN dt::timestamp
+                ELSE NULL
+            END BETWEEN %s AND %s
         ORDER BY user_name, dt;
     """
+
     cur.execute(sql, (start_date, end_date))
     rows = cur.fetchall()
 
@@ -284,6 +289,7 @@ def load_events_from_db(start_date, end_date):
         return df
 
     return process_events(df)
+
 
 
 ###########################################################
