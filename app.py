@@ -2782,10 +2782,36 @@ if data_mode == "Upload files" and "df_del" in locals():
 # 2) UPLOAD MODE
 # ------------------------------------------------------------
 if data_mode == "Upload files" and "to_save" in locals() and isinstance(to_save, pd.DataFrame):
-    # 3) DATABASE ONLY MODE
+    # CLEAN + CONVERT
+    to_save = to_save.replace({pd.NA: None}).where(pd.notna(to_save), None)
+
+    for c in ["device", "user", "type", "desc", "medid"]:
+        if c in to_save.columns:
+            to_save[c] = to_save[c].astype("object").where(~to_save[c].isna(), None)
+
+    qty_col = colmap.get("qty")
+    if qty_col and qty_col in to_save.columns:
+        to_save[qty_col] = pd.to_numeric(to_save[qty_col], errors="coerce")
+        to_save[qty_col] = to_save[qty_col].where(~to_save[qty_col].isna(), None)
+
+    dtcol = colmap["datetime"]
+    if dtcol in to_save.columns:
+        to_save[dtcol] = pd.to_datetime(to_save[dtcol], errors="coerce")
+        to_save[dtcol] = to_save[dtcol].apply(lambda x: x.to_pydatetime() if not pd.isna(x) else None)
+
+    # SAVE
+    if not to_save.empty:
+        ok, msg = save_history_sql(to_save, colmap, eng)
+        (st.sidebar.success if ok else st.sidebar.error)(msg)
+
+    # Reload DB after save
+    ev_all = load_history_sql(colmap, eng)
+
 # ------------------------------------------------------------
-    if data_mode == "Database only":
-        ev_all = load_history_sql(colmap, eng)
+# 3) DATABASE ONLY MODE
+# ------------------------------------------------------------
+if data_mode == "Database only":
+    ev_all = load_history_sql(colmap, eng)
 
 # ------------------------------------------------------------
 # FINAL GUARD
