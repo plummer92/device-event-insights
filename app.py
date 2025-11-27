@@ -1,41 +1,43 @@
+###############################################
+# DEVICE EVENT INSIGHTS (NEON VERSION)
+# Full Trend-Building Analytics Dashboard
+# Python 3.12 / Streamlit Cloud
+###############################################
+
 import streamlit as st
 import pandas as pd
+import numpy as np
 import hashlib
 import psycopg2
 from psycopg2.extras import execute_batch
 import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Device Event Loader", layout="wide")
+st.set_page_config(page_title="Device Event Insights", layout="wide")
 
-# -------------------------------------------------------
-# DATABASE CONNECTION
-# -------------------------------------------------------
+###########################################################
+#                 DATABASE CONNECTION
+###########################################################
 DB_URL = st.secrets["neon"]["db_url"]
 
 def get_conn():
     return psycopg2.connect(DB_URL)
 
 
-# -------------------------------------------------------
-# UTILITIES
-# -------------------------------------------------------
+###########################################################
+#                 CLEANING FUNCTIONS
+###########################################################
 def generate_pk(row):
-    """Stable row hash for deduplication."""
-    row_string = "|".join(str(v) for v in row.values)
-    return hashlib.sha256(row_string.encode()).hexdigest()
+    """Stable unique hash for deduplication."""
+    return hashlib.sha256("|".join(str(v) for v in row.values).encode()).hexdigest()
 
 
 def clean_dataframe(df):
+    """Normalize uploaded file → final schema that matches DB."""
     df = df.copy()
+    df.columns = df.columns.str.strip().str.lower()
 
-    # ----------------------------------------------------
-    # Normalize column names safely
-    # ----------------------------------------------------
-    df.columns = df.columns.astype(str).str.strip().str.lower()
-
-    # ----------------------------------------------------
-    # Map ANY possible input name → your schema
-    # ----------------------------------------------------
     colmap = {
         "username": "user_name",
         "user": "user_name",
@@ -45,178 +47,96 @@ def clean_dataframe(df):
 
         "medid": "med_id",
         "med id": "med_id",
-        "medication id": "med_id",
 
         "description": "med_desc",
         "desc": "med_desc",
-        "med description": "med_desc",
 
         "type": "event_type",
-        "event type": "event_type",
-        "transactiontype": "event_type",
+        "transaction type": "event_type",
 
         "datetime": "dt",
         "transaction datetime": "dt",
-        "transaction date time": "dt",
-        "transaction date": "dt",
-        "date": "dt",
-        "time": "dt",
+        "transaction date and time": "dt",
 
-        "qty": "qty",
         "quantity": "qty",
+        "qty": "qty",
 
-        "beginning": "beginning_qty",
         "beg": "beginning_qty",
+        "beginning": "beginning_qty",
         "begin": "beginning_qty",
-        "beginning qty": "beginning_qty",
 
         "end": "ending_qty",
-        "ending": "ending_qty",
-        "end qty": "ending_qty",
+        "ending": "ending_qty"
     }
 
-    # Rename known columns
     df = df.rename(columns=colmap)
 
-    # ----------------------------------------------------
-    # Ensure required columns always exist
-    # ----------------------------------------------------
-    required_cols = [
-        "user_name",
-        "device",
-        "med_id",
-        "med_desc",
-        "event_type",
-        "dt",
-        "qty",
-        "beginning_qty",
-        "ending_qty"
+    required = [
+        "user_name", "device", "med_id", "med_desc",
+        "event_type", "dt", "qty", "beginning_qty", "ending_qty"
     ]
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = None
 
-    # ----------------------------------------------------
-    # Convert dt → datetime cleanly
-    # ----------------------------------------------------
+    for c in required:
+        if c not in df.columns:
+            df[c] = None
+
+    # Datetime handling
     df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
+    df["dt"] = df["dt"].astype(str).where(df["dt"].notna(), None)
 
-    # Convert dt → TEXT for Postgres, but keep datetime for analytics
-    df["dt"] = df["dt"].apply(
-        lambda x: x.isoformat(sep=" ") if pd.notna(x) else None
-    )
-
-    # ----------------------------------------------------
-    # Convert numeric columns safely
-    # ----------------------------------------------------
+    # Numeric cleanup
     for c in ["qty", "beginning_qty", "ending_qty"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # ----------------------------------------------------
-    # Replace leftover NaNs → None (Postgres-safe)
-    # ----------------------------------------------------
     df = df.where(pd.notna(df), None)
-
-    # ----------------------------------------------------
-    # Generate stable PK for dedupe
-    # ----------------------------------------------------
     df["pk"] = df.apply(lambda r: generate_pk(r), axis=1)
 
     return df
 
-def safe_preview(df, n=20):
-    # Convert problematic columns so Arrow doesn't crash
-    df_preview = df.copy().head(n)
 
-    for col in df_preview.columns:
-        # Convert lists/dicts to strings
-        df_preview[col] = df_preview[col].apply(
-            lambda x: str(x) if isinstance(x, (list, dict)) else x
-        )
-
-        # Convert long objects to strings
-        if df_preview[col].dtype == "object":
-            df_preview[col] = df_preview[col].astype(str)
-
-    st.dataframe(df_preview, use_container_width=True)
-
-
-
+###########################################################
+#                 INSERT INTO DATABASE
+###########################################################
 def insert_batch(df):
-    """Insert cleaned rows into Neon using psycopg2."""
     conn = get_conn()
     cur = conn.cursor()
 
     sql = """
         INSERT INTO events (
-            pk,
-            user_name,
-            device,
-            med_id,
-            med_desc,
-            event_type,
-            dt,
-            qty,
-            beginning_qty,
-            ending_qty
+            pk, user_name, device, med_id, med_desc,
+            event_type, dt, qty, beginning_qty, ending_qty
         )
         VALUES (
-            %(pk)s,
-            %(user_name)s,
-            %(device)s,
-            %(med_id)s,
-            %(med_desc)s,
-            %(event_type)s,
-            %(dt)s,
-            %(qty)s,
-            %(beginning_qty)s,
-            %(ending_qty)s
+            %(pk)s, %(user_name)s, %(device)s, %(med_id)s, %(med_desc)s,
+            %(event_type)s, %(dt)s, %(qty)s, %(beginning_qty)s, %(ending_qty)s
         )
         ON CONFLICT (pk) DO NOTHING;
     """
 
     rows = df.to_dict("records")
-    batch_size = 5000
-
-    for i in range(0, len(rows), batch_size):
-        batch = rows[i:i + batch_size]
-        execute_batch(cur, sql, batch, page_size=len(batch))
+    for i in range(0, len(rows), 5000):
+        execute_batch(cur, sql, rows[i:i + 5000], page_size=len(rows[i:i + 5000]))
         conn.commit()
 
     cur.close()
     conn.close()
 
 
-# -------------------------------------------------------
-# PROCESSING ENGINE
-# -------------------------------------------------------
-
-IDLE_CUTOFF_SEC = 10 * 60  # 10 minutes
-
+###########################################################
+#       PROCESSING ENGINE: TIME, WALK, REFILL PAIRS
+###########################################################
 
 def normalize_event_type(raw):
     if raw is None:
         return None
 
     r = str(raw).strip().lower()
-
-    if "cancel" in r:
-        return "cancelled"
-    if "verify" in r:
-        return "verify"
-    if "refill" in r:
-        return "refill"
-    if "load" in r:
-        return "load"
-    if "unload" in r:
-        return "unload"
-    if "outdate" in r:
-        return "outdate"
-    if "empty" in r:
-        return "emptyreturn"
-    if "count" in r:
-        return "count"
-
+    if "cancel" in r: return "cancelled"
+    if "verify" in r: return "verify"
+    if "refill" in r: return "refill"
+    if "load" in r: return "load"
+    if "unload" in r: return "unload"
+    if "outdate" in r: return "outdate"
     return r
 
 
@@ -224,20 +144,19 @@ def prepare_events(df):
     df = df.copy()
     df.columns = df.columns.str.lower()
 
-    # enforce required columns
-    needed = [
-        "dt", "user_name", "device", "event_type",
-        "med_id", "med_desc", "qty",
-        "beginning_qty", "ending_qty", "pk"
+    required = [
+        "dt","user_name","device","event_type",
+        "med_id","med_desc","qty","beginning_qty","ending_qty","pk"
     ]
-    for c in needed:
+    for c in required:
         if c not in df.columns:
             df[c] = None
 
     df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
     df["event_type_clean"] = df["event_type"].apply(normalize_event_type)
-    df = df.sort_values(["user_name", "dt"])
-    return df.reset_index(drop=True)
+    df = df.sort_values(["user_name", "dt"]).reset_index(drop=True)
+
+    return df
 
 
 def compute_time_deltas(df):
@@ -252,25 +171,24 @@ def compute_time_deltas(df):
     return df
 
 
+IDLE_CUTOFF_SEC = 10 * 60  # 10 minutes
+
 def compute_dwell_walk(df):
     df = df.copy()
-
     df["dwell_sec"] = 0
     df["walk_sec"] = 0
 
-    valid_mask = df["event_type_clean"] != "cancelled"
+    mask_valid = df["event_type_clean"] != "cancelled"
 
     for idx in df.index:
-        if not valid_mask[idx]:
+        if not mask_valid[idx]:
             continue
 
         delta = df.at[idx, "time_delta_sec"]
         if delta <= 0:
             continue
 
-        same_device = df.at[idx, "device"] == df.at[idx, "next_device"]
-
-        if same_device:
+        if df.at[idx, "device"] == df.at[idx, "next_device"]:
             if delta <= IDLE_CUTOFF_SEC:
                 df.at[idx, "dwell_sec"] = delta
         else:
@@ -281,18 +199,19 @@ def compute_dwell_walk(df):
 
 def compute_refill_pairs(df):
     df = df.copy()
-
     df["refill_pair_id"] = None
     df["refill_pair_sec"] = 0
     df["is_refill_primary"] = False
 
-    pair_counter = 1
+    counter = 1
 
     for user, grp in df.groupby("user_name"):
+        grp_idx = grp.index
+
         last_verify_idx = None
         last_verify_dt = None
 
-        for idx in grp.index:
+        for idx in grp_idx:
             etype = df.at[idx, "event_type_clean"]
 
             if etype == "verify":
@@ -302,18 +221,16 @@ def compute_refill_pairs(df):
             elif etype == "refill" and last_verify_idx is not None:
                 refill_dt = df.at[idx, "dt"]
 
-                pair_id = f"{user}_{pair_counter}"
-                pair_counter += 1
+                pair_id = f"{user}_{counter}"
+                counter += 1
 
                 df.at[last_verify_idx, "refill_pair_id"] = pair_id
                 df.at[idx, "refill_pair_id"] = pair_id
 
-                if last_verify_dt is not None:
-                    sec = (refill_dt - last_verify_dt).total_seconds()
-                    if sec < 0:
-                        sec = 0
-                    df.at[idx, "refill_pair_sec"] = sec
-                    df.at[idx, "is_refill_primary"] = True
+                sec = (refill_dt - last_verify_dt).total_seconds()
+                sec = max(sec, 0)
+                df.at[idx, "refill_pair_sec"] = sec
+                df.at[idx, "is_refill_primary"] = True
 
                 last_verify_idx = None
                 last_verify_dt = None
@@ -333,112 +250,248 @@ def process_events(df_raw):
     return df
 
 
-# -------------------------------------------------------
-# REFILL EFFICIENCY TAB
-# -------------------------------------------------------
+###########################################################
+#              LOAD FROM DATABASE (DATE FILTER)
+###########################################################
 
-def build_refill_efficiency_tab(df):
-    st.subheader("💊 Refill Efficiency Overview")
+def load_events_from_db(start_date, end_date):
+    """Query Neon for events in date range."""
+    conn = get_conn()
+    cur = conn.cursor()
 
-    df_refill = df[df["is_refill_primary"] == True].copy()
-    if df_refill.empty:
-        st.info("No refill events found.")
-        return
+    sql = """
+        SELECT pk, user_name, device, med_id, med_desc,
+               event_type, dt, qty, beginning_qty, ending_qty
+        FROM events
+        WHERE dt::date BETWEEN %s AND %s
+        ORDER BY user_name, dt;
+    """
+    cur.execute(sql, (start_date, end_date))
+    rows = cur.fetchall()
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Refills", len(df_refill))
-    c2.metric("Avg Refill Time", f"{df_refill['refill_pair_sec'].mean():.1f} sec")
-    c3.metric("Median Refill Time", f"{df_refill['refill_pair_sec'].median():.1f} sec")
-    c4.metric("Longest Refill", f"{df_refill['refill_pair_sec'].max():.1f} sec")
+    cols = [
+        "pk","user_name","device","med_id","med_desc",
+        "event_type","dt","qty","beginning_qty","ending_qty"
+    ]
 
-    st.markdown("---")
+    df = pd.DataFrame(rows, columns=cols)
+    df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
 
-    # Technician comparison
-    st.subheader("⏱️ Refill Time by Technician")
-    tech_stats = (
-        df_refill.groupby("user_name")
-        .agg(avg_refill_sec=("refill_pair_sec", "mean"))
-        .reset_index()
-    )
-    fig = px.bar(
-        tech_stats,
-        x="user_name",
-        y="avg_refill_sec",
-        title="Average Refill Duration per Technician",
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    cur.close()
+    conn.close()
 
-    st.markdown("---")
+    if df.empty:
+        return df
 
-    # Device comparison
-    st.subheader("🏥 Refill Time by Device")
-    dev_stats = (
-        df_refill.groupby("device")
-        .agg(avg_refill_sec=("refill_pair_sec", "mean"))
-        .reset_index()
-    )
-    fig2 = px.bar(
-        dev_stats,
-        x="device",
-        y="avg_refill_sec",
-        title="Average Refill Duration per Device",
-    )
-    st.plotly_chart(fig2, use_container_width=True)
-
-    st.markdown("---")
-
-    # Outliers
-    st.subheader("🚨 Longest Refill Times")
-    st.dataframe(
-        df_refill.sort_values("refill_pair_sec", ascending=False).head(20),
-        use_container_width=True,
-        hide_index=True,
-    )
+    return process_events(df)
 
 
-# -------------------------------------------------------
-# STREAMLIT UI
-# -------------------------------------------------------
+###########################################################
+#                    SIDEBAR UI
+###########################################################
 
-st.title("📥 Device Event Loader (Neon + Analytics Engine)")
+st.sidebar.header("📤 Upload & Database Controls")
 
-uploaded = st.file_uploader("Upload Device Event Report", type=["csv", "xlsx"])
+uploaded = st.sidebar.file_uploader("Upload Device Event Report", type=["csv","xlsx"])
 
 if uploaded:
-    st.success("File uploaded")
-
     if uploaded.name.endswith(".xlsx"):
         df_raw = pd.read_excel(uploaded)
     else:
         df_raw = pd.read_csv(uploaded)
 
-    st.write(f"Raw rows: {len(df_raw):,}")
-
     df_clean = clean_dataframe(df_raw)
-    st.write(f"Cleaned rows: {len(df_clean):,}")
+    st.sidebar.success(f"Loaded {len(df_clean):,} rows.")
 
-    st.write("Column dtypes:", df_clean.dtypes)
-
-    bad_cols = []
-    for col in df_clean.columns:
-        if df_clean[col].apply(lambda x: isinstance(x, (list, dict))).any():
-            bad_cols.append(col)
-
-    st.write("Columns with list/dict values:", bad_cols)
-
-
-    st.dataframe(df_clean.head(20), use_container_width=True)
-
-    if st.button("Save to Neon"):
-        with st.spinner("Saving…"):
+    if st.sidebar.button("💾 Save to Neon Database"):
+        with st.spinner("Saving to Neon…"):
             insert_batch(df_clean)
-        st.success("Saved to Neon!")
+        st.sidebar.success("Saved to DB!")
+
+# Date Range Filter
+st.sidebar.markdown("---")
+st.sidebar.subheader("📅 Date Range")
+
+default_end = datetime.today().date()
+default_start = default_end - timedelta(days=7)
+
+start_date = st.sidebar.date_input("Start Date", default_start)
+end_date = st.sidebar.date_input("End Date", default_end)
+
+load_btn = st.sidebar.button("📥 Load Data From Database")
+
+
+###########################################################
+#                 ALWAYS-VISIBLE TABS
+###########################################################
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "📊 Overview",
+    "💊 Refill Efficiency",
+    "🧑‍🔧 Technician Metrics",
+    "🏥 Device Metrics",
+    "🚶 Walking Time",
+    "🧱 Machine Dwell Time",
+    "📋 Raw Events"
+])
+
+
+###########################################################
+# If no data loaded → show message in all tabs
+###########################################################
+if not load_btn:
+    with tab1: st.info("Upload a file or load data from DB to begin.")
+    with tab2: st.info("Upload a file or load data from DB to begin.")
+    with tab3: st.info("Upload a file or load data from DB to begin.")
+    with tab4: st.info("Upload a file or load data from DB to begin.")
+    with tab5: st.info("Upload a file or load data from DB to begin.")
+    with tab6: st.info("Upload a file or load data from DB to begin.")
+    with tab7: st.info("Upload a file or load data from DB to begin.")
+    st.stop()
+
+
+###########################################################
+#          LOAD & PROCESS DATA FOR ANALYTICS
+###########################################################
+df = load_events_from_db(start_date, end_date)
+
+if df.empty:
+    with tab1: st.warning("No data found for this date range.")
+    with tab2: st.warning("No data found for this date range.")
+    with tab3: st.warning("No data found for this date range.")
+    with tab4: st.warning("No data found for this date range.")
+    with tab5: st.warning("No data found for this date range.")
+    with tab6: st.warning("No data found for this date range.")
+    with tab7: st.warning("No data found for this date range.")
+    st.stop()
+
+
+###########################################################
+#                     TAB 1: OVERVIEW
+###########################################################
+with tab1:
+    st.header("📊 Overview Dashboard")
+
+    total_events = len(df)
+    total_refills = df["is_refill_primary"].sum()
+    avg_walk = df["walk_sec"].mean()
+    avg_dwell = df["dwell_sec"].mean()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Events", f"{total_events:,}")
+    c2.metric("Refills", f"{total_refills:,}")
+    c3.metric("Avg Walking", f"{avg_walk:.1f} sec")
+    c4.metric("Avg Dwell", f"{avg_dwell:.1f} sec")
 
     st.markdown("---")
-    st.header("📊 Analytics (local processing only)")
+    st.subheader("Event Volume by Event Type")
 
-    df_proc = process_events(df_clean)
+    vol = df.groupby("event_type_clean").size().reset_index(name="count")
+    fig = px.bar(vol, x="event_type_clean", y="count", title="Event Counts by Type")
+    st.plotly_chart(fig, use_container_width=True)
 
-    tab1, = st.tabs(["💊 Refill Efficiency"])
-    with tab1:
-        build_refill_efficiency_tab(df_proc)
+
+###########################################################
+#                 TAB 2: REFILL EFFICIENCY
+###########################################################
+with tab2:
+    st.header("💊 Refill Efficiency")
+
+    df_ref = df[df["is_refill_primary"] == True]
+
+    if df_ref.empty:
+        st.info("No refill events found.")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Refills", f"{len(df_ref):,}")
+        c2.metric("Avg Refill Time", f"{df_ref['refill_pair_sec'].mean():.1f} sec")
+        c3.metric("Median Refill", f"{df_ref['refill_pair_sec'].median():.1f} sec")
+        c4.metric("Max Refill", f"{df_ref['refill_pair_sec'].max():.1f} sec")
+
+        st.markdown("### Refill Time by Technician")
+        tech = (
+            df_ref.groupby("user_name")["refill_pair_sec"]
+            .mean().reset_index().sort_values("refill_pair_sec")
+        )
+        fig = px.bar(tech, x="user_name", y="refill_pair_sec", title="Avg Refill Time per Tech")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("📋 All Refill Events")
+        st.dataframe(df_ref, hide_index=True, use_container_width=True)
+
+
+###########################################################
+#              TAB 3: TECHNICIAN METRICS
+###########################################################
+with tab3:
+    st.header("🧑‍🔧 Technician Metrics")
+
+    tech = (
+        df.groupby("user_name")
+        .agg(
+            events=("pk","count"),
+            walk_sec=("walk_sec","sum"),
+            dwell_sec=("dwell_sec","sum"),
+            refills=("is_refill_primary","sum")
+        )
+        .reset_index()
+    )
+
+    st.dataframe(tech, use_container_width=True)
+
+    fig = px.bar(tech, x="user_name", y="events", title="Total Events per Technician")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+###########################################################
+#              TAB 4: DEVICE METRICS
+###########################################################
+with tab4:
+    st.header("🏥 Device Metrics")
+
+    dev = (
+        df.groupby("device")
+        .agg(
+            events=("pk","count"),
+            avg_dwell=("dwell_sec","mean"),
+            avg_walk=("walk_sec","mean")
+        ).reset_index()
+    )
+
+    st.dataframe(dev, use_container_width=True)
+
+    fig = px.bar(dev, x="device", y="avg_dwell", title="Average Dwell Time per Device")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+###########################################################
+#              TAB 5: WALKING TIME
+###########################################################
+with tab5:
+    st.header("🚶 Walking Time Analytics")
+
+    fig = px.histogram(df, x="total_walk_sec", nbins=40, title="Distribution of Walking Times")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(df[["dt","user_name","device","total_walk_sec"]], hide_index=True)
+
+
+###########################################################
+#              TAB 6: MACHINE DWELL TIME
+###########################################################
+with tab6:
+    st.header("🧱 Machine Dwell Times")
+
+    fig = px.histogram(df, x="total_machine_sec", nbins=40, title="Distribution of Machine Dwell")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(df[["dt","user_name","device","total_machine_sec"]], hide_index=True)
+
+
+###########################################################
+#              TAB 7: RAW EVENT BROWSER
+###########################################################
+with tab7:
+    st.header("📋 Raw Events")
+
+    st.dataframe(df, hide_index=True, use_container_width=True)
