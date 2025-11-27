@@ -29,7 +29,8 @@ def clean_dataframe(df):
     """Convert uploaded sheet → unified schema."""
     df = df.copy()
 
-    df.columns = df.columns.str.strip().lower()
+    df.columns = df.columns.str.strip().str.lower()
+
 
     colmap = {
         "username": "user_name",
