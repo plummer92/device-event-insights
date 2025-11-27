@@ -28,72 +28,118 @@ def generate_pk(row):
 def clean_dataframe(df):
     df = df.copy()
 
-    # Normalize source column names
-    df.columns = df.columns.str.strip().str.lower()
+    # ----------------------------------------------------
+    # Normalize column names safely
+    # ----------------------------------------------------
+    df.columns = df.columns.astype(str).str.strip().str.lower()
 
-    rename_map = {
+    # ----------------------------------------------------
+    # Map ANY possible input name → your schema
+    # ----------------------------------------------------
+    colmap = {
         "username": "user_name",
         "user": "user_name",
-        "userid": "user_name",
+        "employee": "user_name",
 
         "device": "device",
 
-        "medid": "medid",
-        "med id": "medid",
+        "medid": "med_id",
+        "med id": "med_id",
+        "medication id": "med_id",
 
-        "meddescription": "description",
-        "description": "description",
-        "med description": "description",
+        "description": "med_desc",
+        "desc": "med_desc",
+        "med description": "med_desc",
 
-        "transactiontype": "event_type",
-        "transaction type": "event_type",
         "type": "event_type",
+        "event type": "event_type",
+        "transactiontype": "event_type",
 
-        "transactiondatetime": "dt",
-        "transaction date and time": "dt",
+        "datetime": "dt",
+        "transaction datetime": "dt",
+        "transaction date time": "dt",
         "transaction date": "dt",
+        "date": "dt",
+        "time": "dt",
 
-        "quantity": "qty",
         "qty": "qty",
+        "quantity": "qty",
 
-        "beg": "beg",
-        "beginning": "beg",
-        "beginning qty": "beg",
+        "beginning": "beginning_qty",
+        "beg": "beginning_qty",
+        "begin": "beginning_qty",
+        "beginning qty": "beginning_qty",
 
-        "end": "end",
-        "ending": "end",
-        "end qty": "end"
+        "end": "ending_qty",
+        "ending": "ending_qty",
+        "end qty": "ending_qty",
     }
 
-    df = df.rename(columns=rename_map)
+    # Rename known columns
+    df = df.rename(columns=colmap)
 
-    # Required columns guaranteed
-    required = ["user_name","device","medid","description","event_type","dt","qty","beg","end"]
-    for col in required:
+    # ----------------------------------------------------
+    # Ensure required columns always exist
+    # ----------------------------------------------------
+    required_cols = [
+        "user_name",
+        "device",
+        "med_id",
+        "med_desc",
+        "event_type",
+        "dt",
+        "qty",
+        "beginning_qty",
+        "ending_qty"
+    ]
+    for col in required_cols:
         if col not in df.columns:
             df[col] = None
 
-    # Normalize dt
+    # ----------------------------------------------------
+    # Convert dt → datetime cleanly
+    # ----------------------------------------------------
     df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
 
-    # Normalize event type → lowercase
-    df["event_type"] = (
-        df["event_type"]
-        .astype(str)
-        .str.strip()
-        .str.lower()
+    # Convert dt → TEXT for Postgres, but keep datetime for analytics
+    df["dt"] = df["dt"].apply(
+        lambda x: x.isoformat(sep=" ") if pd.notna(x) else None
     )
 
-    # Numeric conversions
-    for c in ["qty","beg","end"]:
+    # ----------------------------------------------------
+    # Convert numeric columns safely
+    # ----------------------------------------------------
+    for c in ["qty", "beginning_qty", "ending_qty"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    # ----------------------------------------------------
+    # Replace leftover NaNs → None (Postgres-safe)
+    # ----------------------------------------------------
     df = df.where(pd.notna(df), None)
 
-    # Generate PK
+    # ----------------------------------------------------
+    # Generate stable PK for dedupe
+    # ----------------------------------------------------
     df["pk"] = df.apply(lambda r: generate_pk(r), axis=1)
 
     return df
+
+def safe_preview(df, n=20):
+    # Convert problematic columns so Arrow doesn't crash
+    df_preview = df.copy().head(n)
+
+    for col in df_preview.columns:
+        # Convert lists/dicts to strings
+        df_preview[col] = df_preview[col].apply(
+            lambda x: str(x) if isinstance(x, (list, dict)) else x
+        )
+
+        # Convert long objects to strings
+        if df_preview[col].dtype == "object":
+            df_preview[col] = df_preview[col].astype(str)
+
+    st.dataframe(df_preview, use_container_width=True)
+
 
 
 def insert_batch(df):
