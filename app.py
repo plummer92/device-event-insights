@@ -32,8 +32,10 @@ def generate_pk(row):
 def clean_dataframe(df):
     df = df.copy()
 
+    # Normalize column names
     df.columns = df.columns.str.strip().str.lower()
 
+    # Rename columns to match DB schema
     colmap = {
         "datetime": "dt",
         "time": "dt",
@@ -50,9 +52,9 @@ def clean_dataframe(df):
         "medid": "medid",
         "med id": "medid"
     }
-
     df = df.rename(columns=colmap)
 
+    # Ensure required columns exist
     required_cols = [
         "dt",
         "device",
@@ -62,33 +64,31 @@ def clean_dataframe(df):
         "qty",
         "medid"
     ]
-
     for col in required_cols:
         if col not in df.columns:
             df[col] = None
 
-    ## Convert datetime safely
-if "dt" in df.columns:
-    df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
+    # Convert datetime safely
+    if "dt" in df.columns:
+        df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
 
-    # Convert NaT → None
-    df["dt"] = df["dt"].where(df["dt"].notna(), None)
+        # Convert NaT → None
+        df["dt"] = df["dt"].where(df["dt"].notna(), None)
 
-    # Convert valid datetimes to ISO string for Postgres
-    df["dt"] = df["dt"].apply(lambda x: x.isoformat(sep=" ") if x is not None else None)
-else:
-    df["dt"] = None
+        # Convert valid datetimes to ISO string for Postgres
+        df["dt"] = df["dt"].apply(
+            lambda x: x.isoformat(sep=" ") if x is not None else None
+        )
+    else:
+        df["dt"] = None
 
-
-    # Force any invalid or NaT date to None (required for psycopg2)
-    df["dt"] = df["dt"].where(df["dt"].notna(), None)
-
-
+    # Replace remaining NaNs with None
     df = df.where(pd.notna(df), None)
 
+    # Generate PK
     df["pk"] = df.apply(lambda r: generate_pk(r), axis=1)
 
-return df
+    return df
 
 
 def insert_batch(df):
