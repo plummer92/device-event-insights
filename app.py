@@ -30,42 +30,47 @@ def generate_pk(row):
 
 
 def clean_dataframe(df):
-    """
-    Clean column names, normalize formats, apply PK.
-    """
     df = df.copy()
 
-    # Normalize column names
     df.columns = df.columns.str.strip().str.lower()
 
-    # Map expected Pyxis report columns to DB columns
     colmap = {
         "datetime": "dt",
         "time": "dt",
         "device": "device",
         "user": "user_name",
+        "username": "user_name",
+        "employee": "user_name",
         "type": "event_type",
+        "event type": "event_type",
         "desc": "description",
         "description": "description",
         "qty": "qty",
+        "quantity": "qty",
         "medid": "medid",
         "med id": "medid"
     }
 
     df = df.rename(columns=colmap)
 
-    # Keep only known safe schema columns
-    keep_cols = ["dt", "device", "user_name", "event_type", "description", "qty", "medid"]
-    df = df[[c for c in keep_cols if c in df.columns]]
+    required_cols = [
+        "dt",
+        "device",
+        "user_name",
+        "event_type",
+        "description",
+        "qty",
+        "medid"
+    ]
 
-    # Fix datetime
-    if "dt" in df.columns:
-        df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = None
 
-    # Replace NaNs with None so Postgres accepts them
+    df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
+
     df = df.where(pd.notna(df), None)
 
-    # Apply PK
     df["pk"] = df.apply(lambda r: generate_pk(r), axis=1)
 
     return df
