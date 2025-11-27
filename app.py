@@ -90,6 +90,11 @@ def clean_dataframe(df):
 
     return df
 
+st.write("Example dt values:", df_clean["dt"].head(20).tolist())
+st.write("DT dtype:", df_clean["dt"].dtype)
+st.write("Rows with invalid dt:", df_clean[df_clean["dt"].isna()].head(20))
+
+
 
 def insert_batch(df):
     """
