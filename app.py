@@ -371,6 +371,16 @@ if uploaded:
     df_clean = clean_dataframe(df_raw)
     st.write(f"Cleaned rows: {len(df_clean):,}")
 
+    st.write("Column dtypes:", df_clean.dtypes)
+
+    bad_cols = []
+    for col in df_clean.columns:
+        if df_clean[col].apply(lambda x: isinstance(x, (list, dict))).any():
+            bad_cols.append(col)
+
+    st.write("Columns with list/dict values:", bad_cols)
+
+
     st.dataframe(df_clean.head(20), use_container_width=True)
 
     if st.button("Save to Neon"):
