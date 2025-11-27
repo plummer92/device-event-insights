@@ -26,74 +26,71 @@ def generate_pk(row):
 
 
 def clean_dataframe(df):
-    """Convert uploaded sheet → unified schema."""
     df = df.copy()
 
+    # Normalize source column names
     df.columns = df.columns.str.strip().str.lower()
 
-
-    colmap = {
+    rename_map = {
         "username": "user_name",
         "user": "user_name",
-        "employee": "user_name",
+        "userid": "user_name",
 
         "device": "device",
 
-        "medid": "med_id",
-        "med id": "med_id",
-        "medication id": "med_id",
+        "medid": "medid",
+        "med id": "medid",
 
-        "description": "med_desc",
-        "desc": "med_desc",
-        "med description": "med_desc",
+        "meddescription": "description",
+        "description": "description",
+        "med description": "description",
 
-        "type": "event_type",
+        "transactiontype": "event_type",
         "transaction type": "event_type",
+        "type": "event_type",
 
-        "datetime": "dt",
-        "date": "dt",
-        "time": "dt",
+        "transactiondatetime": "dt",
+        "transaction date and time": "dt",
         "transaction date": "dt",
-        "transaction time": "dt",
 
-        "qty": "qty",
         "quantity": "qty",
+        "qty": "qty",
 
-        "beginning": "beginning_qty",
-        "begin": "beginning_qty",
-        "beginning qty": "beginning_qty",
+        "beg": "beg",
+        "beginning": "beg",
+        "beginning qty": "beg",
 
-        "end": "ending_qty",
-        "ending": "ending_qty",
-        "end qty": "ending_qty",
+        "end": "end",
+        "ending": "end",
+        "end qty": "end"
     }
 
-    df = df.rename(columns=colmap)
+    df = df.rename(columns=rename_map)
 
-    required_cols = [
-        "user_name",
-        "device",
-        "med_id",
-        "med_desc",
-        "event_type",
-        "dt",
-        "qty",
-        "beginning_qty",
-        "ending_qty",
-    ]
-    for c in required_cols:
-        if c not in df.columns:
-            df[c] = None
+    # Required columns guaranteed
+    required = ["user_name","device","medid","description","event_type","dt","qty","beg","end"]
+    for col in required:
+        if col not in df.columns:
+            df[col] = None
 
-    # dt → safe text for database
+    # Normalize dt
     df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
-    df["dt"] = df["dt"].astype(str).where(df["dt"].notna(), None)
 
-    # numeric cleanup
-    for c in ["qty", "beginning_qty", "ending_qty"]:
+    # Normalize event type → lowercase
+    df["event_type"] = (
+        df["event_type"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+
+    # Numeric conversions
+    for c in ["qty","beg","end"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df = df.where(pd.notna(df), None)
+
+    # Generate PK
     df["pk"] = df.apply(lambda r: generate_pk(r), axis=1)
 
     return df
