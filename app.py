@@ -68,19 +68,13 @@ def clean_dataframe(df):
         if col not in df.columns:
             df[col] = None
 
-    # Convert datetime safely
-    if "dt" in df.columns:
-        df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
+# Convert dt to string consistently
+if "dt" in df.columns:
+    df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
+    df["dt"] = df["dt"].astype(str).where(df["dt"].notna(), None)
+else:
+    df["dt"] = None
 
-        # Convert NaT → None
-        df["dt"] = df["dt"].where(df["dt"].notna(), None)
-
-        # Convert valid datetimes to ISO string for Postgres
-        df["dt"] = df["dt"].apply(
-            lambda x: x.isoformat(sep=" ") if x is not None else None
-        )
-    else:
-        df["dt"] = None
 
     # Replace remaining NaNs with None
     df = df.where(pd.notna(df), None)
@@ -89,10 +83,6 @@ def clean_dataframe(df):
     df["pk"] = df.apply(lambda r: generate_pk(r), axis=1)
 
     return df
-
-st.write("Example dt values:", df_clean["dt"].head(20).tolist())
-st.write("DT dtype:", df_clean["dt"].dtype)
-st.write("Rows with invalid dt:", df_clean[df_clean["dt"].isna()].head(20))
 
 
 
@@ -142,6 +132,17 @@ if uploaded:
     # Clean
     df_clean = clean_dataframe(df_raw)
     st.write(f"**Cleaned rows:** {len(df_clean):,}")
+    if uploaded:
+    ...
+    df_clean = clean_dataframe(df_raw)
+    ...
+    
+    # Debug dt values
+    st.write("Example dt values:", df_clean["dt"].head(20).tolist())
+    st.write("DT dtype:", str(df_clean["dt"].dtype))
+    st.write("Rows with invalid dt:", df_clean[df_clean["dt"].isna()].head(20))
+
+    st.dataframe(df_clean.head(20))
 
     # Preview
     st.dataframe(df_clean.head(20), use_container_width=True)
