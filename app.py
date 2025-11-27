@@ -67,7 +67,12 @@ def clean_dataframe(df):
         if col not in df.columns:
             df[col] = None
 
+    # Convert datetime safely
     df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
+
+    # Force any invalid or NaT date to None (required for psycopg2)
+    df["dt"] = df["dt"].where(df["dt"].notna(), None)
+
 
     df = df.where(pd.notna(df), None)
 
