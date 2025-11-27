@@ -3627,7 +3627,12 @@ with tab11:
 with tab12:
     st.subheader("Pended / Threshold Activity (simple view)")
 
-    up = st.file_uploader("Upload DeviceActivityLog CSV", type=["csv", "xlsx"])
+    up = st.file_uploader(
+        "Upload DeviceActivityLog CSV",
+        type=["csv", "xlsx"],
+        key="upload_activity"
+    )
+
     if not up:
         st.info("Upload your DeviceActivityLog and I’ll show the parsed view.")
     else:
@@ -3645,12 +3650,15 @@ with tab12:
             st.dataframe(view.head(300), use_container_width=True, height=480)
 
             c1, c2 = st.columns(2)
+
             with c1:
                 if st.button(
-                    "💾 Save parsed snapshot to Postgres", type="primary", key="save_simple"
+                    "💾 Save parsed snapshot to Postgres",
+                    type="primary",
+                    key="save_simple"
                 ):
                     try:
-                        init_db(eng)  # ensures table exists
+                        init_db(eng)
                         n = upsert_activity_simple(eng, view)
                         st.success(f"Saved {n:,} rows into pyxis_activity_simple (UPSERT).")
                     except Exception as e:
@@ -3662,7 +3670,9 @@ with tab12:
                     data=view.to_csv(index=False).encode("utf-8"),
                     file_name="device_activity_parsed.csv",
                     mime="text/csv",
+                    key="download_activity_parsed"
                 )
+
 
 # ---------- TAB 13: SLOT CONFIG (DB VIEW) ----------
 with tab13:
