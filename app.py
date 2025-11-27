@@ -6,29 +6,39 @@ from psycopg2.extras import execute_batch
 
 st.set_page_config(page_title="Device Event Loader", layout="wide")
 
-# -------------------------------
-# DB CONNECTION
-# -------------------------------
-DB_CONN = st.secrets["neon"]["conn"]
+# -------------------------------------------------------
+# DATABASE CONNECTION
+# -------------------------------------------------------
+DB_URL = st.secrets["neon"]["db_url"]
 
 def get_conn():
-    return psycopg2.connect(DB_CONN)
+    """
+    Returns a psycopg2 connection to Neon.
+    """
+    return psycopg2.connect(DB_URL)
 
-# -------------------------------
+
+# -------------------------------------------------------
 # UTILITIES
-# -------------------------------
+# -------------------------------------------------------
 def generate_pk(row):
-    """Create a stable SHA-256 key for deduplication."""
+    """
+    Generate a stable unique hash for deduplication.
+    """
     row_string = "|".join(str(v) for v in row.values)
     return hashlib.sha256(row_string.encode()).hexdigest()
 
+
 def clean_dataframe(df):
+    """
+    Clean column names, normalize formats, apply PK.
+    """
     df = df.copy()
 
-    # Standardize column names
+    # Normalize column names
     df.columns = df.columns.str.strip().str.lower()
 
-    # Rename known columns
+    # Map expected Pyxis report columns to DB columns
     colmap = {
         "datetime": "dt",
         "time": "dt",
@@ -39,28 +49,32 @@ def clean_dataframe(df):
         "description": "description",
         "qty": "qty",
         "medid": "medid",
-        "med id": "medid",
+        "med id": "medid"
     }
 
     df = df.rename(columns=colmap)
 
-    # Keep only the DB columns
-    keep = ["dt", "device", "user_name", "event_type", "description", "qty", "medid"]
-    df = df[[c for c in keep if c in df.columns]]
+    # Keep only known safe schema columns
+    keep_cols = ["dt", "device", "user_name", "event_type", "description", "qty", "medid"]
+    df = df[[c for c in keep_cols if c in df.columns]]
 
-    # Convert datetime
+    # Fix datetime
     if "dt" in df.columns:
         df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
 
+    # Replace NaNs with None so Postgres accepts them
     df = df.where(pd.notna(df), None)
 
-    # Generate PK last
+    # Apply PK
     df["pk"] = df.apply(lambda r: generate_pk(r), axis=1)
 
     return df
 
+
 def insert_batch(df):
-    """Insert into Postgres in large batches (Neon paid tier)."""
+    """
+    Insert rows into Neon in safe batches.
+    """
     conn = get_conn()
     cur = conn.cursor()
 
@@ -71,25 +85,26 @@ def insert_batch(df):
     """
 
     rows = df.to_dict("records")
-    batch_size = 5000  # safe for paid Neon
+    batch_size = 5000  # safe for paid Neon plans
 
     for i in range(0, len(rows), batch_size):
-        batch = rows[i:i+batch_size]
+        batch = rows[i:i + batch_size]
         execute_batch(cur, sql, batch, page_size=len(batch))
         conn.commit()
 
     cur.close()
     conn.close()
 
-# -------------------------------
+
+# -------------------------------------------------------
 # STREAMLIT UI
-# -------------------------------
-st.title("📥 Device Event Loader (Fresh Reset)")
+# -------------------------------------------------------
+st.title("📥 Device Event Loader (Clean Reset, Neon + Psycopg2)")
 
 uploaded = st.file_uploader("Upload Device Event Report (CSV or Excel)", type=["csv", "xlsx"])
 
 if uploaded:
-    st.success("File uploaded! Preview below:")
+    st.success("File uploaded successfully!")
 
     # Load file
     if uploaded.name.endswith(".xlsx"):
@@ -97,15 +112,17 @@ if uploaded:
     else:
         df_raw = pd.read_csv(uploaded)
 
-    st.write("Raw rows:", len(df_raw))
+    st.write(f"**Raw rows:** {len(df_raw):,}")
 
     # Clean
     df_clean = clean_dataframe(df_raw)
-    st.write("Cleaned rows:", len(df_clean))
+    st.write(f"**Cleaned rows:** {len(df_clean):,}")
 
-    st.dataframe(df_clean.head(20))
+    # Preview
+    st.dataframe(df_clean.head(20), use_container_width=True)
 
     # Save button
     if st.button("🚀 Save to Neon Database"):
-        insert_batch(df_clean)
-        st.success("Upload complete and saved to Neon!")
+        with st.spinner("Saving rows to Neon…"):
+            insert_batch(df_clean)
+        st.success("✅ Upload complete and saved to Neon!")
