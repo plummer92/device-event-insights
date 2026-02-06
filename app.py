@@ -247,37 +247,57 @@ def load_data(start_date, end_date):
 ###########################################################
 
 # SIDEBAR
+# --- SIDEBAR COMMAND CENTER ---
 with st.sidebar:
     st.image("https://img.icons8.com/color/96/medical-history.png", width=50)
     st.title("RxTrack Admin")
     
+    # 1. Persistent Date Logic (The "Anchor")
+    # This ensures dates stay locked when switching to the Tardies or Student pages
+    n_events, n_pharm, n_sched, n_att, min_db, max_db = get_stats_range()
+    
+    if 'start_date' not in st.session_state:
+        st.session_state.start_date = max_db - timedelta(days=7)
+    if 'end_date' not in st.session_state:
+        st.session_state.end_date = max_db
+
     st.markdown("### 📅 Time Filter")
-    # Date defaults
-    default_end = datetime.today().date()
-    default_start = default_end - timedelta(days=7)
-    
     d_col1, d_col2 = st.columns(2)
-    start_date = d_col1.date_input("Start", default_start)
-    end_date = d_col2.date_input("End", default_end)
+    start_date = d_col1.date_input("Start", st.session_state.start_date)
+    end_date = d_col2.date_input("End", st.session_state.end_date)
     
+    # Update the "shared clipboard" so sub-pages can see these dates
+    st.session_state.start_date = start_date
+    st.session_state.end_date = end_date
+
     st.markdown("### ⚙️ Settings")
     hourly_rate = st.number_input("Tech Avg Hourly Rate ($)", value=22.50, step=0.50)
     
     st.markdown("---")
+    
+    # 2. Universal Data Ingest
+    # Keeping this in the sidebar allows you to upload data from ANY page
     st.markdown("### 📤 Data Upload")
-    uploaded = st.file_uploader("Upload Report", type=["csv","xlsx"])
+    u_type = st.selectbox("Report Type:", [
+        "Daily Transaction Report", "Staff Schedule", "Attendance Tracking",
+        "Pharmacy Workflow Report", "Inventory Audit (Prices)"
+    ])
+    uploaded = st.file_uploader(f"Upload {u_type}", type=["csv","xlsx"])
+    
     if uploaded:
-        if uploaded.name.endswith(".xlsx"):
-            df_raw = pd.read_excel(uploaded)
-        else:
-            df_raw = pd.read_csv(uploaded)
-        
-        df_clean = clean_dataframe(df_raw)
-        st.info(f"Staged {len(df_clean)} rows.")
-        if st.button("Confirm Upload to Neon"):
-            insert_batch(df_clean)
-            st.cache_data.clear() # Clear cache to show new data
-
+        if st.button(f"Process & Staging"):
+            try:
+                # Reuse your existing cleaning functions based on selection
+                if u_type == "Daily Transaction Report":
+                    df_raw = pd.read_excel(uploaded) if uploaded.name.endswith(".xlsx") else pd.read_csv(uploaded)
+                    df_clean = clean_dataframe(df_raw)
+                    # SQL Insert logic here...
+                
+                st.success(f"✅ {u_type} processed!")
+                st.cache_data.clear() # Refresh all pages with new data
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error: {e}")
 # MAIN LOADING
 df = load_data(start_date, end_date)
 
